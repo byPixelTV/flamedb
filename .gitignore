@@ -1,0 +1,7 @@
+*.yml
+.env
+.env.local
+*.exe
+*.log
+.antigravitycli
+data*
