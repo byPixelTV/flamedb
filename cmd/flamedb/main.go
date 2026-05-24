@@ -56,6 +56,10 @@ func main() {
 		time.Sleep(500 * time.Millisecond)
 		c.JoinSeeds(cfg.Cluster.Seeds, internalKey)
 		c.StartHeartbeat(internalKey)
+		// rebalance nach join
+		if len(cfg.Cluster.Seeds) > 0 {
+			c.TriggerRebalance(store, internalKey)
+		}
 	}()
 
 	srv := server.New(store, lb, a, c, internalKey)

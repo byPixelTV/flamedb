@@ -19,7 +19,8 @@ type Server struct {
 	exec    *query.Executor
 	auth    *auth.Auth
 	cluster *cluster.Cluster
-	apiKey  string // interner key für node-to-node communication
+	apiKey  string
+	store   *storage.Storage // neu
 }
 
 func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cluster.Cluster, internalKey string) *Server {
@@ -28,6 +29,7 @@ func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cl
 		auth:    a,
 		cluster: c,
 		apiKey:  internalKey,
+		store:   store, // neu
 	}
 }
 
@@ -95,6 +97,29 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 			switch msg.Type {
+			case "CLUSTER_METRICS":
+				// alle metrics die dieser node hat zurückschicken
+				metrics := s.exec.GetAllMetrics()
+				data, _ := json.Marshal(metrics)
+				conn.Write(append(data, '\n'))
+				continue
+
+			case "CLUSTER_EXPORT":
+				// metric name nach dem command
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) < 2 {
+					writeJSON(conn, map[string]string{"error": "missing metric"})
+					continue
+				}
+				metricName := strings.TrimSpace(parts[1])
+				data, err := s.store.ExportMetricData(metricName)
+				if err != nil {
+					writeJSON(conn, map[string]string{"error": err.Error()})
+					continue
+				}
+				encoded, _ := json.Marshal(data)
+				conn.Write(append(encoded, '\n'))
+				continue
 			case "JOIN":
 				newNode := cluster.Node{ID: msg.NodeID, Addr: msg.Addr}
 				isNew := !s.cluster.Knows(newNode.ID)

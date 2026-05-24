@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/byPixelTV/flamedb/internal/cluster"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -148,4 +149,113 @@ func (s *Storage) ReadRangeWithTags(metric string, from, to int64, tags map[stri
 	}
 
 	return events, iter.Error()
+}
+
+// ExportMetric gibt alle raw pebble keys für eine metric zurück
+func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
+	lower := []byte(metric + ":")
+	upper := []byte(metric + ";") // ; ist ein zeichen nach : in ASCII
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var kvs []RawKV
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := make([]byte, len(iter.Key()))
+		val := make([]byte, len(iter.Value()))
+		copy(key, iter.Key())
+		copy(val, iter.Value())
+		kvs = append(kvs, RawKV{Key: key, Value: val})
+	}
+	return kvs, iter.Error()
+}
+
+// ExportLeaderboard gibt alle leaderboard entries für eine metric zurück
+func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
+	prefix := []byte("lb:" + metric + ":")
+	upper := append([]byte("lb:"+metric+":"), 0xFF)
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var kvs []RawKV
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := make([]byte, len(iter.Key()))
+		val := make([]byte, len(iter.Value()))
+		copy(key, iter.Key())
+		copy(val, iter.Value())
+		kvs = append(kvs, RawKV{Key: key, Value: val})
+	}
+	return kvs, iter.Error()
+}
+
+// ImportRawKVs schreibt raw keys direkt in pebble
+func (s *Storage) ImportRawKVs(kvs []RawKV) error {
+	batch := s.db.NewBatch()
+	for _, kv := range kvs {
+		batch.Set(kv.Key, kv.Value, pebble.Sync)
+	}
+	return batch.Commit(pebble.Sync)
+}
+
+type RawKV struct {
+	Key   []byte `json:"k"`
+	Value []byte `json:"v"`
+}
+
+func (s *Storage) HasMetric(metric string) bool {
+	lower := []byte(metric + ":")
+	upper := []byte(metric + ";")
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+	})
+	if err != nil {
+		return false
+	}
+	defer iter.Close()
+	return iter.First()
+}
+
+func (s *Storage) ExportMetricData(metric string) (cluster.RebalanceData, error) {
+	events, err := s.ExportMetric(metric)
+	if err != nil {
+		return cluster.RebalanceData{}, err
+	}
+	lb, err := s.ExportLeaderboard(metric)
+	if err != nil {
+		return cluster.RebalanceData{}, err
+	}
+
+	data := cluster.RebalanceData{Metric: metric}
+	for _, kv := range events {
+		data.Events = append(data.Events, cluster.RawEvent{Key: kv.Key, Value: kv.Value})
+	}
+	for _, kv := range lb {
+		data.Leaderboard = append(data.Leaderboard, cluster.LeaderboardEntry{Key: kv.Key, Value: kv.Value})
+	}
+	return data, nil
+}
+
+func (s *Storage) ImportRebalanceData(data cluster.RebalanceData) error {
+	var kvs []RawKV
+	for _, e := range data.Events {
+		kvs = append(kvs, RawKV{Key: e.Key, Value: e.Value})
+	}
+	for _, lb := range data.Leaderboard {
+		kvs = append(kvs, RawKV{Key: lb.Key, Value: lb.Value})
+	}
+	return s.ImportRawKVs(kvs)
 }

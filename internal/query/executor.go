@@ -2,10 +2,12 @@ package query
 
 import (
 	"math"
+	"strings"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
+	"github.com/cockroachdb/pebble"
 )
 
 type Executor struct {
@@ -43,6 +45,35 @@ func (e *Executor) executeStats(q *Query) (*Result, error) {
 			TagStats: stats,
 		},
 	}, nil
+}
+
+func (e *Executor) GetAllMetrics() []string {
+	// scan über alle keys, metric names extrahieren
+	iter, err := e.store.DB().NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return nil
+	}
+	defer iter.Close()
+
+	seen := make(map[string]bool)
+	var metrics []string
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		key := string(iter.Key())
+		// skip index und leaderboard keys
+		if strings.HasPrefix(key, "idx:") ||
+			strings.HasPrefix(key, "lb:") ||
+			strings.HasPrefix(key, "card") {
+			continue
+		}
+		// metric name ist alles vor dem ersten :
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) > 0 && !seen[parts[0]] {
+			seen[parts[0]] = true
+			metrics = append(metrics, parts[0])
+		}
+	}
+	return metrics
 }
 
 func (e *Executor) executeSet(q *Query) (*Result, error) {
