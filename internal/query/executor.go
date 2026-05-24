@@ -206,5 +206,14 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		events = events[:q.Limit]
 	}
 
+	switch q.Order {
+	case "DESC":
+		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+			events[i], events[j] = events[j], events[i]
+		}
+	case "ASC":
+		// do nothing, default order is ASC
+	}
+
 	return &Result{Events: events}, nil
 }
