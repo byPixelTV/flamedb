@@ -26,7 +26,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	store, err := storage.Open(cfg.Server.DataPath)
+	store, err := storage.Open(cfg.Server.DataPath, cfg.Storage.Compression)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -24,10 +24,15 @@ type ServerConfig struct {
 	DataPath      string `yaml:"data_path"`
 }
 
+type StorageConfig struct {
+	Compression string `yaml:"compression"` // none|snappy|zstd
+}
+
 type Config struct {
 	Auth    AuthConfig    `yaml:"auth"`
 	Server  ServerConfig  `yaml:"server"`
 	Cluster ClusterConfig `yaml:"cluster"`
+	Storage StorageConfig `yaml:"storage"`
 }
 
 type ClusterConfig struct {

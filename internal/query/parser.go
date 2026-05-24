@@ -179,6 +179,16 @@ func Parse(input string) (*Query, error) {
 	}
 	q.Metric = tokens[1]
 
+	if q.Type == QueryTypeGet {
+		q.Metrics = splitMetrics(tokens[1])
+		if len(q.Metrics) == 0 {
+			return nil, fmt.Errorf("missing metric")
+		}
+		q.Metric = q.Metrics[0]
+	} else if strings.Contains(tokens[1], ",") {
+		return nil, fmt.Errorf("multiple metrics only supported for GET")
+	}
+
 	// keyword loop nur für GET und LEADERBOARD
 	i := 2
 	for i < len(tokens) {
@@ -444,4 +454,16 @@ func parseDurationSpec(spec string) (time.Duration, error) {
 	}
 
 	return total, nil
+}
+
+func splitMetrics(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -215,6 +215,77 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
+		// multi-metric GET: scatter/gather across nodes
+		if q.Type == query.QueryTypeGet && len(q.Metrics) > 1 {
+			// build suffix after metric list (keeps WHERE/FROM/TO/etc)
+			cmdEnd := strings.Index(line, " ")
+			if cmdEnd == -1 {
+				writeJSON(conn, map[string]string{"error": "invalid query"})
+				continue
+			}
+			metricStart := cmdEnd + 1
+			nextSpace := strings.Index(line[metricStart:], " ")
+			suffix := ""
+			if nextSpace != -1 {
+				suffix = line[metricStart+nextSpace:]
+			}
+
+			metricsOut := make(map[string][]storage.Event, len(q.Metrics))
+			aggregatesOut := make(map[string]*query.AggregateResult, len(q.Metrics))
+			seriesOut := make(map[string][]query.SeriesPoint, len(q.Metrics))
+
+			for _, metric := range q.Metrics {
+				metricLine := "GET " + metric + suffix
+				readNode := s.cluster.GetReadNode(metric)
+
+				var res query.Result
+				if readNode.ID == s.cluster.Self.ID {
+					q2 := *q
+					q2.Metric = metric
+					q2.Metrics = nil
+					r, err := s.exec.Execute(&q2)
+					if err != nil {
+						writeJSON(conn, map[string]string{"error": err.Error()})
+						continue
+					}
+					res = *r
+				} else {
+					bytes, err := s.cluster.SendToNode(readNode, metricLine)
+					if err != nil {
+						writeJSON(conn, map[string]string{"error": err.Error()})
+						continue
+					}
+					if err := json.Unmarshal(bytes, &res); err != nil {
+						writeJSON(conn, map[string]string{"error": "invalid upstream response"})
+						continue
+					}
+				}
+
+				if res.Aggregate != nil {
+					aggregatesOut[metric] = res.Aggregate
+				} else if len(res.Series) > 0 {
+					seriesOut[metric] = res.Series
+				} else {
+					if res.Events == nil {
+						res.Events = []storage.Event{}
+					}
+					metricsOut[metric] = res.Events
+				}
+			}
+
+			var out query.Result
+			if len(aggregatesOut) > 0 {
+				out.Aggregates = aggregatesOut
+			} else if len(seriesOut) > 0 {
+				out.SeriesByMetric = seriesOut
+			} else {
+				out.Metrics = metricsOut
+			}
+
+			writeJSON(conn, out)
+			continue
+		}
+
 		if (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) &&
 			!q.IsReplica &&
 			!s.cluster.IsPrimaryFor(q.Metric) {

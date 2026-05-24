@@ -184,20 +184,111 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		to = math.MaxInt64
 	}
 
-	var events []storage.Event
-	var err error
-
-	if len(q.Where) > 0 {
-		events, err = e.store.ReadRangeWithTags(q.Metric, from, to, q.Where)
-	} else {
-		events, err = e.store.ReadRange(q.Metric, from, to)
+	getEvents := func(metric string) ([]storage.Event, error) {
+		if len(q.Where) > 0 {
+			return e.store.ReadRangeWithTags(metric, from, to, q.Where)
+		}
+		return e.store.ReadRange(metric, from, to)
 	}
+
+	metricNames := q.Metrics
+	if len(metricNames) == 0 {
+		metricNames = []string{q.Metric}
+	}
+
+	if len(metricNames) > 1 {
+		if q.GroupBySpec != "" {
+			out := make(map[string][]SeriesPoint, len(metricNames))
+			for _, m := range metricNames {
+				events, err := getEvents(m)
+				if err != nil {
+					return nil, err
+				}
+				out[m] = aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
+			}
+			return &Result{SeriesByMetric: out}, nil
+		}
+
+		if q.Aggregate != "" {
+			out := make(map[string]*AggregateResult, len(metricNames))
+			for _, m := range metricNames {
+				events, err := getEvents(m)
+				if err != nil {
+					return nil, err
+				}
+				count := len(events)
+				var sum float64
+				for _, e := range events {
+					sum += e.Value
+				}
+
+				var value float64
+				switch q.Aggregate {
+				case AggCount:
+					value = float64(count)
+				case AggSum:
+					value = sum
+				case AggAvg:
+					if count > 0 {
+						value = sum / float64(count)
+					}
+				}
+
+				out[m] = &AggregateResult{
+					Type:  string(q.Aggregate),
+					Value: value,
+					Count: count,
+				}
+			}
+			return &Result{Aggregates: out}, nil
+		}
+
+		out := make(map[string][]storage.Event, len(metricNames))
+		for _, m := range metricNames {
+			events, err := getEvents(m)
+			if err != nil {
+				return nil, err
+			}
+			if events == nil {
+				events = []storage.Event{}
+			}
+
+			// ordering vor pagination
+			switch q.Order {
+			case "DESC":
+				for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+					events[i], events[j] = events[j], events[i]
+				}
+			case "ASC":
+			}
+
+			// pagination danach
+			if q.Offset >= len(events) {
+				out[m] = []storage.Event{}
+				continue
+			}
+			events = events[q.Offset:]
+			if q.Limit > 0 && len(events) > q.Limit {
+				events = events[:q.Limit]
+			}
+
+			out[m] = events
+		}
+		return &Result{Metrics: out}, nil
+	}
+
+	// single metric flow
+	events, err := getEvents(q.Metric)
 	if err != nil {
 		return nil, err
 	}
-
 	if events == nil {
 		events = []storage.Event{}
+	}
+
+	if q.GroupBySpec != "" {
+		series := aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
+		return &Result{Series: series}, nil
 	}
 
 	if q.Aggregate != "" {
@@ -228,11 +319,6 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		}, nil
 	}
 
-	if q.GroupBySpec != "" {
-		series := aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
-		return &Result{Series: series}, nil
-	}
-
 	// ordering vor pagination
 	switch q.Order {
 	case "DESC":
@@ -240,7 +326,6 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 			events[i], events[j] = events[j], events[i]
 		}
 	case "ASC":
-		// default order is ASC
 	}
 
 	// pagination danach

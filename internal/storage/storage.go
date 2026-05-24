@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/byPixelTV/flamedb/internal/cluster"
 	"github.com/cockroachdb/pebble"
@@ -55,12 +56,33 @@ func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
 	return append([]byte(prefix), ts...)
 }
 
-func Open(path string) (*Storage, error) {
-	db, err := pebble.Open(path, &pebble.Options{})
+func Open(path, compression string) (*Storage, error) {
+	opts := &pebble.Options{}
+	opts.EnsureDefaults()
+
+	comp := parseCompression(compression)
+	for i := range opts.Levels {
+		opts.Levels[i].Compression = comp
+	}
+
+	db, err := pebble.Open(path, opts)
 	if err != nil {
 		return nil, err
 	}
 	return &Storage{db: db}, nil
+}
+
+func parseCompression(s string) pebble.Compression {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "snappy":
+		return pebble.SnappyCompression
+	case "zstd":
+		return pebble.ZstdCompression
+	case "none", "no":
+		return pebble.NoCompression
+	default:
+		return pebble.SnappyCompression
+	}
 }
 
 func (s *Storage) DB() *pebble.DB {

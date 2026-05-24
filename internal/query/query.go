@@ -35,6 +35,7 @@ const (
 type Query struct {
 	Type      QueryType
 	Metric    string
+	Metrics   []string
 	Where     map[string]string
 	Timestamp int64
 	From      int64
@@ -57,11 +58,14 @@ type Query struct {
 }
 
 type Result struct {
-	Events      []storage.Event               `json:"events,omitempty"`
-	Leaderboard []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
-	Stats       *StatsResult                  `json:"stats,omitempty"`
-	Aggregate   *AggregateResult              `json:"aggregate,omitempty"`
-	Series      []SeriesPoint                 `json:"series,omitempty"`
+	Events         []storage.Event               `json:"events,omitempty"`
+	Metrics        map[string][]storage.Event    `json:"metrics,omitempty"`
+	Leaderboard    []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
+	Stats          *StatsResult                  `json:"stats,omitempty"`
+	Aggregate      *AggregateResult              `json:"aggregate,omitempty"`
+	Aggregates     map[string]*AggregateResult   `json:"aggregates,omitempty"`
+	Series         []SeriesPoint                 `json:"series,omitempty"`
+	SeriesByMetric map[string][]SeriesPoint      `json:"series_by_metric,omitempty"`
 }
 
 type SeriesPoint struct {

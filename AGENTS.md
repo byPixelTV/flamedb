@@ -79,11 +79,14 @@ WRITE <metric> <value> [lb="<entityID>"] [tag="value"] [ts=<unix_nano>] [QUORUM]
 
 #### GET
 ```
-GET <metric> [WHERE key="value" AND key2="value2"] [FROM YYYY-MM-DD] [TO YYYY-MM-DD] [LIMIT n] [OFFSET n] [ORDER ASC|DESC]
+GET <metric> [WHERE key="value" AND key2="value2"] [FROM <time>] [TO <time>] [COUNT|SUM|AVG] [GROUP BY <bucket>] [LIMIT n] [OFFSET n] [ORDER ASC|DESC]
 ```
 - Returns raw events, filtered by tags and time range
 - Tag filtering uses cardinality-based secondary index (lowest cardinality tag used as primary index)
 - Supports multiple WHERE clauses with AND
+- Aggregations: COUNT, SUM, AVG (if present, returns aggregate)
+- Grouping: GROUP BY <bucket> returns series (see Time/Duration rules)
+- Multi-metric: `GET kills,deaths ...` returns `{metrics:{...}}`, aggregates return `{aggregates:{...}}`, group-by returns `{series_by_metric:{...}}`
 
 #### LEADERBOARD
 ```
@@ -131,6 +134,18 @@ CLUSTER {"type":"JOIN","node_id":"node-2","addr":"192.168.1.2:7778"}
 ```
 GROUP_LEADERBOARD <metric> GROUP "group1:member1,member2" GROUP "group2:memberA,memberB" [LIMIT n] [OFFSET n]
 ```
+- Ad‑hoc Gruppen (nicht gespeichert), pro Query definiert
+- Score pro Gruppe = Summe der Member‑Scores auf dem Leaderboard
+- Gibt ein Leaderboard ueber Gruppen zurueck (EntityID = Gruppenname)
+
+---
+
+```markdown
+### Time / Duration Notes
+- `FROM` / `TO` accept absolute dates (`YYYY-MM-DD`) and relative time (`now`, `now-7d`, `now+1y6m`)
+- `GROUP BY <bucket>` supports: s, `min`, m, h, d, `w`, `mo`, `y` and combinations (e.g. `1y6m`, `2w3d`, `1y6m30min`)
+- Ambiguity rule: m = minutes **unless** `y` or `mo` is present; use `min` when mixing with calendar units
+- Buckets are aligned to Unix epoch (UTC)
 
 ---
 
@@ -281,23 +296,22 @@ cluster:
 - [x] Rebalancing infrastructure (CLUSTER_METRICS, CLUSTER_EXPORT, CLUSTER_IMPORT commands, RebalanceStore interface, storage export/import methods)
 - [x] Single-node mode (replication_factor: 1, works standalone with no cluster config)
 - [x] Ad-hoc group leaderboards (GROUP_LEADERBOARD, per-query groups, sum aggregation)
+- [x] GET ORDER ASC/DESC
+- [x] GET COUNT/SUM/AVG (aggregate output)
+- [x] GET GROUP BY time bucket (series output, UTC epoch aligned)
+- [x] Relative time in FROM/TO (now±duration, calendar accurate y/mo)
+- [x] O(1) leaderboard lookups via lb-entity index (self-heal on first read)
+- [x] Multi-metric GET (comma-separated metrics; metrics/aggregates/series_by_metric output)
 
 ---
 
 ## What is NOT Yet Implemented / Broken ❌
 
-### Query Language
-- [ ] **ORDER ASC/DESC** for GET queries (currently GET doesn't sort, only leaderboard is sorted)
-- [ ] **COUNT aggregation** — `GET kills COUNT` to count events
-- [ ] **SUM/AVG aggregation** — for dashboard graph data
-- [ ] **GROUP BY time bucket** — e.g. `GROUP BY 1h` for time-series graphs
-- [ ] **Multi-metric queries** — `GET kills, deaths WHERE player="pixel"`
-- [ ] **Relative time** — `FROM now-7d TO now` instead of absolute dates
-
 ### SDKs (not started)
 - [ ] **Kotlin/Java SDK** — primary target, for Minecraft plugin devs
 - [ ] **Go SDK** — simple wrapper around the TCP protocol
 - [ ] **C# SDK** — for Unity / .NET users
+- [ ] **Typescript SDK** - for Web / other Typescript based applications
 
 ### Operational
 - [ ] **HTTP API** — optional REST/JSON API layer on top of TCP for dashboards and web clients
