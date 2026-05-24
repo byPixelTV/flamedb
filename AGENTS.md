@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/FLAMEDB_INSTRUCTIONS.md << 'HEREDOC'
 # FlameDB — Project Instructions for Coding Agents
 
 ## What is FlameDB?
@@ -31,6 +30,7 @@ flamedb/
 │   │   ├── cluster.go                # cluster state, node management, forwarding
 │   │   ├── ring.go                   # consistent hashing ring with virtual nodes
 │   │   ├── discovery.go              # seed-based join, gossip propagation, heartbeat
+│   │   ├── pool.go                   # TCP connection pool with auth + retry
 │   │   ├── replication.go            # async replication + quorum writes
 │   │   └── rebalance.go              # data rebalancing when new node joins
 │   ├── config/
@@ -48,7 +48,7 @@ flamedb/
 ├── config.yml                        # node-1 config (seed node)
 ├── config2.yml                       # node-2 config
 ├── config3.yml                       # node-3 config
-├── config4.yml                       # node-4 config (example for adding nodes)
+├── config4.yml                       # node-4 config
 └── go.mod
 ```
 
@@ -79,14 +79,12 @@ WRITE <metric> <value> [lb="<entityID>"] [tag="value"] [ts=<unix_nano>] [QUORUM]
 
 #### GET
 ```
-GET <metric> [WHERE key="value" AND key2="value2"] [FROM <time>] [TO <time>] [COUNT|SUM|AVG] [GROUP BY <bucket>] [LIMIT n] [OFFSET n] [ORDER ASC|DESC]
+GET <metric>[,metric2,...] [WHERE key="value" AND key2="value2"] [FROM YYYY-MM-DD] [TO YYYY-MM-DD] [LIMIT n] [OFFSET n] [ORDER ASC|DESC]
 ```
 - Returns raw events, filtered by tags and time range
-- Tag filtering uses cardinality-based secondary index (lowest cardinality tag used as primary index)
+- Supports comma-separated multi-metric queries
+- Tag filtering uses cardinality-based secondary index
 - Supports multiple WHERE clauses with AND
-- Aggregations: COUNT, SUM, AVG (if present, returns aggregate)
-- Grouping: GROUP BY <bucket> returns series (see Time/Duration rules)
-- Multi-metric: `GET kills,deaths ...` returns `{metrics:{...}}`, aggregates return `{aggregates:{...}}`, group-by returns `{series_by_metric:{...}}`
 
 #### LEADERBOARD
 ```
@@ -95,6 +93,13 @@ LEADERBOARD <metric> [LIMIT n] [OFFSET n]
 - Returns pre-computed sorted leaderboard entries
 - Instant regardless of data size (aggregates on write, not on query)
 - Supports pagination
+
+#### GROUP_LEADERBOARD
+```
+GROUP_LEADERBOARD <metric> GROUP "groupname:member1,member2" GROUP "groupname2:memberA" [LIMIT n] [OFFSET n]
+```
+- Ad-hoc group leaderboards, sums member values per group
+- Groups defined per-query, no pre-configuration needed
 
 #### SET
 ```
@@ -118,34 +123,12 @@ STATS <metric> TAGS <tag1> <tag2> ...
 #### CLUSTER (internal)
 ```
 CLUSTER {"type":"JOIN","node_id":"node-2","addr":"192.168.1.2:7778"}
+CLUSTER {"type":"CLUSTER_METRICS"}
+CLUSTER {"type":"CLUSTER_EXPORT","metric":"kills"}
+CLUSTER {"type":"SET_CONFIG","replication_factor":3}
 ```
-- Internal command for node discovery
-- Response includes `peers` list so joining node learns about all existing nodes
-
-#### CLUSTER_METRICS (internal)
-- Returns JSON array of all metric names stored on this node
-- Used during rebalancing
-
-#### CLUSTER_EXPORT <metric> (internal)
-- Returns all raw pebble KV data for a metric (events + leaderboard)
-- Used during rebalancing
-
-#### GROUP_LEADERBOARD
-```
-GROUP_LEADERBOARD <metric> GROUP "group1:member1,member2" GROUP "group2:memberA,memberB" [LIMIT n] [OFFSET n]
-```
-- Ad‑hoc Gruppen (nicht gespeichert), pro Query definiert
-- Score pro Gruppe = Summe der Member‑Scores auf dem Leaderboard
-- Gibt ein Leaderboard ueber Gruppen zurueck (EntityID = Gruppenname)
-
----
-
-```markdown
-### Time / Duration Notes
-- `FROM` / `TO` accept absolute dates (`YYYY-MM-DD`) and relative time (`now`, `now-7d`, `now+1y6m`)
-- `GROUP BY <bucket>` supports: s, `min`, m, h, d, `w`, `mo`, `y` and combinations (e.g. `1y6m`, `2w3d`, `1y6m30min`)
-- Ambiguity rule: m = minutes **unless** `y` or `mo` is present; use `min` when mixing with calendar units
-- Buckets are aligned to Unix epoch (UTC)
+- Internal command for node discovery, config sync, and rebalancing
+- JOIN response includes full peer list so joining node learns all existing nodes
 
 ---
 
@@ -164,18 +147,14 @@ auth:
 server:
   port: 7777
   host: "0.0.0.0"
-  advertise_addr: "192.168.178.199:7777"  # IP that other nodes use to reach this node
+  advertise_addr: "192.168.178.199:7777"  # actual IP other nodes use to reach this node
   node_id: "node-1"
   data_path: "./data-node1"
 
 cluster:
-  seeds: []                  # node-1 has no seeds, it IS the seed
-  replication_factor: 3      # how many nodes store each metric (1 = no replication)
+  seeds: []                  # empty = this is the seed node
+  replication_factor: 3      # 1 = no replication (single node mode)
 ```
-
-- `seeds` — list of existing node addresses to announce to on startup. Empty for the first node.
-- `replication_factor: 1` — single node mode, no replication, works standalone
-- `advertise_addr` — must be set to the actual IP, not `0.0.0.0`, for multi-node clusters
 
 ---
 
@@ -187,80 +166,79 @@ cluster:
 - **Secondary index key format:** `idx:metric:tagkey:tagvalue:timestamp` → primary key
 - **Leaderboard key format:** `lb:metric:inverted_score:entityID` (inverted for descending order)
 - **Cardinality key format:** `card:metric:tagkey:tagvalue` and `card-count:metric:tagkey`
-- Export/import methods for raw KV data (used in rebalancing)
+- `ExportMetricData(metric)` — exports all raw KV pairs for a metric (events + leaderboard)
+- `ImportRebalanceData(data)` — bulk imports raw KV pairs via pebble batch
+- `HasMetric(metric)` — checks if any events exist for a metric locally
 
 ### Leaderboard Layer (`internal/aggregates`)
-- Pre-computed sorted leaderboards stored in same Pebble instance
-- Aggregate on write (Increment/Set/Delete), never on query → instant reads regardless of data size
+- Pre-computed sorted leaderboards in same Pebble instance
+- Aggregate on write (Increment/Set/Delete), never on query → instant reads
 - Per-entity mutex via `sync.Map` to prevent read-modify-write race conditions
 - Uses Pebble Batch for atomic delete-old-key + set-new-key operations
 
 ### Query Layer (`internal/query`)
-- `parser.go`: tokenizer (handles quoted strings, `=` as separate token) + parser
-- `executor.go`: executes Query against storage + leaderboard
-- `GetAllMetrics()`: scans pebble for all metric names (used by rebalancing)
-- Cardinality-based tag selection: lowest cardinality tag used as primary index for GET+WHERE
+- `parser.go`: tokenizer + parser, handles quoted strings, `=` as separate token, standalone flags (QUORUM, __replica)
+- `executor.go`: executes Query against storage + leaderboard, `GetAllMetrics()` for rebalancing
+- Cardinality-based tag selection: lowest cardinality tag = primary index for GET+WHERE
 
 ### Auth Layer (`internal/auth`)
 - API key → Session mapping loaded at startup
-- Session has permissions map: `read`, `write`
-- Write commands (WRITE, SET, DELETE) require `write` permission
-- Read commands (GET, LEADERBOARD, STATS) require `read` permission
+- `read` permission: GET, LEADERBOARD, GROUP_LEADERBOARD, STATS
+- `write` permission: WRITE, SET, DELETE
 
 ### Cluster Layer (`internal/cluster`)
 
 #### consistent hashing (`ring.go`)
-- 150 virtual nodes per physical node by default
+- 150 virtual nodes per physical node
 - `Get(metric)` → primary node
-- `GetN(metric, n)` → N nodes (primary + replicas), deduplicated
+- `GetN(metric, n)` → N nodes deduplicated (primary + replicas)
 - Duplicate node detection in `Add()` prevents double-registration
 - Thread-safe with `sync.RWMutex`
 
 #### node management (`cluster.go`)
-- `IsLocal(metric)` — true if this node is primary OR replica for this metric
-- `IsPrimaryFor(metric)` — true if this node is the first node in the ring for this metric
+- `IsLocal(metric)` — true if this node is primary OR replica
+- `IsPrimaryFor(metric)` — true if first node in ring for this metric
 - `GetReplicaNodes(metric)` — all nodes except primary
-- `GetReadNode(metric)` — round-robin over all replica nodes for load balancing
-- `ForwardWithFailover(metric, query)` — tries each replica in order until one succeeds
-- `ForwardToPrimary(metric, query)` — sends write to primary node
-- `SendToNode(node, query)` — sends query to specific node via connection pool
-- `GetAllNodes()` — returns all known nodes (used in JOIN response)
-- `Knows(nodeID)` — checks if node is in ring
+- `GetReadNode(metric)` — round-robin over all nodes for read load balancing
+- `ForwardWithFailover` — tries each replica until one succeeds
+- `ForwardToPrimary` — sends write to primary node
+- `SendToNode` — sends to specific node via pool
+- `GetAllNodes()` — all known nodes
+- `Knows(nodeID)` — checks ring membership
+- `rebalancing sync.Map` — prevents duplicate metric imports during rebalance
+
+#### connection pool (`pool.go`)
+- Persistent authenticated TCP connections per node
+- Auto-evicts and reconnects on dead connections
+- `Send(node, query)` — thread-safe send with retry on failure
 
 #### discovery (`discovery.go`)
-- Seed-based join: node announces itself to seed nodes on startup
-- JOIN response includes full peer list so new node learns about all existing nodes
-- Gossip propagation: when node A learns about node C, it tells all other known nodes
-- Loop prevention: `Knows()` check before propagating
-- Heartbeat every 5 seconds, node removed from ring after 3 consecutive failures (`recordFailure`)
-- `clearFailure()` resets failure count when node responds
+- Seed-based join: announces to seeds, gets full peer list in response
+- Gossip: new node announced to all known peers, loop prevention via `Knows()`
+- Heartbeat every 5s, node removed after 3 consecutive failures
+- `DiscoveryMessage` struct handles all internal message types
 
 #### replication (`replication.go`)
-- `ReplicateAsync(metric, query)` — fire and forget to all replica nodes
-- `ReplicateQuorum(metric, query)` — waits until majority (n/2+1) of nodes confirm
-- `ReplicateWrite(metric, query, quorum)` — picks async or quorum based on flag
-- Replica writes tagged with `__replica` suffix to prevent replication loops
+- `ReplicateAsync` — fire and forget to all replicas
+- `ReplicateQuorum` — waits for majority (n/2+1) confirmation
+- `ReplicateWrite` — dispatches to async or quorum based on flag
+- `__replica` suffix on forwarded writes prevents replication loops
 
 #### rebalancing (`rebalance.go`)
-- Triggered on startup when seeds are configured (i.e. not the first node)
-- Waits 2 seconds after join for gossip to propagate
-- Asks each known node for their metric list via `CLUSTER_METRICS`
-- For each metric that now belongs to this node as primary: requests full data via `CLUSTER_EXPORT`
-- `HasMetric(metric)` check to skip metrics already present locally
-- **KNOWN BUG:** rebalancing currently logs "starting rebalance" but `rebalanceFromNode` gets no results — `CLUSTER_METRICS` and `CLUSTER_EXPORT` are handled in server.go but the response parsing in `rebalance.go` may be receiving the auth handshake response instead of the actual data. The pool connection reuse during rebalance likely causes the scanner to read a stale response. Fix: rebalance should open a fresh connection instead of using the pool, OR the pool needs to handle the auth handshake transparently for internal commands.
+- Triggered on startup when seeds configured (not first node)
+- Waits 2s for gossip to settle
+- Opens **fresh dedicated TCP connections** (not pool) to avoid race conditions
+- Uses **64MB scanner buffer** for large metric exports
+- Per-metric `rebalancing sync.Map` lock prevents duplicate imports from parallel goroutines
+- Flow: connect → auth → CLUSTER_METRICS → for each local metric not yet present → CLUSTER_EXPORT → import
 
 ### Server Layer (`internal/server`)
 - TCP server, one goroutine per connection
-- Auth handshake on every new connection (`{"auth":"required"}` → `AUTH key` → `{"auth":"ok"}`)
-- Session nil check after auth loop (handles disconnects during handshake)
+- Auth handshake → session nil check → main loop
 - CLUSTER command handling before query parsing
-- Write path:
-  1. If not local → `ForwardWithFailover`
-  2. If local but not primary and not replica → `ForwardToPrimary`
-  3. If primary → execute locally → `ReplicateWrite` to replicas
-  4. If replica (tagged `__replica`) → execute locally, no further replication
-- Read path: `GetReadNode` for round-robin load balancing across replicas
-- `store` field exposed on Server for `CLUSTER_EXPORT` handling
+- Write path: not local → ForwardWithFailover | local+not primary+not replica → ForwardToPrimary | primary → execute+ReplicateWrite | replica → execute only
+- Read path: GetReadNode for round-robin load balancing
+- `store` field on Server for CLUSTER_EXPORT handling
 
 ---
 
@@ -268,72 +246,83 @@ cluster:
 
 - [x] Pebble-backed event storage with time-range reads
 - [x] Pre-computed leaderboards with pagination
-- [x] Custom query language: WRITE, GET, LEADERBOARD, SET, DELETE, STATS
+- [x] Custom query language: WRITE, GET, LEADERBOARD, GROUP_LEADERBOARD, SET, DELETE, STATS
+- [x] Multi-metric GET (comma-separated)
+- [x] Ad-hoc group leaderboards (GROUP_LEADERBOARD)
 - [x] Tag filtering with multiple AND clauses
-- [x] Cardinality-based secondary index for tag filtering (lowest cardinality = primary index)
+- [x] Cardinality-based secondary index for tag filtering
 - [x] FROM/TO date range filtering
 - [x] LIMIT/OFFSET pagination
-- [x] Timestamp override on WRITE (`ts=`)
+- [x] Timestamp override on WRITE
 - [x] TCP server with newline-delimited JSON protocol
 - [x] API key auth with read/write permissions
-- [x] Consistent hashing ring for metric-based sharding (150 virtual nodes)
-- [x] Automatic query forwarding between nodes with failover
-- [x] Seed-based dynamic node discovery (no hardcoded cluster topology)
-- [x] Gossip propagation (new nodes announced to all known nodes)
-- [x] Full peer list exchange on JOIN (new node learns all existing nodes)
-- [x] Heartbeat with failure detection (remove after 3 failures)
+- [x] Consistent hashing ring (150 virtual nodes)
+- [x] Automatic query forwarding with failover
+- [x] Seed-based dynamic node discovery
+- [x] Gossip propagation with loop prevention
+- [x] Full peer list exchange on JOIN
+- [x] Heartbeat with failure detection (3 strikes)
 - [x] Graceful shutdown (SIGINT/SIGTERM)
 - [x] Per-entity mutex for leaderboard race condition prevention
 - [x] Atomic leaderboard updates via Pebble Batch
 - [x] Config path as CLI argument
-- [x] `advertise_addr` config (separate bind addr from advertised addr)
-- [x] Eventual consistency replication (async, fire-and-forget to replicas)
-- [x] Quorum writes (`QUORUM` flag, waits for majority confirmation)
-- [x] `__replica` flag to prevent replication loops
-- [x] Failover reads (if primary down, try replicas)
-- [x] Round-robin read load balancing across replicas
-- [x] Connection pooling with retry on dead connections
-- [x] Rebalancing infrastructure (CLUSTER_METRICS, CLUSTER_EXPORT, CLUSTER_IMPORT commands, RebalanceStore interface, storage export/import methods)
-- [x] Single-node mode (replication_factor: 1, works standalone with no cluster config)
-- [x] Ad-hoc group leaderboards (GROUP_LEADERBOARD, per-query groups, sum aggregation)
-- [x] GET ORDER ASC/DESC
-- [x] GET COUNT/SUM/AVG (aggregate output)
-- [x] GET GROUP BY time bucket (series output, UTC epoch aligned)
-- [x] Relative time in FROM/TO (now±duration, calendar accurate y/mo)
-- [x] O(1) leaderboard lookups via lb-entity index (self-heal on first read)
-- [x] Multi-metric GET (comma-separated metrics; metrics/aggregates/series_by_metric output)
+- [x] `advertise_addr` config
+- [x] Eventual consistency replication (async)
+- [x] Quorum writes (QUORUM flag)
+- [x] Failover reads
+- [x] Round-robin read load balancing
+- [x] Connection pooling with retry
+- [x] **Data rebalancing** — fully working, new node imports metrics it owns from existing nodes
+- [x] Per-metric import deduplication during rebalance (sync.Map lock)
+- [x] Single-node mode (replication_factor: 1)
+- [x] ORDER ASC/DESC for GET queries
+- [x] COUNT/SUM/AVG aggregation
+- [x] GROUP BY time bucket (e.g. `GROUP BY 1h`)
+- [x] Relative time (`FROM now-7d TO now`)
+- [x] Pebble block compression
 
 ---
 
-## What is NOT Yet Implemented / Broken ❌
+## What is NOT Yet Implemented ❌
+
+### Next Up
+- [ ] **`__internal` metrics** — expose FlameDB's own stats as queryable metrics:
+  - `__internal.writes_per_sec` — write throughput
+  - `__internal.reads_per_sec` — read throughput
+  - `__internal.latency_p99` — query latency percentiles
+  - `__internal.storage_bytes` — pebble storage size per node
+  - `__internal.node_count` — active nodes in cluster
+  - `__internal.replication_lag` — how far behind replicas are
+  - Query via normal GET/LEADERBOARD syntax
+- [ ] **Benchmark tool** (`cmd/benchmark/main.go`) — standalone load testing tool:
+  - Flags: `--addr`, `--key`, `--workers`, `--duration`, `--metric`, `--mode` (write/read/mixed)
+  - Output: writes/sec, reads/sec, p50/p99 latency, error count
+  - Should test at 1000+ concurrent workers
+
+### Query Language
+- [ ] **Multi-metric aggregation** — `GET kills,deaths SUM` cross-metric ops
 
 ### SDKs (not started)
-- [ ] **Kotlin/Java SDK** — primary target, for Minecraft plugin devs
-- [ ] **Go SDK** — simple wrapper around the TCP protocol
-- [ ] **C# SDK** — for Unity / .NET users
-- [ ] **Typescript SDK** - for Web / other Typescript based applications
+- [ ] **Kotlin/Java SDK** — primary target for Minecraft plugin devs
+- [ ] **Go SDK** — simple wrapper
+- [ ] **C# SDK**
 
 ### Operational
-- [ ] **HTTP API** — optional REST/JSON API layer on top of TCP for dashboards and web clients
-- [ ] **`__internal` metrics** — expose FlameDB's own stats (queries/sec, storage size, node count)
-- [ ] **Backup/restore** — snapshot Pebble data to S3 or local disk
-- [ ] **Data TTL** — auto-expire raw events older than X days (leaderboards kept forever)
-- [ ] **Compression** — Pebble supports block compression, should be enabled and configurable
-- [ ] **TLS** — encrypt node-to-node and client-to-node traffic
-- [ ] **Dashboard UI** — web-based dashboard for graphs and leaderboards
-
-### Performance
-- [ ] **Write batching** — buffer writes and flush in batches for higher throughput
-- [ ] **Read cache** — LRU cache for frequently-read leaderboards
-- [ ] **Benchmark suite** — test with 1000 concurrent writers, measure p99 latency
+- [ ] **HTTP API** — REST/JSON layer for dashboards
+- [ ] **Backup/restore** — snapshot to S3 or local disk
+- [ ] **Data TTL** — auto-expire raw events older than X days
+- [x] **Compression** — Pebble block compression configured
+- [ ] **TLS** — encrypt node-to-node and client traffic
+- [ ] **Dashboard UI**
 
 ---
 
 ## Known Issues / Tech Debt
 
-- Leaderboard lookups use an O(1) lb-entity index (self-heal on first read), falls back to scan for legacy data
-- Config is loaded once at startup, no hot reload
-- Internal node-to-node auth uses the first API key from config — should have a dedicated `internal_key` config field
+- `Get` on Leaderboard does full prefix scan to find entity's current value — needs secondary index `lb-entity:metric:entityID → value` for O(1) lookup
+- Internal node-to-node auth uses first API key — should have dedicated `internal_key` config field
+- Config loaded once at startup, no hot reload
+- `CLUSTER_METRICS` and `CLUSTER_EXPORT` bypass permission check — should require valid auth session (they do go through auth handshake but no permission level check)
 
 ---
 
@@ -341,47 +330,41 @@ cluster:
 
 ### Requirements
 - Go 1.22+
-- Git
-- Windows with WSL recommended for testing (use WSL for nc commands, Windows for running the exe)
+- Windows with WSL for testing (WSL for nc, Windows for exe)
 
 ### Build & Run
 ```powershell
-# build
 go build -o flamedb.exe cmd/flamedb/main.go
 
-# node-1 (seed node)
-.\flamedb.exe config.yml
-
-# node-2 (joins node-1)
-.\flamedb.exe config2.yml
-
-# node-3
-.\flamedb.exe config3.yml
+.\flamedb.exe config.yml   # node-1 (seed)
+.\flamedb.exe config2.yml  # node-2
+.\flamedb.exe config3.yml  # node-3
+.\flamedb.exe config4.yml  # node-4 (joins and rebalances)
 ```
 
-### Testing with nc (from WSL)
+### Reset between tests
+```powershell
+Remove-Item -Recurse -Force data-node1, data-node2, data-node3, data-node4
+```
+
+### Testing with nc (WSL)
 ```bash
-# write with leaderboard update
+# write
 printf 'AUTH flame_abc123\nWRITE kills 10 lb="pixel" player="pixel" region="eu"\n' | nc 192.168.178.199 7777
 
 # quorum write
 printf 'AUTH flame_abc123\nWRITE kills 10 lb="pixel" QUORUM\n' | nc 192.168.178.199 7777
 
-# leaderboard (should return same result from all nodes if replication works)
-printf 'AUTH flame_abc123\nLEADERBOARD kills LIMIT 10 OFFSET 0\n' | nc 192.168.178.199 7777
-printf 'AUTH flame_abc123\nLEADERBOARD kills LIMIT 10 OFFSET 0\n' | nc 192.168.178.199 7778
-printf 'AUTH flame_abc123\nLEADERBOARD kills LIMIT 10 OFFSET 0\n' | nc 192.168.178.199 7779
+# leaderboard from all nodes (should match if replication works)
+for port in 7777 7778 7779 7780; do
+  printf 'AUTH flame_abc123\nLEADERBOARD kills LIMIT 3 OFFSET 0\n' | nc 192.168.178.199 $port
+done
 
-# tag stats (shows cardinality for index selection)
+# cardinality stats
 printf 'AUTH flame_abc123\nSTATS kills TAGS player region\n' | nc 192.168.178.199 7777
 
-# GET with tag filter
-printf 'AUTH flame_abc123\nGET kills WHERE region="eu" AND player="pixel" FROM 2020-01-01 TO 2030-01-01\n' | nc 192.168.178.199 7777
-```
-
-### Reset data between tests
-```powershell
-Remove-Item -Recurse -Force data-node1, data-node2, data-node3, data-node4
+# group leaderboard
+printf 'AUTH flame_abc123\nGROUP_LEADERBOARD kills GROUP "team_red:pixel,notch" GROUP "team_blue:dream"\n' | nc 192.168.178.199 7777
 ```
 
 ### Dependencies
@@ -394,8 +377,8 @@ gopkg.in/yaml.v3               — config parsing
 
 ## Important Design Decisions
 
-- **Eventual consistency by default** — writes return ok after primary write, replicas updated async. Use `QUORUM` flag for stronger guarantees.
-- **Cardinality-based index selection** — when filtering by multiple tags, the tag with lowest cardinality (fewest unique values) is used as the primary index. This is tracked automatically on every write.
-- **Consistent hashing** — metric name determines which node is primary. Different metrics land on different nodes naturally distributing load.
-- **No coordinator** — fully peer-to-peer, no single point of failure in routing layer.
-- **Single node mode** — `replication_factor: 1` and empty `seeds` = standalone mode, no cluster overhead.
+- **Eventual consistency by default** — writes return ok after primary write, replicas async. Use `QUORUM` for stronger guarantees.
+- **Cardinality-based index** — lowest cardinality tag used as primary index, tracked automatically on every write.
+- **Consistent hashing** — metric name determines primary node. No coordinator, fully peer-to-peer.
+- **Single node mode** — `replication_factor: 1` + empty `seeds` = standalone, zero cluster overhead.
+- **Rebalancing uses fresh connections** — dedicated TCP connections separate from pool to avoid race conditions with normal traffic.

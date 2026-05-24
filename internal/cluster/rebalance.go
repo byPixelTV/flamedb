@@ -1,8 +1,11 @@
 package cluster
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
+	"net"
 	"time"
 )
 
@@ -33,10 +36,58 @@ type LeaderboardEntry struct {
 	Value []byte `json:"value"`
 }
 
-// TriggerRebalance wird aufgerufen wenn dieser node gejoint hat
-// checkt welche metrics jetzt zu ihm gehören und requested data
+type rebalanceConn struct {
+	conn    net.Conn
+	scanner *bufio.Scanner
+	writer  *bufio.Writer
+}
+
+func newRebalanceConn(addr, apiKey string) (*rebalanceConn, error) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	// 64MB buffer für große export responses
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
+	writer := bufio.NewWriter(conn)
+
+	rc := &rebalanceConn{conn: conn, scanner: scanner, writer: writer}
+
+	// auth handshake
+	if !scanner.Scan() {
+		conn.Close()
+		return nil, fmt.Errorf("no auth challenge received")
+	}
+
+	fmt.Fprintf(writer, "AUTH %s\n", apiKey)
+	writer.Flush()
+
+	if !scanner.Scan() {
+		conn.Close()
+		return nil, fmt.Errorf("no auth response received")
+	}
+
+	return rc, nil
+}
+
+func (rc *rebalanceConn) send(msg string) ([]byte, error) {
+	fmt.Fprintf(rc.writer, "%s\n", msg)
+	rc.writer.Flush()
+	if !rc.scanner.Scan() {
+		return nil, fmt.Errorf("connection closed during rebalance")
+	}
+	result := make([]byte, len(rc.scanner.Bytes()))
+	copy(result, rc.scanner.Bytes())
+	return result, nil
+}
+
+func (rc *rebalanceConn) close() {
+	rc.conn.Close()
+}
+
 func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
-	// kurz warten bis gossip propagiert ist
 	time.Sleep(2 * time.Second)
 
 	c.Ring.mu.RLock()
@@ -47,13 +98,11 @@ func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
 	c.Ring.mu.RUnlock()
 
 	if len(nodes) <= 1 {
-		return // single node, nichts zu rebalancen
+		return
 	}
 
-	log.Printf("starting rebalance, checking which metrics belong to us...")
+	log.Printf("starting rebalance across %d nodes...", len(nodes)-1)
 
-	// alle anderen nodes fragen welche metrics sie haben
-	// und von denen die zu uns gehören die data holen
 	for _, node := range nodes {
 		if node.ID == c.Self.ID {
 			continue
@@ -63,9 +112,17 @@ func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
 }
 
 func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey string) {
-	// metrics liste von dem node holen (JSON)
-	payload, _ := json.Marshal(DiscoveryMessage{Type: "CLUSTER_METRICS"})
-	result, err := c.pool.Send(node, "CLUSTER "+string(payload))
+	// eigene fresh connection — nicht pool, vermeidet race conditions
+	rc, err := newRebalanceConn(node.Addr, apiKey)
+	if err != nil {
+		log.Printf("rebalance: could not connect to %s: %v", node.ID, err)
+		return
+	}
+	defer rc.close()
+
+	// metrics liste holen
+	metricsPayload, _ := json.Marshal(map[string]string{"type": "CLUSTER_METRICS"})
+	result, err := rc.send("CLUSTER " + string(metricsPayload))
 	if err != nil {
 		log.Printf("rebalance: could not get metrics from %s: %v", node.ID, err)
 		return
@@ -77,35 +134,50 @@ func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey stri
 		return
 	}
 
+	log.Printf("rebalance: %s has %d metrics", node.ID, len(metrics))
+
 	for _, metric := range metrics {
-		// gehoert diese metric zu uns (primary oder replica)?
 		if !c.IsLocal(metric) {
+			continue
+		}
+		if store.HasMetric(metric) {
+			continue
+		}
+
+		// NEU: verhindert dass mehrere goroutines die gleiche metric importieren
+		if _, loaded := c.rebalancing.LoadOrStore(metric, true); loaded {
 			continue
 		}
 
 		log.Printf("rebalance: requesting metric %s from %s", metric, node.ID)
 
-		// data requesten (JSON)
-		payload, _ = json.Marshal(DiscoveryMessage{Type: "CLUSTER_EXPORT", Metric: metric})
-		result, err = c.pool.Send(node, "CLUSTER "+string(payload))
+		exportPayload, _ := json.Marshal(map[string]string{
+			"type":   "CLUSTER_EXPORT",
+			"metric": metric,
+		})
+		result, err = rc.send("CLUSTER " + string(exportPayload))
 		if err != nil {
-			log.Printf("rebalance: export request failed: %v", err)
+			log.Printf("rebalance: export request failed for %s: %v", metric, err)
+			c.rebalancing.Delete(metric) // lock freigeben bei fehler
 			continue
 		}
 
 		var data RebalanceData
 		if err := json.Unmarshal(result, &data); err != nil {
-			log.Printf("rebalance: could not parse export data: %v", err)
+			log.Printf("rebalance: could not parse export data for %s: %v", metric, err)
+			c.rebalancing.Delete(metric)
 			continue
 		}
 
-		// importieren
 		if err := store.ImportRebalanceData(data); err != nil {
-			log.Printf("rebalance: import failed: %v", err)
+			log.Printf("rebalance: import failed for %s: %v", metric, err)
+			c.rebalancing.Delete(metric)
 			continue
 		}
 
 		log.Printf("rebalance: imported metric %s (%d events, %d lb entries)",
 			metric, len(data.Events), len(data.Leaderboard))
+		c.rebalancing.Delete(metric) // nach erfolgreichem import freigeben
+		// (HasMetric gibt jetzt true zurück)
 	}
 }

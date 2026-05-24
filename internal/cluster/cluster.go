@@ -25,6 +25,7 @@ type Cluster struct {
 	readCounter       atomic.Uint64 // für round-robin
 	replicationFactor atomic.Int32
 	readPolicy        atomic.Value
+	rebalancing       sync.Map
 }
 
 func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {

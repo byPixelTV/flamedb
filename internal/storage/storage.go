@@ -11,49 +11,8 @@ import (
 )
 
 type Storage struct {
-	db *pebble.DB
-}
-
-func eventKey(metric string, timestamp int64) []byte {
-	ts := make([]byte, 8)
-	binary.BigEndian.PutUint64(ts, uint64(timestamp))
-	key := append([]byte(metric+":"), ts...)
-	return key
-}
-
-func (s *Storage) WriteEvent(e Event) error {
-	ts := make([]byte, 8)
-	binary.BigEndian.PutUint64(ts, uint64(e.Timestamp))
-
-	primaryKey := eventKey(e.Metric, e.Timestamp)
-
-	batch := s.db.NewBatch()
-
-	val, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-	batch.Set(primaryKey, val, pebble.Sync)
-
-	for k, v := range e.Tags {
-		idxKey := indexKey(e.Metric, k, v, e.Timestamp)
-		batch.Set(idxKey, primaryKey, pebble.Sync)
-	}
-
-	// cardinality tracking
-	if err := s.updateCardinality(batch, e.Metric, e.Tags); err != nil {
-		return err
-	}
-
-	return batch.Commit(pebble.Sync)
-}
-
-func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
-	ts := make([]byte, 8)
-	binary.BigEndian.PutUint64(ts, uint64(timestamp))
-	// format: idx:metric:tagkey:tagvalue:timestamp
-	prefix := fmt.Sprintf("idx:%s:%s:%s:", metric, tagKey, tagValue)
-	return append([]byte(prefix), ts...)
+	db      *pebble.DB
+	batcher *WriteBatcher
 }
 
 func Open(path, compression string) (*Storage, error) {
@@ -69,7 +28,60 @@ func Open(path, compression string) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{db: db}, nil
+	return &Storage{
+		db:      db,
+		batcher: NewWriteBatcher(db),
+	}, nil
+}
+
+func eventKey(metric string, timestamp int64) []byte {
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(timestamp))
+	key := append([]byte(metric+":"), ts...)
+	return key
+}
+
+func (s *Storage) WriteEvent(e Event, sync bool) error {
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(e.Timestamp))
+	primaryKey := eventKey(e.Metric, e.Timestamp)
+
+	val, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+
+	// primary event
+	s.batcher.Add(primaryKey, val)
+
+	// secondary index pro tag
+	for k, v := range e.Tags {
+		idxKey := indexKey(e.Metric, k, v, e.Timestamp)
+		s.batcher.Add(idxKey, primaryKey)
+	}
+
+	// cardinality tracking — das muss sync bleiben weil es reads macht
+	batch := s.db.NewBatch()
+	if err := s.updateCardinality(batch, e.Metric, e.Tags); err != nil {
+		return err
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+
+	// QUORUM = sofort flushen, sonst async
+	if sync {
+		return s.batcher.Flush()
+	}
+	return nil
+}
+
+func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
+	ts := make([]byte, 8)
+	binary.BigEndian.PutUint64(ts, uint64(timestamp))
+	// format: idx:metric:tagkey:tagvalue:timestamp
+	prefix := fmt.Sprintf("idx:%s:%s:%s:", metric, tagKey, tagValue)
+	return append([]byte(prefix), ts...)
 }
 
 func parseCompression(s string) pebble.Compression {

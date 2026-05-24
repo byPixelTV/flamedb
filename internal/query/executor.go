@@ -17,10 +17,15 @@ import (
 type Executor struct {
 	store *storage.Storage
 	lb    *aggregates.Leaderboard
+	cache *storage.LeaderboardCache
 }
 
 func NewExecutor(store *storage.Storage, lb *aggregates.Leaderboard) *Executor {
-	return &Executor{store: store, lb: lb}
+	return &Executor{
+		store: store,
+		lb:    lb,
+		cache: storage.NewLeaderboardCache(1 * time.Second),
+	}
 }
 
 func (e *Executor) Execute(q *Query) (*Result, error) {
@@ -121,12 +126,12 @@ func (e *Executor) GetAllMetrics() []string {
 
 func (e *Executor) executeSet(q *Query) (*Result, error) {
 	if q.UpdateLB {
-		// get current, dann diff berechnen
 		current, _ := e.lb.Get(q.Metric, q.LBEntityID)
 		delta := q.Value - current
 		if err := e.lb.Increment(q.Metric, q.LBEntityID, delta); err != nil {
 			return nil, err
 		}
+		e.cache.Invalidate(q.Metric) // ← neu
 	}
 	return &Result{}, nil
 }
@@ -136,6 +141,7 @@ func (e *Executor) executeDelete(q *Query) (*Result, error) {
 		if err := e.lb.Delete(q.Metric, q.LBEntityID); err != nil {
 			return nil, err
 		}
+		e.cache.Invalidate(q.Metric) // ← neu
 	}
 	return &Result{}, nil
 }
@@ -153,7 +159,8 @@ func (e *Executor) executeWrite(q *Query) (*Result, error) {
 		Tags:      q.Tags,
 	}
 
-	if err := e.store.WriteEvent(event); err != nil {
+	// sync=true wenn QUORUM, sonst async batching
+	if err := e.store.WriteEvent(event, q.Quorum); err != nil {
 		return nil, err
 	}
 
@@ -161,16 +168,26 @@ func (e *Executor) executeWrite(q *Query) (*Result, error) {
 		if err := e.lb.Increment(q.Metric, q.LBEntityID, q.Value); err != nil {
 			return nil, err
 		}
+		e.cache.Invalidate(q.Metric)
 	}
 
 	return &Result{}, nil
 }
 
 func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
+	// cache check
+	if cached, ok := e.cache.Get(q.Metric, q.Limit, q.Offset); ok {
+		return &Result{Leaderboard: cached}, nil
+	}
+
 	entries, err := e.lb.TopN(q.Metric, q.Limit, q.Offset)
 	if err != nil {
 		return nil, err
 	}
+
+	// in cache schreiben
+	e.cache.Set(q.Metric, q.Limit, q.Offset, entries)
+
 	return &Result{Leaderboard: entries}, nil
 }
 
