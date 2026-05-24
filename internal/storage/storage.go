@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/cluster"
@@ -35,6 +36,7 @@ type Storage struct {
 	cardCache   *cardCache
 	cardUpdater *cardUpdater
 	cache       *pebble.Cache
+	latest      sync.Map
 }
 
 func Open(path, compression string) (*Storage, error) {
@@ -148,10 +150,28 @@ func (s *Storage) WriteEvent(e Event, sync bool) error {
 	}
 
 	// QUORUM = sofort flushen, sonst async
+	s.updateLatest(e)
 	if sync {
 		return s.batcher.Flush()
 	}
 	return nil
+}
+
+func (s *Storage) updateLatest(e Event) {
+	for {
+		current, ok := s.latest.Load(e.Metric)
+		if ok && e.Timestamp <= current.(Event).Timestamp {
+			return
+		}
+		if !ok {
+			actual, loaded := s.latest.LoadOrStore(e.Metric, e)
+			if !loaded || e.Timestamp <= actual.(Event).Timestamp {
+				return
+			}
+		}
+		s.latest.Store(e.Metric, e)
+		return
+	}
 }
 
 func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
@@ -222,6 +242,15 @@ func (s *Storage) ReadRange(metric string, from, to int64) ([]Event, error) {
 }
 
 func (s *Storage) ReadRangeDesc(metric string, from, to int64, limit, offset int) ([]Event, error) {
+	if limit == 1 && offset == 0 {
+		if latest, ok := s.latest.Load(metric); ok {
+			e := latest.(Event)
+			if e.Timestamp >= from && e.Timestamp <= to {
+				return []Event{e}, nil
+			}
+		}
+	}
+
 	lower := eventKey(metric, from)
 	upper := eventKey(metric, to)
 

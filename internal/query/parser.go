@@ -31,7 +31,13 @@ func Parse(input string) (*Query, error) {
 		q.Metric = tokens[1]
 		// rest sind tag keys
 		if len(tokens) > 2 && strings.ToUpper(tokens[2]) == "TAGS" {
-			q.TagKeys = tokens[3:]
+			for _, token := range tokens[3:] {
+				if strings.ToUpper(token) == "__LOCAL" {
+					q.ForceLocal = true
+					continue
+				}
+				q.TagKeys = append(q.TagKeys, token)
+			}
 		}
 		return q, nil
 	case "GROUP_LEADERBOARD":
@@ -60,6 +66,10 @@ func Parse(input string) (*Query, error) {
 				continue
 			case "__REPLICA":
 				q.IsReplica = true
+				i++
+				continue
+			case "__LOCAL":
+				q.ForceLocal = true
 				i++
 				continue
 			}
@@ -104,6 +114,16 @@ func Parse(input string) (*Query, error) {
 
 		i := 3
 		for i < len(tokens) {
+			switch strings.ToUpper(tokens[i]) {
+			case "__REPLICA":
+				q.IsReplica = true
+				i++
+				continue
+			case "__LOCAL":
+				q.ForceLocal = true
+				i++
+				continue
+			}
 			if i+2 > len(tokens) {
 				break
 			}
@@ -133,6 +153,12 @@ func Parse(input string) (*Query, error) {
 		i := 2
 		for i < len(tokens) {
 			switch strings.ToUpper(tokens[i]) {
+			case "__REPLICA":
+				q.IsReplica = true
+				i++
+			case "__LOCAL":
+				q.ForceLocal = true
+				i++
 			case "FROM":
 				ts, err := parseTimeValue(tokens[i+1])
 				if err != nil {
@@ -193,6 +219,9 @@ func Parse(input string) (*Query, error) {
 	i := 2
 	for i < len(tokens) {
 		switch strings.ToUpper(tokens[i]) {
+		case "__LOCAL":
+			q.ForceLocal = true
+			i++
 		case "GROUP":
 			// expect: GROUP BY <duration>
 			if i+1 >= len(tokens) || strings.ToUpper(tokens[i+1]) != "BY" {

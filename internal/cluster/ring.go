@@ -27,6 +27,12 @@ func NewRing(replicas int) *Ring {
 	}
 }
 
+func (r *Ring) Replicas() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.replicas
+}
+
 func (r *Ring) Add(node Node) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

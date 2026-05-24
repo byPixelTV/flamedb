@@ -90,6 +90,7 @@ func (s *Server) Listen(addr string) error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), 64<<20)
 
 	// auth handshake
 	writeJSON(conn, map[string]string{"auth": "required"})
@@ -126,11 +127,46 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		if strings.HasPrefix(line, "REPL_BATCH ") {
+			if !session.Can(auth.PermWrite) {
+				writeJSON(conn, map[string]string{"error": "permission denied"})
+				continue
+			}
+			queries := strings.Split(strings.TrimSpace(line[len("REPL_BATCH "):]), "\x1f")
+			for _, replicaLine := range queries {
+				replicaLine = strings.TrimSpace(replicaLine)
+				if replicaLine == "" {
+					continue
+				}
+				q, err := query.Parse(replicaLine)
+				if err != nil {
+					writeJSON(conn, map[string]string{"error": err.Error()})
+					continue
+				}
+				q.IsReplica = true
+				q.ForceLocal = true
+				if _, err := s.exec.Execute(q); err != nil {
+					writeJSON(conn, map[string]string{"error": err.Error()})
+					continue
+				}
+			}
+			writeJSON(conn, map[string]string{"cluster": "ok"})
+			continue
+		}
+
 		if strings.HasPrefix(strings.ToUpper(line), "CLUSTER ") {
 			payload := strings.TrimSpace(line[8:])
 			var msg cluster.DiscoveryMessage
 			if err := json.Unmarshal([]byte(payload), &msg); err != nil {
 				writeJSON(conn, map[string]string{"error": "invalid cluster message"})
+				continue
+			}
+			if msg.Type == "CLUSTER_TOPOLOGY" {
+				if !session.Can(auth.PermRead) && !session.Can(auth.PermWrite) {
+					writeJSON(conn, map[string]string{"error": "permission denied"})
+					continue
+				}
+				writeJSON(conn, s.cluster.Topology())
 				continue
 			}
 			if !session.Can(auth.PermWrite) {
@@ -250,7 +286,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					}
 					res = *r
 				} else {
-					bytes, err := s.cluster.SendToNode(readNode, metricLine)
+					bytes, err := s.cluster.SendToNodeLocal(readNode, metricLine)
 					if err != nil {
 						writeJSON(conn, map[string]string{"error": err.Error()})
 						continue
@@ -286,7 +322,11 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		if (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) &&
+		requiresPrimary := q.Type == query.QueryTypeSet ||
+			q.Type == query.QueryTypeDelete ||
+			(q.Type == query.QueryTypeWrite && q.UpdateLB)
+
+		if requiresPrimary &&
 			!q.IsReplica &&
 			!s.cluster.IsPrimaryFor(q.Metric) {
 
@@ -300,7 +340,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		// forwarden wenn nicht lokal
-		if !s.cluster.IsLocal(q.Metric) {
+		if !q.ForceLocal && !s.cluster.IsLocal(q.Metric) {
 			result, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, line)
 			if err != nil {
 				writeJSON(conn, map[string]string{"error": err.Error()})
@@ -314,8 +354,8 @@ func (s *Server) handleConn(conn net.Conn) {
 		switch q.Type {
 		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats:
 			readNode := s.cluster.GetReadNode(q.Metric)
-			if readNode.ID != s.cluster.Self.ID {
-				result, err := s.cluster.SendToNode(readNode, line)
+			if !q.ForceLocal && readNode.ID != s.cluster.Self.ID {
+				result, err := s.cluster.SendToNodeLocal(readNode, line)
 				if err != nil {
 					// fallback: lokal handlen
 					break
@@ -335,13 +375,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		// replication nur vom primary, nicht von replicas
 		switch q.Type {
 		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
-			if s.cluster.IsPrimaryFor(q.Metric) && !q.IsReplica {
+			replicateFromThisNode := !q.IsReplica && (s.cluster.IsPrimaryFor(q.Metric) || (q.Type == query.QueryTypeWrite && !q.UpdateLB))
+			if replicateFromThisNode {
 				replicaQuery := line + " __replica"
 				if err := s.cluster.ReplicateWrite(q.Metric, replicaQuery, q.Quorum); err != nil {
 					writeJSON(conn, map[string]string{"error": fmt.Sprintf("quorum failed: %v", err)})
 					continue
 				}
 			}
+			writeEmptyResult(conn)
+			continue
 		}
 
 		writeJSON(conn, result)
@@ -368,4 +411,8 @@ func isConnectionClosed(err error) bool {
 func writeJSON(conn net.Conn, v any) {
 	data, _ := json.Marshal(v)
 	conn.Write(append(data, '\n'))
+}
+
+func writeEmptyResult(conn net.Conn) {
+	_, _ = conn.Write([]byte("{}\n"))
 }

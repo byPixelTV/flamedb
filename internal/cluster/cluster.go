@@ -16,6 +16,8 @@ const (
 	ReadPolicyLocal      ReadPolicy = "local"
 )
 
+const defaultReadPolicy = ReadPolicyLocal
+
 type Cluster struct {
 	Self              Node
 	Ring              *Ring
@@ -26,6 +28,17 @@ type Cluster struct {
 	replicationFactor atomic.Int32
 	readPolicy        atomic.Value
 	rebalancing       sync.Map
+	replicationQueues sync.Map
+	fanoutQueues      sync.Map
+	routeCache        sync.Map
+}
+
+type routeInfo struct {
+	nodes     []Node
+	primary   Node
+	replicas  []Node
+	isLocal   bool
+	isPrimary bool
 }
 
 func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {
@@ -37,7 +50,7 @@ func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster
 	}
 	c.Ring.Add(self) // self immer zuerst adden
 	c.replicationFactor.Store(int32(replicationFactor))
-	c.readPolicy.Store(ReadPolicyRoundRobin)
+	c.readPolicy.Store(defaultReadPolicy)
 	return c
 }
 
@@ -50,11 +63,12 @@ func (c *Cluster) SetReplicationFactor(n int) {
 		n = 1
 	}
 	c.replicationFactor.Store(int32(n))
+	c.invalidateRoutes()
 }
 
 func (c *Cluster) SetReadPolicy(p ReadPolicy) {
 	if p == "" {
-		p = ReadPolicyRoundRobin
+		p = defaultReadPolicy
 	}
 	c.readPolicy.Store(p)
 }
@@ -63,7 +77,7 @@ func (c *Cluster) getReadPolicy() ReadPolicy {
 	if v := c.readPolicy.Load(); v != nil {
 		return v.(ReadPolicy)
 	}
-	return ReadPolicyRoundRobin
+	return defaultReadPolicy
 }
 
 func (c *Cluster) BroadcastConfig(msg DiscoveryMessage) {
@@ -89,30 +103,28 @@ func (c *Cluster) BroadcastConfig(msg DiscoveryMessage) {
 
 func (c *Cluster) GetReadNode(metric string) Node {
 	policy := c.getReadPolicy()
+	route := c.getRoute(metric)
 	switch policy {
 	case ReadPolicyPrimary:
-		nodes := c.Ring.GetN(metric, 1)
-		if len(nodes) == 0 {
+		if route.primary.ID == "" {
 			return c.Self
 		}
-		return nodes[0]
+		return route.primary
 	case ReadPolicyLocal:
-		if c.IsLocal(metric) {
+		if route.isLocal {
 			return c.Self
 		}
 		// fallback: primary
-		nodes := c.Ring.GetN(metric, 1)
-		if len(nodes) == 0 {
+		if route.primary.ID == "" {
 			return c.Self
 		}
-		return nodes[0]
+		return route.primary
 	default: // rr
-		nodes := c.Ring.GetN(metric, c.GetReplicationFactor())
-		if len(nodes) == 0 {
+		if len(route.nodes) == 0 {
 			return c.Self
 		}
-		idx := c.readCounter.Add(1) % uint64(len(nodes))
-		return nodes[idx]
+		idx := c.readCounter.Add(1) % uint64(len(route.nodes))
+		return route.nodes[idx]
 	}
 }
 
@@ -120,16 +132,19 @@ func (c *Cluster) SendToNode(node Node, query string) ([]byte, error) {
 	return c.pool.Send(node, query)
 }
 
+func (c *Cluster) SendToNodeLocal(node Node, query string) ([]byte, error) {
+	return c.pool.Send(node, query+" __local")
+}
+
 func (c *Cluster) ForwardToPrimary(metric, apiKey, query string) ([]byte, error) {
-	nodes := c.Ring.GetN(metric, 1)
-	if len(nodes) == 0 {
+	route := c.getRoute(metric)
+	if route.primary.ID == "" {
 		return nil, fmt.Errorf("no primary found for metric: %s", metric)
 	}
-	primary := nodes[0]
-	if primary.ID == c.Self.ID {
+	if route.primary.ID == c.Self.ID {
 		return nil, fmt.Errorf("self is primary, should not forward")
 	}
-	return c.pool.Send(primary, query)
+	return c.pool.Send(route.primary, query)
 }
 
 func (c *Cluster) GetAllNodes() []NodeInfo {
@@ -146,15 +161,26 @@ func (c *Cluster) GetAllNodes() []NodeInfo {
 	return nodes
 }
 
+func (c *Cluster) Topology() TopologyInfo {
+	return TopologyInfo{
+		Cluster:           "ok",
+		Self:              NodeInfo{ID: c.Self.ID, Addr: c.Self.Addr},
+		Nodes:             c.GetAllNodes(),
+		ReplicationFactor: c.GetReplicationFactor(),
+		VirtualNodes:      c.Ring.Replicas(),
+		ReadPolicy:        string(c.getReadPolicy()),
+	}
+}
+
 func (c *Cluster) ForwardWithFailover(metric, apiKey, query string) ([]byte, error) {
-	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
+	route := c.getRoute(metric)
 
 	var lastErr error
-	for _, node := range nodes {
+	for _, node := range route.nodes {
 		if node.ID == c.Self.ID {
 			continue
 		}
-		result, err := c.pool.Send(node, query)
+		result, err := c.pool.Send(node, query+" __local")
 		if err != nil {
 			lastErr = err
 			log.Printf("forward to %s failed, trying next replica: %v", node.ID, err)
@@ -166,42 +192,26 @@ func (c *Cluster) ForwardWithFailover(metric, apiKey, query string) ([]byte, err
 }
 
 func (c *Cluster) GetReplicaNodes(metric string) []Node {
-	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
-	// primary rausfiltern, nur replicas
-	var replicas []Node
-	for _, n := range nodes {
-		if n.ID != c.Self.ID {
-			replicas = append(replicas, n)
-		}
-	}
-	return replicas
+	return c.getRoute(metric).replicas
 }
 
 func (c *Cluster) IsPrimaryFor(metric string) bool {
-	nodes := c.Ring.GetN(metric, 1)
-	if len(nodes) == 0 {
-		return true
-	}
-	return nodes[0].ID == c.Self.ID
+	return c.getRoute(metric).isPrimary
 }
 
 // IsLocal jetzt: bin ich primary ODER replica für diese metric?
 func (c *Cluster) IsLocal(metric string) bool {
-	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
-	for _, n := range nodes {
-		if n.ID == c.Self.ID {
-			return true
-		}
-	}
-	return false
+	return c.getRoute(metric).isLocal
 }
 
 func (c *Cluster) AddNode(node Node) {
 	c.Ring.Add(node)
+	c.invalidateRoutes()
 }
 
 func (c *Cluster) RemoveNode(nodeID string) {
 	c.Ring.Remove(nodeID)
+	c.invalidateRoutes()
 }
 
 func (c *Cluster) PropagateJoin(node Node, apiKey string) {
@@ -222,4 +232,35 @@ func (c *Cluster) Knows(nodeID string) bool {
 		}
 	}
 	return false
+}
+
+func (c *Cluster) getRoute(metric string) routeInfo {
+	if cached, ok := c.routeCache.Load(metric); ok {
+		return cached.(routeInfo)
+	}
+
+	nodes := c.Ring.GetN(metric, c.GetReplicationFactor())
+	info := routeInfo{nodes: nodes}
+	if len(nodes) > 0 {
+		info.primary = nodes[0]
+		info.isPrimary = info.primary.ID == c.Self.ID
+	}
+
+	for _, node := range nodes {
+		if node.ID == c.Self.ID {
+			info.isLocal = true
+			continue
+		}
+		info.replicas = append(info.replicas, node)
+	}
+
+	actual, _ := c.routeCache.LoadOrStore(metric, info)
+	return actual.(routeInfo)
+}
+
+func (c *Cluster) invalidateRoutes() {
+	c.routeCache.Range(func(key, _ any) bool {
+		c.routeCache.Delete(key)
+		return true
+	})
 }

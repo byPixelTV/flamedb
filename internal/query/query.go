@@ -51,6 +51,7 @@ type Query struct {
 	TagKeys     []string // for get queries, which tag keys to return
 	Quorum      bool
 	IsReplica   bool
+	ForceLocal  bool
 	Groups      []GroupDef
 	Aggregate   AggType
 	GroupBy     time.Duration

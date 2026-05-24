@@ -19,6 +19,7 @@ type DiscoveryMessage struct {
 	ReadPolicy        string     `json:"read_policy,omitempty"`
 	Propagate         bool       `json:"propagate,omitempty"`
 	UpdateSeeds       bool       `json:"update_seeds,omitempty"`
+	Queries           []string   `json:"queries,omitempty"`
 
 	Metric string `json:"metric,omitempty"` // fuer CLUSTER_EXPORT
 }
@@ -26,6 +27,15 @@ type DiscoveryMessage struct {
 type NodeInfo struct {
 	ID   string `json:"id"`
 	Addr string `json:"addr"`
+}
+
+type TopologyInfo struct {
+	Cluster           string     `json:"cluster"`
+	Self              NodeInfo   `json:"self"`
+	Nodes             []NodeInfo `json:"nodes"`
+	ReplicationFactor int        `json:"replication_factor"`
+	VirtualNodes      int        `json:"virtual_nodes"`
+	ReadPolicy        string     `json:"read_policy"`
 }
 
 // propagiert einen neuen node an alle bekannten nodes

@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+const connsPerNode = 64
+const poolRequestTimeout = 5 * time.Second
+const scannerMaxTokenSize = 64 << 20
 
 type pooledConn struct {
 	conn    net.Conn
@@ -16,46 +21,88 @@ type pooledConn struct {
 
 type ConnPool struct {
 	mu     sync.RWMutex
-	pools  map[string]*pooledConn // nodeID → conn
+	pools  map[string]*nodePool // nodeID → connections
 	apiKey string
+}
+
+type nodePool struct {
+	mu    sync.Mutex
+	next  atomic.Uint64
+	conns []*pooledConn
 }
 
 func NewConnPool(apiKey string) *ConnPool {
 	return &ConnPool{
-		pools:  make(map[string]*pooledConn),
+		pools:  make(map[string]*nodePool),
 		apiKey: apiKey,
 	}
 }
 
 func (p *ConnPool) get(node Node) (*pooledConn, error) {
 	p.mu.RLock()
-	pc, ok := p.pools[node.ID]
+	np, ok := p.pools[node.ID]
 	p.mu.RUnlock()
 
 	if ok {
-		return pc, nil
+		return np.get(p, node)
 	}
 
+	p.mu.Lock()
+	np, ok = p.pools[node.ID]
+	if !ok {
+		np = &nodePool{}
+		p.pools[node.ID] = np
+	}
+	p.mu.Unlock()
+
+	return np.get(p, node)
+}
+
+func (np *nodePool) get(p *ConnPool, node Node) (*pooledConn, error) {
+	np.mu.Lock()
+	defer np.mu.Unlock()
+
+	if len(np.conns) >= connsPerNode {
+		idx := np.next.Add(1) % uint64(len(np.conns))
+		return np.conns[idx], nil
+	}
+
+	pc, err := p.dial(node)
+	if err != nil {
+		if len(np.conns) > 0 {
+			idx := np.next.Add(1) % uint64(len(np.conns))
+			return np.conns[idx], nil
+		}
+		return nil, err
+	}
+	np.conns = append(np.conns, pc)
+	return pc, nil
+}
+
+func (p *ConnPool) dial(node Node) (*pooledConn, error) {
 	// neue connection aufbauen
 	conn, err := net.DialTimeout("tcp", node.Addr, 3*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	_ = conn.SetDeadline(time.Now().Add(poolRequestTimeout))
 
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
 
 	// auth handshake
-	scanner.Scan() // {"auth":"required"}
+	if !scanner.Scan() { // {"auth":"required"}
+		conn.Close()
+		return nil, fmt.Errorf("auth challenge failed: %v", scanner.Err())
+	}
 	fmt.Fprintf(conn, "AUTH %s\n", p.apiKey)
-	scanner.Scan() // {"auth":"ok"}
+	if !scanner.Scan() { // {"auth":"ok"}
+		conn.Close()
+		return nil, fmt.Errorf("auth response failed: %v", scanner.Err())
+	}
+	_ = conn.SetDeadline(time.Time{})
 
-	pc = &pooledConn{conn: conn, scanner: scanner}
-
-	p.mu.Lock()
-	p.pools[node.ID] = pc
-	p.mu.Unlock()
-
-	return pc, nil
+	return &pooledConn{conn: conn, scanner: scanner}, nil
 }
 
 func (p *ConnPool) Send(node Node, query string) ([]byte, error) {
@@ -67,28 +114,41 @@ func (p *ConnPool) Send(node Node, query string) ([]byte, error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
+	_ = pc.conn.SetDeadline(time.Now().Add(poolRequestTimeout))
+	defer pc.conn.SetDeadline(time.Time{})
+
 	_, err = fmt.Fprintf(pc.conn, "%s\n", query)
 	if err != nil {
 		// connection tot, neu aufbauen
-		p.evict(node.ID)
+		p.evictConn(node.ID, pc)
 		return p.sendFresh(node, query)
 	}
 
 	if !pc.scanner.Scan() {
-		p.evict(node.ID)
+		p.evictConn(node.ID, pc)
 		return p.sendFresh(node, query)
 	}
 
-	return pc.scanner.Bytes(), nil
+	return append([]byte(nil), pc.scanner.Bytes()...), nil
 }
 
-func (p *ConnPool) evict(nodeID string) {
-	p.mu.Lock()
-	if pc, ok := p.pools[nodeID]; ok {
-		pc.conn.Close()
-		delete(p.pools, nodeID)
+func (p *ConnPool) evictConn(nodeID string, dead *pooledConn) {
+	p.mu.RLock()
+	np, ok := p.pools[nodeID]
+	p.mu.RUnlock()
+	if !ok {
+		return
 	}
-	p.mu.Unlock()
+
+	np.mu.Lock()
+	defer np.mu.Unlock()
+	for i, pc := range np.conns {
+		if pc == dead {
+			_ = pc.conn.Close()
+			np.conns = append(np.conns[:i], np.conns[i+1:]...)
+			break
+		}
+	}
 }
 
 func (p *ConnPool) sendFresh(node Node, query string) ([]byte, error) {
@@ -98,18 +158,22 @@ func (p *ConnPool) sendFresh(node Node, query string) ([]byte, error) {
 	}
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	_ = pc.conn.SetDeadline(time.Now().Add(poolRequestTimeout))
+	defer pc.conn.SetDeadline(time.Time{})
 	fmt.Fprintf(pc.conn, "%s\n", query)
 	if !pc.scanner.Scan() {
 		return nil, fmt.Errorf("connection failed after retry")
 	}
-	return pc.scanner.Bytes(), nil
+	return append([]byte(nil), pc.scanner.Bytes()...), nil
 }
 
 func (p *ConnPool) CloseAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, pc := range p.pools {
-		pc.conn.Close()
+	for _, np := range p.pools {
+		for _, pc := range np.conns {
+			pc.conn.Close()
+		}
 	}
-	p.pools = make(map[string]*pooledConn)
+	p.pools = make(map[string]*nodePool)
 }
