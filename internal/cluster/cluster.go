@@ -1,10 +1,19 @@
 package cluster
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+)
+
+type ReadPolicy string
+
+const (
+	ReadPolicyRoundRobin ReadPolicy = "rr"
+	ReadPolicyPrimary    ReadPolicy = "primary"
+	ReadPolicyLocal      ReadPolicy = "local"
 )
 
 type Cluster struct {
@@ -14,6 +23,8 @@ type Cluster struct {
 	pool              *ConnPool
 	ReplicationFactor int
 	readCounter       atomic.Uint64 // für round-robin
+	replicationFactor atomic.Int32
+	readPolicy        atomic.Value
 }
 
 func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {
@@ -24,16 +35,84 @@ func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster
 		ReplicationFactor: replicationFactor,
 	}
 	c.Ring.Add(self) // self immer zuerst adden
+	c.replicationFactor.Store(int32(replicationFactor))
+	c.readPolicy.Store(ReadPolicyRoundRobin)
 	return c
 }
 
-func (c *Cluster) GetReadNode(metric string) Node {
-	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
-	if len(nodes) == 0 {
-		return c.Self
+func (c *Cluster) GetReplicationFactor() int {
+	return int(c.replicationFactor.Load())
+}
+
+func (c *Cluster) SetReplicationFactor(n int) {
+	if n < 1 {
+		n = 1
 	}
-	idx := c.readCounter.Add(1) % uint64(len(nodes))
-	return nodes[idx]
+	c.replicationFactor.Store(int32(n))
+}
+
+func (c *Cluster) SetReadPolicy(p ReadPolicy) {
+	if p == "" {
+		p = ReadPolicyRoundRobin
+	}
+	c.readPolicy.Store(p)
+}
+
+func (c *Cluster) getReadPolicy() ReadPolicy {
+	if v := c.readPolicy.Load(); v != nil {
+		return v.(ReadPolicy)
+	}
+	return ReadPolicyRoundRobin
+}
+
+func (c *Cluster) BroadcastConfig(msg DiscoveryMessage) {
+	msg.Type = "SET_CONFIG"
+	msg.Propagate = false
+
+	payload, _ := json.Marshal(msg)
+
+	c.Ring.mu.RLock()
+	nodes := make(map[string]Node)
+	for _, n := range c.Ring.nodes {
+		nodes[n.ID] = n
+	}
+	c.Ring.mu.RUnlock()
+
+	for _, node := range nodes {
+		if node.ID == c.Self.ID {
+			continue
+		}
+		_, _ = c.pool.Send(node, "CLUSTER "+string(payload))
+	}
+}
+
+func (c *Cluster) GetReadNode(metric string) Node {
+	policy := c.getReadPolicy()
+	switch policy {
+	case ReadPolicyPrimary:
+		nodes := c.Ring.GetN(metric, 1)
+		if len(nodes) == 0 {
+			return c.Self
+		}
+		return nodes[0]
+	case ReadPolicyLocal:
+		if c.IsLocal(metric) {
+			return c.Self
+		}
+		// fallback: primary
+		nodes := c.Ring.GetN(metric, 1)
+		if len(nodes) == 0 {
+			return c.Self
+		}
+		return nodes[0]
+	default: // rr
+		nodes := c.Ring.GetN(metric, c.GetReplicationFactor())
+		if len(nodes) == 0 {
+			return c.Self
+		}
+		idx := c.readCounter.Add(1) % uint64(len(nodes))
+		return nodes[idx]
+	}
 }
 
 func (c *Cluster) SendToNode(node Node, query string) ([]byte, error) {

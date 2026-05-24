@@ -10,12 +10,17 @@ import (
 )
 
 type DiscoveryMessage struct {
-	Type       string   `json:"type"`
-	NodeID     string   `json:"node_id"`
-	Addr       string   `json:"addr"`
-	KnownNodes []string `json:"known_nodes,omitempty"`
-	// neu:
-	Peers []NodeInfo `json:"peers,omitempty"`
+	Type              string     `json:"type"`
+	NodeID            string     `json:"node_id"`
+	Addr              string     `json:"addr"`
+	KnownNodes        []string   `json:"known_nodes,omitempty"`
+	Peers             []NodeInfo `json:"peers,omitempty"`
+	ReplicationFactor int        `json:"replication_factor,omitempty"`
+	ReadPolicy        string     `json:"read_policy,omitempty"`
+	Propagate         bool       `json:"propagate,omitempty"`
+	UpdateSeeds       bool       `json:"update_seeds,omitempty"`
+
+	Metric string `json:"metric,omitempty"` // fuer CLUSTER_EXPORT
 }
 
 type NodeInfo struct {

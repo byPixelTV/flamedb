@@ -7,10 +7,12 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/auth"
 	"github.com/byPixelTV/flamedb/internal/cluster"
+	"github.com/byPixelTV/flamedb/internal/config"
 	"github.com/byPixelTV/flamedb/internal/query"
 	"github.com/byPixelTV/flamedb/internal/storage"
 )
@@ -21,15 +23,50 @@ type Server struct {
 	cluster *cluster.Cluster
 	apiKey  string
 	store   *storage.Storage // neu
+	cfgPath string
+	cfgMu   sync.Mutex
+	cfg     *config.Config
 }
 
-func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cluster.Cluster, internalKey string) *Server {
+func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cluster.Cluster, internalKey string, cfg *config.Config, cfgPath string) *Server {
 	return &Server{
 		exec:    query.NewExecutor(store, lb),
 		auth:    a,
 		cluster: c,
 		apiKey:  internalKey,
-		store:   store, // neu
+		store:   store,
+		cfg:     cfg,
+		cfgPath: cfgPath,
+	}
+}
+
+func (s *Server) persistConfig(msg cluster.DiscoveryMessage) {
+	if s.cfg == nil || s.cfgPath == "" {
+		return
+	}
+
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	if msg.ReplicationFactor > 0 {
+		s.cfg.Cluster.ReplicationFactor = msg.ReplicationFactor
+	}
+	if msg.ReadPolicy != "" {
+		s.cfg.Cluster.ReadPolicy = msg.ReadPolicy
+	}
+	if msg.UpdateSeeds {
+		peers := s.cluster.GetAllNodes()
+		seeds := make([]string, 0, len(peers))
+		for _, p := range peers {
+			if p.ID != s.cluster.Self.ID {
+				seeds = append(seeds, p.Addr)
+			}
+		}
+		s.cfg.Cluster.Seeds = seeds
+	}
+
+	if err := config.Save(s.cfgPath, s.cfg); err != nil {
+		log.Printf("persist config failed: %v", err)
 	}
 }
 
@@ -96,6 +133,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "invalid cluster message"})
 				continue
 			}
+			if !session.Can(auth.PermWrite) {
+				writeJSON(conn, map[string]string{"error": "permission denied"})
+				continue
+			}
 			switch msg.Type {
 			case "CLUSTER_METRICS":
 				// alle metrics die dieser node hat zurückschicken
@@ -103,15 +144,31 @@ func (s *Server) handleConn(conn net.Conn) {
 				data, _ := json.Marshal(metrics)
 				conn.Write(append(data, '\n'))
 				continue
+			case "SET_CONFIG":
+				if msg.ReplicationFactor > 0 {
+					s.cluster.SetReplicationFactor(msg.ReplicationFactor)
+					go s.cluster.TriggerRebalance(s.store, s.apiKey)
+				}
+				if msg.ReadPolicy != "" {
+					s.cluster.SetReadPolicy(cluster.ReadPolicy(msg.ReadPolicy))
+				}
 
+				// persist lokale config
+				s.persistConfig(msg)
+
+				// propagate an alle nodes (nur wenn Admin das will)
+				if msg.Propagate {
+					s.cluster.BroadcastConfig(msg)
+				}
+
+				writeJSON(conn, map[string]string{"cluster": "ok"})
+				continue
 			case "CLUSTER_EXPORT":
-				// metric name nach dem command
-				parts := strings.SplitN(line, " ", 2)
-				if len(parts) < 2 {
+				metricName := strings.TrimSpace(msg.Metric)
+				if metricName == "" {
 					writeJSON(conn, map[string]string{"error": "missing metric"})
 					continue
 				}
-				metricName := strings.TrimSpace(parts[1])
 				data, err := s.store.ExportMetricData(metricName)
 				if err != nil {
 					writeJSON(conn, map[string]string{"error": err.Error()})
@@ -158,7 +215,19 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
-		// forwarden wenn nicht lokal
+		if (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) &&
+			!q.IsReplica &&
+			!s.cluster.IsPrimaryFor(q.Metric) {
+
+			result, err := s.cluster.ForwardToPrimary(q.Metric, s.apiKey, line)
+			if err != nil {
+				writeJSON(conn, map[string]string{"error": err.Error()})
+				continue
+			}
+			conn.Write(append(result, '\n'))
+			continue
+		}
+
 		// forwarden wenn nicht lokal
 		if !s.cluster.IsLocal(q.Metric) {
 			result, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, line)

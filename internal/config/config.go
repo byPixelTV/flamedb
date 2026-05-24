@@ -33,6 +33,7 @@ type Config struct {
 type ClusterConfig struct {
 	Seeds             []string `yaml:"seeds"`
 	ReplicationFactor int      `yaml:"replication_factor"`
+	ReadPolicy        string   `yaml:"read_policy,omitempty"`
 }
 
 type NodeConfig struct {
@@ -50,4 +51,16 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func Save(path string, cfg *Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

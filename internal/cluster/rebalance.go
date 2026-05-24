@@ -63,8 +63,9 @@ func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
 }
 
 func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey string) {
-	// metrics liste von dem node holen
-	result, err := c.pool.Send(node, "CLUSTER_METRICS")
+	// metrics liste von dem node holen (JSON)
+	payload, _ := json.Marshal(DiscoveryMessage{Type: "CLUSTER_METRICS"})
+	result, err := c.pool.Send(node, "CLUSTER "+string(payload))
 	if err != nil {
 		log.Printf("rebalance: could not get metrics from %s: %v", node.ID, err)
 		return
@@ -72,24 +73,21 @@ func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey stri
 
 	var metrics []string
 	if err := json.Unmarshal(result, &metrics); err != nil {
+		log.Printf("rebalance: invalid metrics response from %s: %s", node.ID, string(result))
 		return
 	}
 
 	for _, metric := range metrics {
-		// gehört diese metric zu uns als primary?
-		if !c.IsPrimaryFor(metric) {
-			continue
-		}
-
-		// haben wir die data bereits?
-		if store.HasMetric(metric) {
+		// gehoert diese metric zu uns (primary oder replica)?
+		if !c.IsLocal(metric) {
 			continue
 		}
 
 		log.Printf("rebalance: requesting metric %s from %s", metric, node.ID)
 
-		// data requesten
-		result, err := c.pool.Send(node, "CLUSTER_EXPORT "+metric)
+		// data requesten (JSON)
+		payload, _ = json.Marshal(DiscoveryMessage{Type: "CLUSTER_EXPORT", Metric: metric})
+		result, err = c.pool.Send(node, "CLUSTER "+string(payload))
 		if err != nil {
 			log.Printf("rebalance: export request failed: %v", err)
 			continue

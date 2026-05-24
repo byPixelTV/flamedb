@@ -62,7 +62,11 @@ func main() {
 		}
 	}()
 
-	srv := server.New(store, lb, a, c, internalKey)
+	if cfg.Cluster.ReadPolicy != "" {
+		c.SetReadPolicy(cluster.ReadPolicy(cfg.Cluster.ReadPolicy))
+	}
+
+	srv := server.New(store, lb, a, c, internalKey, cfg, configPath)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
