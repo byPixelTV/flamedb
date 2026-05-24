@@ -178,27 +178,37 @@ func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
 
 // ExportLeaderboard gibt alle leaderboard entries für eine metric zurück
 func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
-	prefix := []byte("lb:" + metric + ":")
-	upper := append([]byte("lb:"+metric+":"), 0xFF)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
 	var kvs []RawKV
-	for iter.First(); iter.Valid(); iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		val := make([]byte, len(iter.Value()))
-		copy(key, iter.Key())
-		copy(val, iter.Value())
-		kvs = append(kvs, RawKV{Key: key, Value: val})
+
+	prefixes := [][]byte{
+		[]byte("lb:" + metric + ":"),
+		[]byte("lb-entity:" + metric + ":"),
 	}
-	return kvs, iter.Error()
+
+	for _, prefix := range prefixes {
+		upper := append(append([]byte{}, prefix...), 0xFF)
+		iter, err := s.db.NewIter(&pebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: upper,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			key := make([]byte, len(iter.Key()))
+			val := make([]byte, len(iter.Value()))
+			copy(key, iter.Key())
+			copy(val, iter.Value())
+			kvs = append(kvs, RawKV{Key: key, Value: val})
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return nil, err
+		}
+		iter.Close()
+	}
+
+	return kvs, nil
 }
 
 // ImportRawKVs schreibt raw keys direkt in pebble

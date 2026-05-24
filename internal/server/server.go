@@ -208,7 +208,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
 				continue
 			}
-		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats:
+		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
 			if !session.Can(auth.PermRead) {
 				writeJSON(conn, map[string]string{"error": "permission denied: read required"})
 				continue

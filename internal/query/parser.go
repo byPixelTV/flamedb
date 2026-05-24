@@ -33,6 +33,8 @@ func Parse(input string) (*Query, error) {
 			q.TagKeys = tokens[3:]
 		}
 		return q, nil
+	case "GROUP_LEADERBOARD":
+		q.Type = QueryTypeGroupLeaderboard
 	case "WRITE":
 		q.Type = QueryTypeWrite
 		if len(tokens) < 3 {
@@ -180,6 +182,20 @@ func Parse(input string) (*Query, error) {
 	i := 2
 	for i < len(tokens) {
 		switch strings.ToUpper(tokens[i]) {
+		case "GROUP":
+			if q.Type != QueryTypeGroupLeaderboard {
+				return nil, fmt.Errorf("GROUP is only valid for GROUP_LEADERBOARD")
+			}
+			if i+1 >= len(tokens) {
+				return nil, fmt.Errorf("missing GROUP value")
+			}
+			spec := strings.Trim(tokens[i+1], `"`)
+			name, members, err := parseGroupSpec(spec)
+			if err != nil {
+				return nil, err
+			}
+			q.Groups = append(q.Groups, GroupDef{Name: name, Members: members})
+			i += 2
 		case "WHERE":
 			// WHERE key = "value" AND key2 = "value2" AND ...
 			i++
@@ -288,4 +304,24 @@ func tokenize(input string) []string {
 	}
 
 	return tokens
+}
+
+func parseGroupSpec(spec string) (string, []string, error) {
+	parts := strings.SplitN(spec, ":", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+		return "", nil, fmt.Errorf("invalid GROUP spec: %s", spec)
+	}
+	groupName := strings.TrimSpace(parts[0])
+	rawMembers := strings.Split(parts[1], ",")
+	var members []string
+	for _, m := range rawMembers {
+		m = strings.TrimSpace(m)
+		if m != "" {
+			members = append(members, m)
+		}
+	}
+	if len(members) == 0 {
+		return "", nil, fmt.Errorf("GROUP has no members: %s", groupName)
+	}
+	return groupName, members, nil
 }

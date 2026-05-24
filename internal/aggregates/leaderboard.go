@@ -3,6 +3,7 @@ package aggregates
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"math"
 	"sync"
 
@@ -32,6 +33,23 @@ func lbKey(metric, entityID string, value float64) []byte {
 	return []byte("lb:" + metric + ":" + string(score) + ":" + entityID)
 }
 
+func lbEntityKey(metric, entityID string) []byte {
+	return []byte("lb-entity:" + metric + ":" + entityID)
+}
+
+func encodeFloat64(v float64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, math.Float64bits(v))
+	return buf
+}
+
+func decodeFloat64(b []byte) (float64, bool) {
+	if len(b) != 8 {
+		return 0, false
+	}
+	return math.Float64frombits(binary.BigEndian.Uint64(b)), true
+}
+
 func (l *Leaderboard) lockFor(metric, entityID string) *sync.Mutex {
 	key := metric + ":" + entityID
 	mu, _ := l.mu.LoadOrStore(key, &sync.Mutex{})
@@ -53,11 +71,24 @@ func (l *Leaderboard) Increment(metric, entityID string, delta float64) error {
 	entry := LeaderboardEntry{EntityID: entityID, Value: newValue}
 	val, _ := json.Marshal(entry)
 	batch.Set(newKey, val, pebble.Sync)
+	batch.Set(lbEntityKey(metric, entityID), encodeFloat64(newValue), pebble.Sync)
 	return batch.Commit(pebble.Sync)
 }
 
 func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
-	// scan to find current entry for this entity
+	// O(1) lookup via index
+	data, closer, err := l.db.Get(lbEntityKey(metric, entityID))
+	if err == nil {
+		defer closer.Close()
+		if v, ok := decodeFloat64(data); ok {
+			return v, nil
+		}
+	}
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return 0, err
+	}
+
+	// fallback: scan (for old data without index)
 	prefix := []byte("lb:" + metric + ":")
 	iter, err := l.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -74,6 +105,7 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 			continue
 		}
 		if entry.EntityID == entityID {
+			_ = l.db.Set(lbEntityKey(metric, entityID), encodeFloat64(entry.Value), pebble.Sync)
 			return entry.Value, nil
 		}
 	}
@@ -85,8 +117,10 @@ func (l *Leaderboard) Delete(metric, entityID string) error {
 	if err != nil {
 		return nil // existiert nicht, okay
 	}
-	key := lbKey(metric, entityID, current)
-	return l.db.Delete(key, pebble.Sync)
+	batch := l.db.NewBatch()
+	batch.Delete(lbKey(metric, entityID, current), pebble.Sync)
+	batch.Delete(lbEntityKey(metric, entityID), pebble.Sync)
+	return batch.Commit(pebble.Sync)
 }
 
 func (l *Leaderboard) TopN(metric string, limit, offset int) ([]LeaderboardEntry, error) {

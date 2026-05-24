@@ -2,6 +2,7 @@ package query
 
 import (
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,8 +34,47 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 		return e.executeGet(q)
 	case QueryTypeStats:
 		return e.executeStats(q)
+	case QueryTypeGroupLeaderboard:
+		return e.executeGroupLeaderboard(q)
 	}
 	return nil, nil
+}
+
+func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
+	if len(q.Groups) == 0 {
+		return &Result{Leaderboard: []aggregates.LeaderboardEntry{}}, nil
+	}
+
+	entries := make([]aggregates.LeaderboardEntry, 0, len(q.Groups))
+	for _, g := range q.Groups {
+		var sum float64
+		for _, member := range g.Members {
+			v, _ := e.lb.Get(q.Metric, member)
+			sum += v
+		}
+		entries = append(entries, aggregates.LeaderboardEntry{
+			EntityID: g.Name,
+			Value:    sum,
+		})
+	}
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].Value == entries[j].Value {
+			return entries[i].EntityID < entries[j].EntityID
+		}
+		return entries[i].Value > entries[j].Value
+	})
+
+	// pagination
+	if q.Offset >= len(entries) {
+		return &Result{Leaderboard: []aggregates.LeaderboardEntry{}}, nil
+	}
+	entries = entries[q.Offset:]
+	if q.Limit > 0 && len(entries) > q.Limit {
+		entries = entries[:q.Limit]
+	}
+
+	return &Result{Leaderboard: entries}, nil
 }
 
 func (e *Executor) executeStats(q *Query) (*Result, error) {

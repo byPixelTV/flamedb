@@ -127,6 +127,11 @@ CLUSTER {"type":"JOIN","node_id":"node-2","addr":"192.168.1.2:7778"}
 - Returns all raw pebble KV data for a metric (events + leaderboard)
 - Used during rebalancing
 
+#### GROUP_LEADERBOARD
+```
+GROUP_LEADERBOARD <metric> GROUP "group1:member1,member2" GROUP "group2:memberA,memberB" [LIMIT n] [OFFSET n]
+```
+
 ---
 
 ## Config Format
@@ -275,15 +280,11 @@ cluster:
 - [x] Connection pooling with retry on dead connections
 - [x] Rebalancing infrastructure (CLUSTER_METRICS, CLUSTER_EXPORT, CLUSTER_IMPORT commands, RebalanceStore interface, storage export/import methods)
 - [x] Single-node mode (replication_factor: 1, works standalone with no cluster config)
+- [x] Ad-hoc group leaderboards (GROUP_LEADERBOARD, per-query groups, sum aggregation)
 
 ---
 
 ## What is NOT Yet Implemented / Broken ❌
-
-### Critical Bug — Rebalancing Not Working
-- [x] Infrastructure exists but **rebalancing does not actually transfer data**
-- Root cause: `rebalanceFromNode` in `rebalance.go` uses the connection pool (`c.pool.Send`) which reuses authenticated connections. However `CLUSTER_METRICS` and `CLUSTER_EXPORT` are special commands that return raw JSON (not the standard query result format), and the pool may be receiving stale data or the response parsing fails silently.
-- **Fix approach:** In `rebalance.go`, open a fresh TCP connection with full auth handshake instead of using `c.pool.Send`. This avoids any pool state issues. OR add proper logging to `rebalanceFromNode` to see exactly what response is being received from `CLUSTER_METRICS`.
 
 ### Query Language
 - [ ] **ORDER ASC/DESC** for GET queries (currently GET doesn't sort, only leaderboard is sorted)
@@ -316,11 +317,9 @@ cluster:
 
 ## Known Issues / Tech Debt
 
-- **Rebalancing bug** (see above) — most critical issue remaining
-- `Get` method on Leaderboard does a full prefix scan to find an entity's current value — should use a secondary index `lb-entity:metric:entityID → value` for O(1) lookups instead of O(n) scan
+- Leaderboard lookups use an O(1) lb-entity index (self-heal on first read), falls back to scan for legacy data
 - Config is loaded once at startup, no hot reload
 - Internal node-to-node auth uses the first API key from config — should have a dedicated `internal_key` config field
-- `CLUSTER_METRICS` and `CLUSTER_EXPORT` commands bypass the normal permission check in `server.go` — they should require at minimum a valid auth session
 
 ---
 

@@ -7,13 +7,19 @@ import (
 
 type QueryType string
 
+type GroupDef struct {
+	Name    string
+	Members []string
+}
+
 const (
-	QueryTypeGet         QueryType = "GET"
-	QueryTypeLeaderboard QueryType = "LEADERBOARD"
-	QueryTypeWrite       QueryType = "WRITE"
-	QueryTypeSet         QueryType = "SET"
-	QueryTypeDelete      QueryType = "DELETE"
-	QueryTypeStats       QueryType = "STATS"
+	QueryTypeGet              QueryType = "GET"
+	QueryTypeLeaderboard      QueryType = "LEADERBOARD"
+	QueryTypeWrite            QueryType = "WRITE"
+	QueryTypeSet              QueryType = "SET"
+	QueryTypeDelete           QueryType = "DELETE"
+	QueryTypeStats            QueryType = "STATS"
+	QueryTypeGroupLeaderboard QueryType = "GROUP_LEADERBOARD"
 )
 
 type Query struct {
@@ -34,6 +40,7 @@ type Query struct {
 	TagKeys    []string // for get queries, which tag keys to return
 	Quorum     bool
 	IsReplica  bool
+	Groups     []GroupDef
 }
 
 type Result struct {
