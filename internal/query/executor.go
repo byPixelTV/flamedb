@@ -208,6 +208,10 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		return e.store.ReadRange(metric, from, to)
 	}
 
+	fastDesc := q.Order == "DESC" && q.Aggregate == "" && q.GroupBySpec == "" && (q.Limit > 0 || q.Offset > 0)
+	fastDescPlain := fastDesc && len(q.Where) == 0
+	fastDescTagged := fastDesc && len(q.Where) > 0
+
 	metricNames := q.Metrics
 	if len(metricNames) == 0 {
 		metricNames = []string{q.Metric}
@@ -262,31 +266,40 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 
 		out := make(map[string][]storage.Event, len(metricNames))
 		for _, m := range metricNames {
-			events, err := getEvents(m)
+			var events []storage.Event
+			var err error
+			if fastDescPlain {
+				events, err = e.store.ReadRangeDesc(m, from, to, q.Limit, q.Offset)
+			} else if fastDescTagged {
+				events, err = e.store.ReadRangeWithTagsDesc(m, from, to, q.Where, q.Limit, q.Offset)
+			} else {
+				events, err = getEvents(m)
+			}
 			if err != nil {
 				return nil, err
 			}
 			if events == nil {
 				events = []storage.Event{}
 			}
-
-			// ordering vor pagination
-			switch q.Order {
-			case "DESC":
-				for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-					events[i], events[j] = events[j], events[i]
+			if !fastDesc {
+				// ordering vor pagination
+				switch q.Order {
+				case "DESC":
+					for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+						events[i], events[j] = events[j], events[i]
+					}
+				case "ASC":
 				}
-			case "ASC":
-			}
 
-			// pagination danach
-			if q.Offset >= len(events) {
-				out[m] = []storage.Event{}
-				continue
-			}
-			events = events[q.Offset:]
-			if q.Limit > 0 && len(events) > q.Limit {
-				events = events[:q.Limit]
+				// pagination danach
+				if q.Offset >= len(events) {
+					out[m] = []storage.Event{}
+					continue
+				}
+				events = events[q.Offset:]
+				if q.Limit > 0 && len(events) > q.Limit {
+					events = events[:q.Limit]
+				}
 			}
 
 			out[m] = events
@@ -295,7 +308,15 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 	}
 
 	// single metric flow
-	events, err := getEvents(q.Metric)
+	var events []storage.Event
+	var err error
+	if fastDescPlain {
+		events, err = e.store.ReadRangeDesc(q.Metric, from, to, q.Limit, q.Offset)
+	} else if fastDescTagged {
+		events, err = e.store.ReadRangeWithTagsDesc(q.Metric, from, to, q.Where, q.Limit, q.Offset)
+	} else {
+		events, err = getEvents(q.Metric)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -336,22 +357,24 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		}, nil
 	}
 
-	// ordering vor pagination
-	switch q.Order {
-	case "DESC":
-		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-			events[i], events[j] = events[j], events[i]
+	if !fastDescPlain && !fastDescTagged {
+		// ordering vor pagination
+		switch q.Order {
+		case "DESC":
+			for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+				events[i], events[j] = events[j], events[i]
+			}
+		case "ASC":
 		}
-	case "ASC":
-	}
 
-	// pagination danach
-	if q.Offset >= len(events) {
-		return &Result{Events: []storage.Event{}}, nil
-	}
-	events = events[q.Offset:]
-	if q.Limit > 0 && len(events) > q.Limit {
-		events = events[:q.Limit]
+		// pagination danach
+		if q.Offset >= len(events) {
+			return &Result{Events: []storage.Event{}}, nil
+		}
+		events = events[q.Offset:]
+		if q.Limit > 0 && len(events) > q.Limit {
+			events = events[:q.Limit]
+		}
 	}
 
 	return &Result{Events: events}, nil

@@ -4,6 +4,8 @@
 
 FlameDB is a lightweight, distributed time-series and event database written in Go, designed as an open-source alternative to ClickHouse, InfluxDB, and TimescaleDB. The goal is to be fast, simple, and cluster-ready out of the box — with leaderboards, aggregates, tag filtering, and graph-ready time-series as first-class features.
 
+Performance target: support 100k ops/s or more on write-heavy workloads.
+
 Target use cases: Minecraft server networks (player stats, kills, deaths, money, TPS, player counts), but designed to be general-purpose. Designed to handle donut SMP scale: 55k concurrent players, millions of writes/day, billions of events over time.
 
 **Module path:** `github.com/byPixelTV/flamedb`  

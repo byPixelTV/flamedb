@@ -16,15 +16,18 @@ type WriteBatcher struct {
 	db      *pebble.DB
 	mu      sync.Mutex
 	pending []writeEntry
-	flushCh chan struct{}
-	doneCh  chan error
+	flushCh chan flushRequest
+}
+
+type flushRequest struct {
+	sync bool
+	done chan error
 }
 
 func NewWriteBatcher(db *pebble.DB) *WriteBatcher {
 	b := &WriteBatcher{
 		db:      db,
-		flushCh: make(chan struct{}, 1),
-		doneCh:  make(chan error, 1),
+		flushCh: make(chan flushRequest, 1),
 	}
 	go b.run()
 	return b
@@ -37,8 +40,9 @@ func (b *WriteBatcher) Add(key, value []byte) {
 }
 
 func (b *WriteBatcher) Flush() error {
-	b.flushCh <- struct{}{}
-	return <-b.doneCh
+	done := make(chan error, 1)
+	b.flushCh <- flushRequest{sync: true, done: done}
+	return <-done
 }
 
 func (b *WriteBatcher) run() {
@@ -48,15 +52,17 @@ func (b *WriteBatcher) run() {
 	for {
 		select {
 		case <-ticker.C:
-			b.flush()
-		case <-b.flushCh:
-			err := b.flush()
-			b.doneCh <- err
+			_ = b.flush(false)
+		case req := <-b.flushCh:
+			err := b.flush(req.sync)
+			if req.done != nil {
+				req.done <- err
+			}
 		}
 	}
 }
 
-func (b *WriteBatcher) flush() error {
+func (b *WriteBatcher) flush(sync bool) error {
 	b.mu.Lock()
 	if len(b.pending) == 0 {
 		b.mu.Unlock()
@@ -70,5 +76,9 @@ func (b *WriteBatcher) flush() error {
 	for _, e := range entries {
 		batch.Set(e.key, e.value, nil)
 	}
-	return batch.Commit(pebble.Sync)
+	opts := pebble.NoSync
+	if sync {
+		opts = pebble.Sync
+	}
+	return batch.Commit(opts)
 }

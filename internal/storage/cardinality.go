@@ -18,8 +18,17 @@ func cardCountKey(metric, tagKey string) []byte {
 	return []byte(fmt.Sprintf("card-count:%s:%s", metric, tagKey))
 }
 
+func cardCacheKey(metric, tagKey, tagValue string) string {
+	return metric + "\x00" + tagKey + "\x00" + tagValue
+}
+
 func (s *Storage) updateCardinality(batch *pebble.Batch, metric string, tags map[string]string) error {
 	for tagKey, tagValue := range tags {
+		ckey := cardCacheKey(metric, tagKey, tagValue)
+		if s.cardCache != nil && s.cardCache.seen(ckey) {
+			continue
+		}
+
 		ck := cardKey(metric, tagKey, tagValue)
 
 		// check ob dieser tagvalue bereits bekannt ist
@@ -32,12 +41,18 @@ func (s *Storage) updateCardinality(batch *pebble.Batch, metric string, tags map
 			count++
 			buf := make([]byte, 8)
 			binary.BigEndian.PutUint64(buf, uint64(count))
-			batch.Set(countKey, buf, pebble.Sync)
+			batch.Set(countKey, buf, nil)
 
 			// tagvalue als bekannt markieren
-			batch.Set(ck, []byte{1}, pebble.Sync)
+			batch.Set(ck, []byte{1}, nil)
+			if s.cardCache != nil {
+				s.cardCache.add(ckey)
+			}
 		} else if err == nil {
 			closer.Close()
+			if s.cardCache != nil {
+				s.cardCache.add(ckey)
+			}
 			// bereits bekannt, nichts tun
 		} else {
 			return err
