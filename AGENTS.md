@@ -282,6 +282,7 @@ cluster:
 - [x] GROUP BY time bucket (e.g. `GROUP BY 1h`)
 - [x] Relative time (`FROM now-7d TO now`)
 - [x] Pebble block compression
+- [x] **Compression** — Pebble block compression configured
 
 ---
 
@@ -296,13 +297,6 @@ cluster:
   - `__internal.node_count` — active nodes in cluster
   - `__internal.replication_lag` — how far behind replicas are
   - Query via normal GET/LEADERBOARD syntax
-- [ ] **Benchmark tool** (`cmd/benchmark/main.go`) — standalone load testing tool:
-  - Flags: `--addr`, `--key`, `--workers`, `--duration`, `--metric`, `--mode` (write/read/mixed)
-  - Output: writes/sec, reads/sec, p50/p99 latency, error count
-  - Should test at 1000+ concurrent workers
-
-### Query Language
-- [ ] **Multi-metric aggregation** — `GET kills,deaths SUM` cross-metric ops
 
 ### SDKs (not started)
 - [ ] **Kotlin/Java SDK** — primary target for Minecraft plugin devs
@@ -310,10 +304,8 @@ cluster:
 - [ ] **C# SDK**
 
 ### Operational
-- [ ] **HTTP API** — REST/JSON layer for dashboards
 - [ ] **Backup/restore** — snapshot to S3 or local disk
 - [ ] **Data TTL** — auto-expire raw events older than X days
-- [x] **Compression** — Pebble block compression configured
 - [ ] **TLS** — encrypt node-to-node and client traffic
 - [ ] **Dashboard UI**
 
