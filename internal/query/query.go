@@ -12,6 +12,14 @@ type GroupDef struct {
 	Members []string
 }
 
+type AggType string
+
+const (
+	AggCount AggType = "COUNT"
+	AggSum   AggType = "SUM"
+	AggAvg   AggType = "AVG"
+)
+
 const (
 	QueryTypeGet              QueryType = "GET"
 	QueryTypeLeaderboard      QueryType = "LEADERBOARD"
@@ -41,12 +49,20 @@ type Query struct {
 	Quorum     bool
 	IsReplica  bool
 	Groups     []GroupDef
+	Aggregate  AggType
 }
 
 type Result struct {
 	Events      []storage.Event               `json:"events,omitempty"`
 	Leaderboard []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
 	Stats       *StatsResult                  `json:"stats,omitempty"`
+	Aggregate   *AggregateResult              `json:"aggregate,omitempty"`
+}
+
+type AggregateResult struct {
+	Type  string  `json:"type"`
+	Value float64 `json:"value"`
+	Count int     `json:"count"`
 }
 
 type StatsResult struct {

@@ -229,6 +229,12 @@ func Parse(input string) (*Query, error) {
 			}
 			q.From = t.UnixNano()
 			i += 2
+		case "COUNT", "SUM", "AVG":
+			if q.Type != QueryTypeGet {
+				return nil, fmt.Errorf("%s is only valid for GET", strings.ToUpper(tokens[i]))
+			}
+			q.Aggregate = AggType(strings.ToUpper(tokens[i]))
+			i++
 		case "TO":
 			if i+1 >= len(tokens) {
 				return nil, fmt.Errorf("missing TO value")

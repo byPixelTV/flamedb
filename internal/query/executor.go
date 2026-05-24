@@ -197,22 +197,51 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		events = []storage.Event{}
 	}
 
-	// pagination
-	if q.Offset >= len(events) {
-		return &Result{Events: []storage.Event{}}, nil
-	}
-	events = events[q.Offset:]
-	if q.Limit > 0 && len(events) > q.Limit {
-		events = events[:q.Limit]
+	if q.Aggregate != "" {
+		count := len(events)
+		var sum float64
+		for _, e := range events {
+			sum += e.Value
+		}
+
+		var value float64
+		switch q.Aggregate {
+		case AggCount:
+			value = float64(count)
+		case AggSum:
+			value = sum
+		case AggAvg:
+			if count > 0 {
+				value = sum / float64(count)
+			}
+		}
+
+		return &Result{
+			Aggregate: &AggregateResult{
+				Type:  string(q.Aggregate),
+				Value: value,
+				Count: count,
+			},
+		}, nil
 	}
 
+	// ordering vor pagination
 	switch q.Order {
 	case "DESC":
 		for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
 			events[i], events[j] = events[j], events[i]
 		}
 	case "ASC":
-		// do nothing, default order is ASC
+		// default order is ASC
+	}
+
+	// pagination danach
+	if q.Offset >= len(events) {
+		return &Result{Events: []storage.Event{}}, nil
+	}
+	events = events[q.Offset:]
+	if q.Limit > 0 && len(events) > q.Limit {
+		events = events[:q.Limit]
 	}
 
 	return &Result{Events: events}, nil
