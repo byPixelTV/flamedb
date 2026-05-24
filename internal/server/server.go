@@ -134,6 +134,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 
 		// forwarden wenn nicht lokal
+		// forwarden wenn nicht lokal
 		if !s.cluster.IsLocal(q.Metric) {
 			result, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, line)
 			if err != nil {
@@ -143,13 +144,16 @@ func (s *Server) handleConn(conn net.Conn) {
 			conn.Write(append(result, '\n'))
 			continue
 		}
+
+		// für reads: round-robin über replicas
 		switch q.Type {
-		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
-			if !s.cluster.IsPrimaryFor(q.Metric) && !q.IsReplica {
-				result, err := s.cluster.ForwardToPrimary(q.Metric, s.apiKey, line)
+		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats:
+			readNode := s.cluster.GetReadNode(q.Metric)
+			if readNode.ID != s.cluster.Self.ID {
+				result, err := s.cluster.SendToNode(readNode, line)
 				if err != nil {
-					writeJSON(conn, map[string]string{"error": err.Error()})
-					continue
+					// fallback: lokal handlen
+					break
 				}
 				conn.Write(append(result, '\n'))
 				continue

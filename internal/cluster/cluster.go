@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 )
 
 type Cluster struct {
@@ -12,6 +13,7 @@ type Cluster struct {
 	failures          sync.Map
 	pool              *ConnPool
 	ReplicationFactor int
+	readCounter       atomic.Uint64 // für round-robin
 }
 
 func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {
@@ -23,6 +25,19 @@ func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster
 	}
 	c.Ring.Add(self) // self immer zuerst adden
 	return c
+}
+
+func (c *Cluster) GetReadNode(metric string) Node {
+	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
+	if len(nodes) == 0 {
+		return c.Self
+	}
+	idx := c.readCounter.Add(1) % uint64(len(nodes))
+	return nodes[idx]
+}
+
+func (c *Cluster) SendToNode(node Node, query string) ([]byte, error) {
+	return c.pool.Send(node, query)
 }
 
 func (c *Cluster) ForwardToPrimary(metric, apiKey, query string) ([]byte, error) {
