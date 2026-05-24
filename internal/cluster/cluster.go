@@ -93,7 +93,6 @@ func (c *Cluster) IsPrimaryFor(metric string) bool {
 // IsLocal jetzt: bin ich primary ODER replica für diese metric?
 func (c *Cluster) IsLocal(metric string) bool {
 	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
-	log.Printf("IsLocal check for %s: replicationFactor=%d, nodes=%v, self=%s", metric, c.ReplicationFactor, nodes, c.Self.ID)
 	for _, n := range nodes {
 		if n.ID == c.Self.ID {
 			return true
@@ -128,12 +127,4 @@ func (c *Cluster) Knows(nodeID string) bool {
 		}
 	}
 	return false
-}
-
-func (c *Cluster) Forward(metric, apiKey, query string) ([]byte, error) {
-	node, ok := c.Ring.Get(metric)
-	if !ok {
-		return nil, fmt.Errorf("no node found for metric: %s", metric)
-	}
-	return c.pool.Send(node, query)
 }

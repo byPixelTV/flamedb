@@ -76,6 +76,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		break
 	}
 
+	if session == nil {
+		return
+	}
+
 	// main loop
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -86,7 +90,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		if strings.HasPrefix(strings.ToUpper(line), "CLUSTER ") {
 			payload := strings.TrimSpace(line[8:])
 			var msg cluster.DiscoveryMessage
-			log.Printf("received cluster message: %s", payload)
 			if err := json.Unmarshal([]byte(payload), &msg); err != nil {
 				writeJSON(conn, map[string]string{"error": "invalid cluster message"})
 				continue
