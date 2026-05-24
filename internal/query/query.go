@@ -1,6 +1,8 @@
 package query
 
 import (
+	"time"
+
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
 )
@@ -41,15 +43,17 @@ type Query struct {
 	Offset    int
 	Order     string
 	// write specific
-	Value      float64
-	Tags       map[string]string
-	UpdateLB   bool     // should this update the leaderboard?
-	LBEntityID string   // entity ID for leaderboard updates
-	TagKeys    []string // for get queries, which tag keys to return
-	Quorum     bool
-	IsReplica  bool
-	Groups     []GroupDef
-	Aggregate  AggType
+	Value       float64
+	Tags        map[string]string
+	UpdateLB    bool     // should this update the leaderboard?
+	LBEntityID  string   // entity ID for leaderboard updates
+	TagKeys     []string // for get queries, which tag keys to return
+	Quorum      bool
+	IsReplica   bool
+	Groups      []GroupDef
+	Aggregate   AggType
+	GroupBy     time.Duration
+	GroupBySpec string // original spec, z.B. "1y6m"
 }
 
 type Result struct {
@@ -57,6 +61,13 @@ type Result struct {
 	Leaderboard []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
 	Stats       *StatsResult                  `json:"stats,omitempty"`
 	Aggregate   *AggregateResult              `json:"aggregate,omitempty"`
+	Series      []SeriesPoint                 `json:"series,omitempty"`
+}
+
+type SeriesPoint struct {
+	TS    int64   `json:"ts"`
+	Value float64 `json:"value"`
+	Count int     `json:"count"`
 }
 
 type AggregateResult struct {

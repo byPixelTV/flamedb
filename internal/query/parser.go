@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func Parse(input string) (*Query, error) {
@@ -133,18 +134,18 @@ func Parse(input string) (*Query, error) {
 		for i < len(tokens) {
 			switch strings.ToUpper(tokens[i]) {
 			case "FROM":
-				t, err := time.Parse("2006-01-02", tokens[i+1])
+				ts, err := parseTimeValue(tokens[i+1])
 				if err != nil {
-					return nil, fmt.Errorf("invalid FROM date: %s", tokens[i+1])
+					return nil, err
 				}
-				q.From = t.UnixNano()
+				q.From = ts
 				i += 2
 			case "TO":
-				t, err := time.Parse("2006-01-02", tokens[i+1])
+				ts, err := parseTimeValue(tokens[i+1])
 				if err != nil {
-					return nil, fmt.Errorf("invalid TO date: %s", tokens[i+1])
+					return nil, err
 				}
-				q.To = t.UnixNano()
+				q.To = ts
 				i += 2
 			default:
 				// tag
@@ -183,19 +184,21 @@ func Parse(input string) (*Query, error) {
 	for i < len(tokens) {
 		switch strings.ToUpper(tokens[i]) {
 		case "GROUP":
-			if q.Type != QueryTypeGroupLeaderboard {
-				return nil, fmt.Errorf("GROUP is only valid for GROUP_LEADERBOARD")
+			// expect: GROUP BY <duration>
+			if i+1 >= len(tokens) || strings.ToUpper(tokens[i+1]) != "BY" {
+				return nil, fmt.Errorf("expected GROUP BY")
 			}
-			if i+1 >= len(tokens) {
-				return nil, fmt.Errorf("missing GROUP value")
+			if i+2 >= len(tokens) {
+				return nil, fmt.Errorf("missing GROUP BY value")
 			}
-			spec := strings.Trim(tokens[i+1], `"`)
-			name, members, err := parseGroupSpec(spec)
+			spec := strings.Trim(tokens[i+2], `"`)
+			q.GroupBySpec = spec
+			dur, err := parseDurationSpec(spec)
 			if err != nil {
 				return nil, err
 			}
-			q.Groups = append(q.Groups, GroupDef{Name: name, Members: members})
-			i += 2
+			q.GroupBy = dur
+			i += 3
 		case "WHERE":
 			// WHERE key = "value" AND key2 = "value2" AND ...
 			i++
@@ -223,11 +226,11 @@ func Parse(input string) (*Query, error) {
 			if i+1 >= len(tokens) {
 				return nil, fmt.Errorf("missing FROM value")
 			}
-			t, err := time.Parse("2006-01-02", tokens[i+1])
+			ts, err := parseTimeValue(tokens[i+1])
 			if err != nil {
-				return nil, fmt.Errorf("invalid FROM date: %s", tokens[i+1])
+				return nil, err
 			}
-			q.From = t.UnixNano()
+			q.From = ts
 			i += 2
 		case "COUNT", "SUM", "AVG":
 			if q.Type != QueryTypeGet {
@@ -239,11 +242,11 @@ func Parse(input string) (*Query, error) {
 			if i+1 >= len(tokens) {
 				return nil, fmt.Errorf("missing TO value")
 			}
-			t, err := time.Parse("2006-01-02", tokens[i+1])
+			ts, err := parseTimeValue(tokens[i+1])
 			if err != nil {
-				return nil, fmt.Errorf("invalid TO date: %s", tokens[i+1])
+				return nil, err
 			}
-			q.To = t.UnixNano()
+			q.To = ts
 			i += 2
 		case "LIMIT":
 			if i+1 >= len(tokens) {
@@ -312,6 +315,50 @@ func tokenize(input string) []string {
 	return tokens
 }
 
+func parseTimeValue(token string) (int64, error) {
+	token = strings.Trim(token, `"`)
+	if strings.HasPrefix(token, "now") {
+		base := time.Now().UTC()
+		if token == "now" {
+			return base.UnixNano(), nil
+		}
+		if len(token) < 5 {
+			return 0, fmt.Errorf("invalid relative time: %s", token)
+		}
+		op := token[3]
+		if op != '-' && op != '+' {
+			return 0, fmt.Errorf("invalid relative time: %s", token)
+		}
+		spec := token[4:]
+		d, err := parseCalendarSpec(spec)
+		if err != nil {
+			return 0, err
+		}
+		return applyCalendarOffset(base, d, op).UnixNano(), nil
+	}
+
+	// fallback: YYYY-MM-DD
+	t, err := time.Parse("2006-01-02", token)
+	if err != nil {
+		return 0, fmt.Errorf("invalid date: %s", token)
+	}
+	return t.UnixNano(), nil
+}
+
+func applyCalendarOffset(base time.Time, spec durSpec, op byte) time.Time {
+	sign := 1
+	if op == '-' {
+		sign = -1
+	}
+	if spec.years != 0 || spec.months != 0 {
+		base = base.AddDate(sign*spec.years, sign*spec.months, 0)
+	}
+	if spec.dur != 0 {
+		base = base.Add(time.Duration(sign) * spec.dur)
+	}
+	return base
+}
+
 func parseGroupSpec(spec string) (string, []string, error) {
 	parts := strings.SplitN(spec, ":", 2)
 	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
@@ -330,4 +377,71 @@ func parseGroupSpec(spec string) (string, []string, error) {
 		return "", nil, fmt.Errorf("GROUP has no members: %s", groupName)
 	}
 	return groupName, members, nil
+}
+
+func parseDurationSpec(spec string) (time.Duration, error) {
+	if spec == "" {
+		return 0, fmt.Errorf("invalid duration: empty")
+	}
+
+	// If spec contains years or explicit months, treat "m" as months.
+	hasCalendar := strings.Contains(spec, "y") || strings.Contains(spec, "mo")
+
+	var total time.Duration
+	i := 0
+	for i < len(spec) {
+		j := i
+		for j < len(spec) && unicode.IsDigit(rune(spec[j])) {
+			j++
+		}
+		if j == i {
+			return 0, fmt.Errorf("invalid duration: %s", spec)
+		}
+		num, err := strconv.Atoi(spec[i:j])
+		if err != nil {
+			return 0, fmt.Errorf("invalid number in duration: %s", spec)
+		}
+
+		unit := ""
+		// check "min" and "mo" before single-char units
+		if j+2 < len(spec) && spec[j:j+3] == "min" {
+			unit = "min"
+			j += 3
+		} else if j+1 < len(spec) && spec[j:j+2] == "mo" {
+			unit = "mo"
+			j += 2
+		} else {
+			unit = spec[j : j+1]
+			j++
+		}
+
+		switch unit {
+		case "y":
+			// calendar unit, encoded via GroupBySpec
+		case "mo":
+			// calendar unit, encoded via GroupBySpec
+		case "m":
+			if hasCalendar {
+				// "m" means month when calendar units are present
+			} else {
+				total += time.Duration(num) * time.Minute
+			}
+		case "min":
+			total += time.Duration(num) * time.Minute
+		case "w":
+			total += time.Duration(num) * 7 * 24 * time.Hour
+		case "d":
+			total += time.Duration(num) * 24 * time.Hour
+		case "h":
+			total += time.Duration(num) * time.Hour
+		case "s":
+			total += time.Duration(num) * time.Second
+		default:
+			return 0, fmt.Errorf("invalid unit in duration: %s", unit)
+		}
+
+		i = j
+	}
+
+	return total, nil
 }

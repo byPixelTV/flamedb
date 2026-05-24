@@ -1,10 +1,13 @@
 package query
 
 import (
+	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
@@ -225,6 +228,11 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 		}, nil
 	}
 
+	if q.GroupBySpec != "" {
+		series := aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
+		return &Result{Series: series}, nil
+	}
+
 	// ordering vor pagination
 	switch q.Order {
 	case "DESC":
@@ -245,4 +253,151 @@ func (e *Executor) executeGet(q *Query) (*Result, error) {
 	}
 
 	return &Result{Events: events}, nil
+}
+
+type durSpec struct {
+	years  int
+	months int
+	dur    time.Duration
+}
+
+func parseCalendarSpec(spec string) (durSpec, error) {
+	var out durSpec
+	if spec == "" {
+		return out, fmt.Errorf("invalid duration: empty")
+	}
+
+	// If spec contains years or explicit months, treat "m" as months.
+	hasCalendar := strings.Contains(spec, "y") || strings.Contains(spec, "mo")
+
+	i := 0
+	for i < len(spec) {
+		j := i
+		for j < len(spec) && unicode.IsDigit(rune(spec[j])) {
+			j++
+		}
+		if j == i {
+			return out, fmt.Errorf("invalid duration: %s", spec)
+		}
+		num, err := strconv.Atoi(spec[i:j])
+		if err != nil {
+			return out, err
+		}
+
+		unit := ""
+		// check "mo" and "min" before single-char units
+		if j+2 < len(spec) && spec[j:j+3] == "min" {
+			unit = "min"
+			j += 3
+		} else if j+1 < len(spec) && spec[j:j+2] == "mo" {
+			unit = "mo"
+			j += 2
+		} else {
+			unit = spec[j : j+1]
+			j++
+		}
+
+		switch unit {
+		case "y":
+			out.years += num
+			hasCalendar = true
+		case "mo":
+			out.months += num
+			hasCalendar = true
+		case "m":
+			if hasCalendar {
+				out.months += num
+			} else {
+				out.dur += time.Duration(num) * time.Minute
+			}
+		case "min":
+			out.dur += time.Duration(num) * time.Minute
+		case "w":
+			out.dur += time.Duration(num) * 7 * 24 * time.Hour
+		case "d":
+			out.dur += time.Duration(num) * 24 * time.Hour
+		case "h":
+			out.dur += time.Duration(num) * time.Hour
+		case "s":
+			out.dur += time.Duration(num) * time.Second
+		default:
+			return out, fmt.Errorf("invalid unit: %s", unit)
+		}
+
+		i = j
+	}
+	return out, nil
+}
+
+func addCalendar(t time.Time, spec durSpec) time.Time {
+	if spec.years != 0 || spec.months != 0 {
+		t = t.AddDate(spec.years, spec.months, 0)
+	}
+	if spec.dur != 0 {
+		t = t.Add(spec.dur)
+	}
+	return t
+}
+
+func aggregateSeriesUTC(events []storage.Event, spec string, agg AggType) []SeriesPoint {
+	if len(events) == 0 {
+		return []SeriesPoint{}
+	}
+
+	dur, err := parseCalendarSpec(spec)
+	if err != nil {
+		return []SeriesPoint{}
+	}
+
+	// align to epoch (UTC)
+	start := time.Unix(0, 0).UTC()
+	end := start
+
+	series := []SeriesPoint{}
+	i := 0
+
+	for i < len(events) {
+		// advance bucket until it contains event
+		for end.Before(time.Unix(0, events[i].Timestamp).UTC()) || end.Equal(time.Unix(0, events[i].Timestamp).UTC()) {
+			start = end
+			end = addCalendar(start, dur)
+		}
+
+		var sum float64
+		count := 0
+		for i < len(events) {
+			evTime := time.Unix(0, events[i].Timestamp).UTC()
+			if evTime.Before(start) || !evTime.Before(end) {
+				break
+			}
+			sum += events[i].Value
+			count++
+			i++
+		}
+
+		value := sum
+		switch agg {
+		case AggCount:
+			value = float64(count)
+		case AggAvg:
+			if count > 0 {
+				value = sum / float64(count)
+			}
+		default:
+			// AggSum or empty = sum
+		}
+
+		series = append(series, SeriesPoint{
+			TS:    start.UnixNano(),
+			Value: value,
+			Count: count,
+		})
+
+		if end.Equal(start) {
+			// guard against zero duration
+			break
+		}
+	}
+
+	return series
 }
