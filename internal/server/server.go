@@ -191,6 +191,9 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 			switch msg.Type {
+			case "CLUSTER_REPLICATION_STATS":
+				writeJSON(conn, s.cluster.ReplicationStats())
+				continue
 			case "CLUSTER_METRICS":
 				// alle metrics die dieser node hat zurückschicken
 				metrics := s.exec.GetAllMetrics()
@@ -449,7 +452,13 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		line  string
 		q     *query.Query
 	}
+	type remoteItem struct {
+		index int
+		line  string
+	}
 	var local []localItem
+	remote := make(map[string][]remoteItem)
+	remoteNodes := make(map[string]cluster.Node)
 
 	for i, itemLine := range lines {
 		q, err := query.Parse(itemLine)
@@ -469,38 +478,66 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 
 		requiresPrimary := q.UpdateLB
 		if requiresPrimary && !q.IsReplica && !s.cluster.IsPrimaryFor(q.Metric) {
-			data, err := s.cluster.ForwardToPrimary(q.Metric, s.apiKey, itemLine)
-			if err != nil {
+			node, ok := s.cluster.GetPrimaryNode(q.Metric)
+			if !ok {
 				result.Failed++
-				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: "no primary found"})
 				continue
 			}
-			if err := upstreamError(data); err != nil {
-				result.Failed++
-				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
-				continue
-			}
-			result.Accepted++
+			remote[node.ID] = append(remote[node.ID], remoteItem{index: i, line: itemLine})
+			remoteNodes[node.ID] = node
 			continue
 		}
 
 		if !q.ForceLocal && !s.cluster.IsLocal(q.Metric) {
-			data, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, itemLine)
-			if err != nil {
+			node, ok := s.cluster.GetWriteNode(q.Metric)
+			if !ok {
 				result.Failed++
-				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: "no write node found"})
 				continue
 			}
-			if err := upstreamError(data); err != nil {
-				result.Failed++
-				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
-				continue
-			}
-			result.Accepted++
+			remoteLine := itemLine + " __local"
+			remote[node.ID] = append(remote[node.ID], remoteItem{index: i, line: remoteLine})
+			remoteNodes[node.ID] = node
 			continue
 		}
 
 		local = append(local, localItem{index: i, line: itemLine, q: q})
+	}
+
+	for nodeID, items := range remote {
+		node := remoteNodes[nodeID]
+		batchLines := make([]string, 0, len(items)+2)
+		batchLines = append(batchLines, "WRITE_BATCH")
+		for _, item := range items {
+			batchLines = append(batchLines, item.line)
+		}
+		batchLines = append(batchLines, "END")
+
+		data, err := s.cluster.SendToNode(node, strings.Join(batchLines, "\n"))
+		if err != nil {
+			for _, item := range items {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: item.index, Error: err.Error()})
+			}
+			continue
+		}
+		accepted, itemErrors, err := upstreamBatchResult(data)
+		if err != nil {
+			for _, item := range items {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: item.index, Error: err.Error()})
+			}
+			continue
+		}
+		result.Accepted += accepted
+		result.Failed += len(items) - accepted
+		for _, itemErr := range itemErrors {
+			if itemErr.Index >= 0 && itemErr.Index < len(items) {
+				itemErr.Index = items[itemErr.Index].index
+			}
+			result.Errors = append(result.Errors, itemErr)
+		}
 	}
 
 	if len(local) > 0 {
@@ -527,6 +564,8 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			result.Failed += localResult.Failed
 			result.Accepted += localResult.Accepted
 
+			replicationItems := make([]cluster.ReplicationItem, 0, len(local))
+			replicationIndexByItem := make([]int, 0, len(local))
 			for _, item := range local {
 				if failedLocal[item.index] || item.q.IsReplica {
 					continue
@@ -535,11 +574,18 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 				if !replicateFromThisNode {
 					continue
 				}
-				replicaQuery := item.line + " __replica"
-				if err := s.cluster.ReplicateWrite(item.q.Metric, replicaQuery, item.q.Quorum); err != nil {
+				replicationItems = append(replicationItems, cluster.ReplicationItem{
+					Metric: item.q.Metric,
+					Query:  item.line + " __replica",
+					Quorum: item.q.Quorum,
+				})
+				replicationIndexByItem = append(replicationIndexByItem, item.index)
+			}
+			if err := s.cluster.ReplicateBatch(replicationItems); err != nil {
+				for _, index := range replicationIndexByItem {
 					result.Accepted--
 					result.Failed++
-					result.Errors = append(result.Errors, query.BatchItemError{Index: item.index, Error: fmt.Sprintf("quorum failed: %v", err)})
+					result.Errors = append(result.Errors, query.BatchItemError{Index: index, Error: err.Error()})
 				}
 			}
 		}
@@ -549,6 +595,22 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		result.OK = false
 	}
 	writeJSON(conn, result)
+}
+
+func upstreamBatchResult(data []byte) (int, []query.BatchItemError, error) {
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(data, &envelope)
+	if envelope.Error != "" {
+		return 0, nil, errors.New(envelope.Error)
+	}
+
+	var resp query.BatchResult
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, nil, fmt.Errorf("invalid upstream response")
+	}
+	return resp.Accepted, resp.Errors, nil
 }
 
 func upstreamError(data []byte) error {

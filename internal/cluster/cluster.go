@@ -32,6 +32,8 @@ type Cluster struct {
 	fanoutQueues      sync.Map
 	routeCache        sync.Map
 	outbox            *replicationOutbox
+	replicationQSize  int
+	fanoutQSize       int
 }
 
 type routeInfo struct {
@@ -48,11 +50,22 @@ func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster
 		Ring:              NewRing(replicas),
 		pool:              NewConnPool(apiKey),
 		ReplicationFactor: replicationFactor,
+		replicationQSize:  asyncReplicationQueueSize,
+		fanoutQSize:       asyncFanoutQueueSize,
 	}
 	c.Ring.Add(self) // self immer zuerst adden
 	c.replicationFactor.Store(int32(replicationFactor))
 	c.readPolicy.Store(defaultReadPolicy)
 	return c
+}
+
+func (c *Cluster) SetQueueSizes(replicationQueueSize, fanoutQueueSize int) {
+	if replicationQueueSize > 0 {
+		c.replicationQSize = replicationQueueSize
+	}
+	if fanoutQueueSize > 0 {
+		c.fanoutQSize = fanoutQueueSize
+	}
 }
 
 func (c *Cluster) GetReplicationFactor() int {
@@ -194,6 +207,21 @@ func (c *Cluster) ForwardWithFailover(metric, apiKey, query string) ([]byte, err
 
 func (c *Cluster) GetReplicaNodes(metric string) []Node {
 	return c.getRoute(metric).replicas
+}
+
+func (c *Cluster) GetWriteNode(metric string) (Node, bool) {
+	route := c.getRoute(metric)
+	for _, node := range route.nodes {
+		if node.ID != c.Self.ID {
+			return node, true
+		}
+	}
+	return Node{}, false
+}
+
+func (c *Cluster) GetPrimaryNode(metric string) (Node, bool) {
+	primary := c.getRoute(metric).primary
+	return primary, primary.ID != ""
 }
 
 func (c *Cluster) IsPrimaryFor(metric string) bool {

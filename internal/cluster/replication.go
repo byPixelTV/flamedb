@@ -23,10 +23,24 @@ const replicationBatchSeparator = "\x1f"
 const replicationRetryInitialDelay = 10 * time.Millisecond
 const replicationRetryMaxDelay = time.Second
 
+var ErrServerBusy = errors.New("server busy")
+
 type ReplicationResult struct {
 	NodeID  string
 	Success bool
 	Error   error
+}
+
+type ReplicationItem struct {
+	Metric string
+	Query  string
+	Quorum bool
+}
+
+type ReplicationStats struct {
+	OutboxDepth       int64          `json:"outbox_depth"`
+	FanoutQueueDepth  map[string]int `json:"fanout_queue_depth"`
+	ReplicaQueueDepth map[string]int `json:"replica_queue_depth"`
 }
 
 type replicationQueue struct {
@@ -55,8 +69,9 @@ type outboxEntry struct {
 }
 
 type replicationOutbox struct {
-	db  *pebble.DB
-	seq atomic.Uint64
+	db    *pebble.DB
+	seq   atomic.Uint64
+	depth atomic.Int64
 }
 
 func newReplicationOutbox(db *pebble.DB) *replicationOutbox {
@@ -66,19 +81,39 @@ func newReplicationOutbox(db *pebble.DB) *replicationOutbox {
 }
 
 func (o *replicationOutbox) put(node Node, query string) ([]byte, error) {
+	keys, err := o.putBatch([]replicationRecord{{node: node, query: query}})
+	if err != nil || len(keys) == 0 {
+		return nil, err
+	}
+	return keys[0], nil
+}
+
+func (o *replicationOutbox) putBatch(records []replicationRecord) ([][]byte, error) {
 	if o == nil || o.db == nil {
 		return nil, nil
 	}
-	seq := o.seq.Add(1)
-	key := []byte(fmt.Sprintf("repl-outbox:%s:%020d", node.ID, seq))
-	value, err := json.Marshal(outboxEntry{Node: node, Query: query})
-	if err != nil {
+	batch := o.db.NewBatch()
+	defer batch.Close()
+
+	keys := make([][]byte, 0, len(records))
+	for _, record := range records {
+		seq := o.seq.Add(1)
+		key := []byte(fmt.Sprintf("repl-outbox:%s:%020d", record.node.ID, seq))
+		value, err := json.Marshal(outboxEntry{Node: record.node, Query: record.query})
+		if err != nil {
+			return nil, err
+		}
+		if err := batch.Set(key, value, nil); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
 		return nil, err
 	}
-	if err := o.db.Set(key, value, pebble.NoSync); err != nil {
-		return nil, err
-	}
-	return key, nil
+	o.depth.Add(int64(len(keys)))
+	return keys, nil
 }
 
 func (o *replicationOutbox) deleteBatch(keys [][]byte) {
@@ -95,7 +130,9 @@ func (o *replicationOutbox) deleteBatch(keys [][]byte) {
 	}
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		log.Printf("replication outbox delete failed: %v", err)
+		return
 	}
+	o.depth.Add(-int64(len(keys)))
 }
 
 func (c *Cluster) AttachReplicationOutbox(db *pebble.DB) {
@@ -135,6 +172,7 @@ func (c *Cluster) recoverReplicationOutbox() {
 		})
 		recovered++
 	}
+	c.outbox.depth.Store(int64(recovered))
 	if err := iter.Error(); err != nil {
 		log.Printf("replication outbox recovery iterator failed: %v", err)
 	}
@@ -163,14 +201,82 @@ func (c *Cluster) ReplicateAsync(metric, query string) error {
 		})
 	}
 
-	c.enqueueFanout(metric, records)
+	if err := c.enqueueFanout(metric, records); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (c *Cluster) enqueueFanout(metric string, records []replicationRecord) {
+func (c *Cluster) ReplicateBatch(items []ReplicationItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	type pendingRecord struct {
+		metric string
+		record replicationRecord
+	}
+	var pending []pendingRecord
+	for _, item := range items {
+		if item.Quorum {
+			if err := c.ReplicateQuorum(item.Metric, item.Query); err != nil {
+				return err
+			}
+			continue
+		}
+		replicas := c.GetReplicaNodes(item.Metric)
+		for _, replica := range replicas {
+			pending = append(pending, pendingRecord{
+				metric: item.Metric,
+				record: replicationRecord{
+					node:  replica,
+					query: item.Query,
+				},
+			})
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	asyncRecords := make([]replicationRecord, 0, len(pending))
+	for _, p := range pending {
+		asyncRecords = append(asyncRecords, p.record)
+	}
+	if c.outbox != nil {
+		keys, err := c.outbox.putBatch(asyncRecords)
+		if err != nil {
+			return err
+		}
+		for i := range asyncRecords {
+			asyncRecords[i].outboxKey = keys[i]
+			pending[i].record.outboxKey = keys[i]
+		}
+	}
+
+	byMetric := make(map[string][]replicationRecord)
+	for _, p := range pending {
+		byMetric[p.metric] = append(byMetric[p.metric], p.record)
+	}
+
+	for metric, records := range byMetric {
+		if err := c.enqueueFanout(metric, records); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Cluster) enqueueFanout(metric string, records []replicationRecord) error {
 	q := c.getFanoutQueue(metric)
-	q.ch <- fanoutTask{
+	task := fanoutTask{
 		records: records,
+	}
+	select {
+	case q.ch <- task:
+		return nil
+	default:
+		return ErrServerBusy
 	}
 }
 
@@ -181,7 +287,7 @@ func (c *Cluster) getFanoutQueue(metric string) *fanoutQueue {
 
 	q := &fanoutQueue{
 		metric: metric,
-		ch:     make(chan fanoutTask, asyncFanoutQueueSize),
+		ch:     make(chan fanoutTask, c.fanoutQSize),
 	}
 	actual, loaded := c.fanoutQueues.LoadOrStore(metric, q)
 	if loaded {
@@ -221,7 +327,7 @@ func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
 
 	q := &replicationQueue{
 		node: node,
-		ch:   make(chan replicationRecord, asyncReplicationQueueSize),
+		ch:   make(chan replicationRecord, c.replicationQSize),
 	}
 	actual, loaded := c.replicationQueues.LoadOrStore(node.ID, q)
 	if loaded {
@@ -408,4 +514,25 @@ func (c *Cluster) ReplicateWrite(metric, query string, quorum bool) error {
 		return c.ReplicateQuorum(metric, query)
 	}
 	return c.ReplicateAsync(metric, query)
+}
+
+func (c *Cluster) ReplicationStats() ReplicationStats {
+	stats := ReplicationStats{
+		FanoutQueueDepth:  make(map[string]int),
+		ReplicaQueueDepth: make(map[string]int),
+	}
+	if c.outbox != nil {
+		stats.OutboxDepth = c.outbox.depth.Load()
+	}
+	c.fanoutQueues.Range(func(key, value any) bool {
+		q := value.(*fanoutQueue)
+		stats.FanoutQueueDepth[key.(string)] = len(q.ch)
+		return true
+	})
+	c.replicationQueues.Range(func(key, value any) bool {
+		q := value.(*replicationQueue)
+		stats.ReplicaQueueDepth[key.(string)] = len(q.ch)
+		return true
+	})
+	return stats
 }

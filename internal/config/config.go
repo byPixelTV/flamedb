@@ -36,9 +36,11 @@ type Config struct {
 }
 
 type ClusterConfig struct {
-	Seeds             []string `yaml:"seeds"`
-	ReplicationFactor int      `yaml:"replication_factor"`
-	ReadPolicy        string   `yaml:"read_policy,omitempty"`
+	Seeds                []string `yaml:"seeds"`
+	ReplicationFactor    int      `yaml:"replication_factor"`
+	ReadPolicy           string   `yaml:"read_policy,omitempty"`
+	ReplicationQueueSize int      `yaml:"replication_queue_size,omitempty"`
+	FanoutQueueSize      int      `yaml:"fanout_queue_size,omitempty"`
 }
 
 type NodeConfig struct {
