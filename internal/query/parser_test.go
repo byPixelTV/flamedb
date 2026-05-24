@@ -52,3 +52,26 @@ func TestParseInternalRoutingFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestParseWriteBatch(t *testing.T) {
+	queries, errs := ParseWriteBatch([]string{
+		`WRITE kills 1 player="pixel"`,
+		`GET kills LIMIT 1`,
+		`WRITE money 5 lb="pixel" QUORUM`,
+	})
+	if len(queries) != 2 {
+		t.Fatalf("len(queries) = %d, want 2", len(queries))
+	}
+	if len(errs) != 1 {
+		t.Fatalf("len(errs) = %d, want 1", len(errs))
+	}
+	if errs[0].Index != 1 {
+		t.Fatalf("errs[0].Index = %d, want 1", errs[0].Index)
+	}
+	if queries[0].Metric != "kills" || queries[0].Tags["player"] != "pixel" {
+		t.Fatalf("first write parsed incorrectly: %+v", queries[0])
+	}
+	if !queries[1].UpdateLB || queries[1].LBEntityID != "pixel" || !queries[1].Quorum {
+		t.Fatalf("second write parsed incorrectly: %+v", queries[1])
+	}
+}

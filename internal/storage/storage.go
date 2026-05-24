@@ -32,7 +32,6 @@ const (
 
 type Storage struct {
 	db          *pebble.DB
-	batcher     *WriteBatcher
 	cardCache   *cardCache
 	cardUpdater *cardUpdater
 	cache       *pebble.Cache
@@ -63,7 +62,6 @@ func Open(path, compression string) (*Storage, error) {
 	}
 	store := &Storage{
 		db:        db,
-		batcher:   NewWriteBatcher(db),
 		cardCache: newCardCache(cardCacheMaxEntries, cardCacheTTL),
 		cache:     blockCache,
 	}
@@ -128,33 +126,47 @@ func eventKey(metric string, timestamp int64) []byte {
 }
 
 func (s *Storage) WriteEvent(e Event, sync bool) error {
-	primaryKey := eventKey(e.Metric, e.Timestamp)
+	return s.WriteEvents([]Event{e}, sync)
+}
 
-	val, err := encodeEventValue(e)
-	if err != nil {
-		return err
+func (s *Storage) WriteEvents(events []Event, sync bool) error {
+	if len(events) == 0 {
+		return nil
 	}
 
-	// primary event
-	s.batcher.Add(primaryKey, val)
+	batch := s.db.NewBatch()
+	defer batch.Close()
 
-	// secondary index pro tag
-	for k, v := range e.Tags {
-		idxKey := indexKey(e.Metric, k, v, e.Timestamp)
-		s.batcher.Add(idxKey, primaryKey)
+	for _, e := range events {
+		primaryKey := eventKey(e.Metric, e.Timestamp)
+
+		val, err := encodeEventValue(e)
+		if err != nil {
+			return err
+		}
+
+		if err := batch.Set(primaryKey, val, nil); err != nil {
+			return err
+		}
+
+		for k, v := range e.Tags {
+			idxKey := indexKey(e.Metric, k, v, e.Timestamp)
+			if err := batch.Set(idxKey, primaryKey, nil); err != nil {
+				return err
+			}
+		}
+
+		if s.cardUpdater != nil {
+			s.cardUpdater.Add(e.Metric, e.Tags)
+		}
+		s.updateLatest(e)
 	}
 
-	// cardinality tracking — async batcher for write throughput
-	if s.cardUpdater != nil {
-		s.cardUpdater.Add(e.Metric, e.Tags)
-	}
-
-	// QUORUM = sofort flushen, sonst async
-	s.updateLatest(e)
+	opts := pebble.NoSync
 	if sync {
-		return s.batcher.Flush()
+		opts = pebble.Sync
 	}
-	return nil
+	return batch.Commit(opts)
 }
 
 func (s *Storage) updateLatest(e Event) {

@@ -31,6 +31,7 @@ type Cluster struct {
 	replicationQueues sync.Map
 	fanoutQueues      sync.Map
 	routeCache        sync.Map
+	outbox            *replicationOutbox
 }
 
 type routeInfo struct {

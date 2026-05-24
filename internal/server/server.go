@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -133,6 +134,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				continue
 			}
 			queries := strings.Split(strings.TrimSpace(line[len("REPL_BATCH "):]), "\x1f")
+			var batch []*query.Query
 			for _, replicaLine := range queries {
 				replicaLine = strings.TrimSpace(replicaLine)
 				if replicaLine == "" {
@@ -145,12 +147,27 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 				q.IsReplica = true
 				q.ForceLocal = true
-				if _, err := s.exec.Execute(q); err != nil {
-					writeJSON(conn, map[string]string{"error": err.Error()})
-					continue
-				}
+				batch = append(batch, q)
+			}
+			res, err := s.exec.ExecuteBatch(batch)
+			if err != nil {
+				writeJSON(conn, map[string]string{"error": err.Error()})
+				continue
+			}
+			if res.Failed > 0 {
+				writeJSON(conn, res)
+				continue
 			}
 			writeJSON(conn, map[string]string{"cluster": "ok"})
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToUpper(line), "WRITE_BATCH") {
+			if !session.Can(auth.PermWrite) {
+				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
+				continue
+			}
+			s.handleWriteBatch(conn, scanner, line)
 			continue
 		}
 
@@ -406,6 +423,145 @@ func isConnectionClosed(err error) bool {
 	return strings.Contains(s, "wsarecv") ||
 		strings.Contains(s, "use of closed") ||
 		strings.Contains(s, "connection reset")
+}
+
+func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header string) {
+	batchQuorum := strings.Contains(strings.ToUpper(header), "QUORUM")
+	var lines []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.EqualFold(line, "END") {
+			break
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+
+	if len(lines) == 0 {
+		writeJSON(conn, query.BatchResult{OK: true})
+		return
+	}
+
+	result := &query.BatchResult{OK: true}
+	type localItem struct {
+		index int
+		line  string
+		q     *query.Query
+	}
+	var local []localItem
+
+	for i, itemLine := range lines {
+		q, err := query.Parse(itemLine)
+		if err != nil {
+			result.Failed++
+			result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+			continue
+		}
+		if q.Type != query.QueryTypeWrite {
+			result.Failed++
+			result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: "WRITE_BATCH only supports WRITE items"})
+			continue
+		}
+		if batchQuorum {
+			q.Quorum = true
+		}
+
+		requiresPrimary := q.UpdateLB
+		if requiresPrimary && !q.IsReplica && !s.cluster.IsPrimaryFor(q.Metric) {
+			data, err := s.cluster.ForwardToPrimary(q.Metric, s.apiKey, itemLine)
+			if err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			if err := upstreamError(data); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			result.Accepted++
+			continue
+		}
+
+		if !q.ForceLocal && !s.cluster.IsLocal(q.Metric) {
+			data, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, itemLine)
+			if err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			if err := upstreamError(data); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			result.Accepted++
+			continue
+		}
+
+		local = append(local, localItem{index: i, line: itemLine, q: q})
+	}
+
+	if len(local) > 0 {
+		localQueries := make([]*query.Query, 0, len(local))
+		localIndexByBatchIndex := make(map[int]int, len(local))
+		for i, item := range local {
+			localQueries = append(localQueries, item.q)
+			localIndexByBatchIndex[i] = item.index
+		}
+
+		localResult, err := s.exec.ExecuteBatch(localQueries)
+		if err != nil {
+			for _, item := range local {
+				result.Failed++
+				result.Errors = append(result.Errors, query.BatchItemError{Index: item.index, Error: err.Error()})
+			}
+		} else {
+			failedLocal := make(map[int]bool, len(localResult.Errors))
+			for _, itemErr := range localResult.Errors {
+				origIndex := localIndexByBatchIndex[itemErr.Index]
+				failedLocal[origIndex] = true
+				result.Errors = append(result.Errors, query.BatchItemError{Index: origIndex, Error: itemErr.Error})
+			}
+			result.Failed += localResult.Failed
+			result.Accepted += localResult.Accepted
+
+			for _, item := range local {
+				if failedLocal[item.index] || item.q.IsReplica {
+					continue
+				}
+				replicateFromThisNode := s.cluster.IsPrimaryFor(item.q.Metric) || !item.q.UpdateLB
+				if !replicateFromThisNode {
+					continue
+				}
+				replicaQuery := item.line + " __replica"
+				if err := s.cluster.ReplicateWrite(item.q.Metric, replicaQuery, item.q.Quorum); err != nil {
+					result.Accepted--
+					result.Failed++
+					result.Errors = append(result.Errors, query.BatchItemError{Index: item.index, Error: fmt.Sprintf("quorum failed: %v", err)})
+				}
+			}
+		}
+	}
+
+	if result.Failed > 0 {
+		result.OK = false
+	}
+	writeJSON(conn, result)
+}
+
+func upstreamError(data []byte) error {
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("invalid upstream response")
+	}
+	if resp.Error != "" {
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 func writeJSON(conn net.Conn, v any) {

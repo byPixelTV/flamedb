@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -52,6 +53,7 @@ func main() {
 	replicationFactor := flag.Int("replication-factor", 1, "replication factor for --route owner")
 	vnodes := flag.Int("vnodes", 150, "virtual nodes per physical node for --route owner")
 	pipeline := flag.Int("pipeline", 1, "number of commands to pipeline per worker iteration")
+	batchSize := flag.Int("batch-size", 1, "number of WRITE commands per native WRITE_BATCH request")
 	timeout := flag.Duration("timeout", 2*time.Second, "per-request timeout")
 	flag.Parse()
 
@@ -81,6 +83,10 @@ func main() {
 	}
 	if *pipeline <= 0 {
 		fmt.Fprintln(os.Stderr, "pipeline must be > 0")
+		os.Exit(2)
+	}
+	if *batchSize <= 0 {
+		fmt.Fprintln(os.Stderr, "batch-size must be > 0")
 		os.Exit(2)
 	}
 	if *duration <= 0 {
@@ -167,6 +173,58 @@ func main() {
 						})
 					}
 					runPipelinedOps(ops, clients, *key, *timeout, &writeCount, &readCount, &writeErrors, &readErrors, &localWrites, &localReads)
+					continue
+				}
+
+				if *batchSize > 1 && m == modeWrite {
+					batches := make(map[string][]string)
+					for j := 0; j < *batchSize; j++ {
+						op++
+						name := *metric
+						if *metrics > 1 {
+							name = fmt.Sprintf("%s_%d", *metric, (workerID+op)%*metrics)
+						}
+						targetAddr := router.addrFor(name, workerID, op)
+						batches[targetAddr] = append(batches[targetAddr], fmt.Sprintf("WRITE %s 1", name))
+					}
+					started := time.Now()
+					accepted := 0
+					failed := 0
+					for targetAddr, writes := range batches {
+						client := clients[targetAddr]
+						if client == nil {
+							c, err := newBenchClient(targetAddr, *key, *timeout)
+							if err != nil {
+								failed += len(writes)
+								continue
+							}
+							client = c
+							clients[targetAddr] = c
+						}
+
+						lines := make([]string, 0, len(writes)+2)
+						lines = append(lines, "WRITE_BATCH")
+						lines = append(lines, writes...)
+						lines = append(lines, "END")
+
+						n, err := client.sendWriteBatch(lines)
+						if err != nil {
+							client.close()
+							delete(clients, targetAddr)
+							failed += len(writes)
+							continue
+						}
+						accepted += n
+						if n < len(writes) {
+							failed += len(writes) - n
+						}
+					}
+					perOp := time.Since(started).Nanoseconds() / int64(*batchSize)
+					atomic.AddInt64(&writeCount, int64(accepted))
+					atomic.AddInt64(&writeErrors, int64(failed))
+					for j := 0; j < accepted; j++ {
+						localWrites = append(localWrites, perOp)
+					}
 					continue
 				}
 
@@ -313,6 +371,42 @@ func newBenchClient(addr, key string, timeout time.Duration) (*benchClient, erro
 func (c *benchClient) send(line string) error {
 	_, err := c.request(line)
 	return err
+}
+
+func (c *benchClient) sendWriteBatch(lines []string) (int, error) {
+	if c == nil {
+		return 0, fmt.Errorf("client is nil")
+	}
+	if len(lines) == 0 {
+		return 0, nil
+	}
+	if err := c.conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	for _, line := range lines {
+		if _, err := c.w.WriteString(line + "\n"); err != nil {
+			return 0, err
+		}
+	}
+	if err := c.w.Flush(); err != nil {
+		return 0, err
+	}
+	resp, err := c.r.ReadBytes('\n')
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		OK       bool   `json:"ok"`
+		Accepted int    `json:"accepted"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return 0, fmt.Errorf("invalid batch response: %w", err)
+	}
+	if out.Error != "" {
+		return 0, errors.New(out.Error)
+	}
+	return out.Accepted, nil
 }
 
 func (c *benchClient) pipeline(lines []string) error {

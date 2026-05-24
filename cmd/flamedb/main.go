@@ -50,6 +50,7 @@ func main() {
 		replicationFactor = 1
 	}
 	c := cluster.New(self, 150, internalKey, replicationFactor)
+	c.AttachReplicationOutbox(store.DB())
 
 	// seeds joinen, kein pre-loading von nodes aus config
 	go func() {

@@ -321,6 +321,28 @@ func Parse(input string) (*Query, error) {
 	return q, nil
 }
 
+func ParseWriteBatch(lines []string) ([]*Query, []BatchItemError) {
+	queries := make([]*Query, 0, len(lines))
+	var errors []BatchItemError
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		q, err := Parse(line)
+		if err != nil {
+			errors = append(errors, BatchItemError{Index: i, Error: err.Error()})
+			continue
+		}
+		if q.Type != QueryTypeWrite {
+			errors = append(errors, BatchItemError{Index: i, Error: "WRITE_BATCH only supports WRITE items"})
+			continue
+		}
+		queries = append(queries, q)
+	}
+	return queries, errors
+}
+
 func tokenize(input string) []string {
 	var tokens []string
 	var current strings.Builder

@@ -1,11 +1,16 @@
 package cluster
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/cockroachdb/pebble"
 )
 
 const asyncReplicationWorkersPerNode = 64
@@ -26,12 +31,11 @@ type ReplicationResult struct {
 
 type replicationQueue struct {
 	node Node
-	ch   chan string
+	ch   chan replicationRecord
 }
 
 type fanoutTask struct {
-	query    string
-	replicas []Node
+	records []replicationRecord
 }
 
 type fanoutQueue struct {
@@ -39,21 +43,134 @@ type fanoutQueue struct {
 	ch     chan fanoutTask
 }
 
-// ReplicateAsync — fire and forget, client wartet nicht
-func (c *Cluster) ReplicateAsync(metric, query string) {
-	replicas := c.GetReplicaNodes(metric)
-	if len(replicas) == 0 {
-		return
-	}
-
-	c.enqueueFanout(metric, replicas, query)
+type replicationRecord struct {
+	node      Node
+	query     string
+	outboxKey []byte
 }
 
-func (c *Cluster) enqueueFanout(metric string, replicas []Node, query string) {
+type outboxEntry struct {
+	Node  Node   `json:"node"`
+	Query string `json:"query"`
+}
+
+type replicationOutbox struct {
+	db  *pebble.DB
+	seq atomic.Uint64
+}
+
+func newReplicationOutbox(db *pebble.DB) *replicationOutbox {
+	o := &replicationOutbox{db: db}
+	o.seq.Store(uint64(time.Now().UnixNano()))
+	return o
+}
+
+func (o *replicationOutbox) put(node Node, query string) ([]byte, error) {
+	if o == nil || o.db == nil {
+		return nil, nil
+	}
+	seq := o.seq.Add(1)
+	key := []byte(fmt.Sprintf("repl-outbox:%s:%020d", node.ID, seq))
+	value, err := json.Marshal(outboxEntry{Node: node, Query: query})
+	if err != nil {
+		return nil, err
+	}
+	if err := o.db.Set(key, value, pebble.NoSync); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func (o *replicationOutbox) deleteBatch(keys [][]byte) {
+	if o == nil || o.db == nil || len(keys) == 0 {
+		return
+	}
+	batch := o.db.NewBatch()
+	defer batch.Close()
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		_ = batch.Delete(key, nil)
+	}
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		log.Printf("replication outbox delete failed: %v", err)
+	}
+}
+
+func (c *Cluster) AttachReplicationOutbox(db *pebble.DB) {
+	if db == nil {
+		return
+	}
+	c.outbox = newReplicationOutbox(db)
+	c.recoverReplicationOutbox()
+}
+
+func (c *Cluster) recoverReplicationOutbox() {
+	if c.outbox == nil || c.outbox.db == nil {
+		return
+	}
+	iter, err := c.outbox.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte("repl-outbox:"),
+		UpperBound: []byte("repl-outbox;"),
+	})
+	if err != nil {
+		log.Printf("replication outbox recovery failed: %v", err)
+		return
+	}
+	defer iter.Close()
+
+	recovered := 0
+	for iter.First(); iter.Valid(); iter.Next() {
+		var entry outboxEntry
+		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
+			log.Printf("replication outbox decode failed for %s: %v", string(iter.Key()), err)
+			continue
+		}
+		key := append([]byte(nil), iter.Key()...)
+		c.enqueueReplicationRecord(replicationRecord{
+			node:      entry.Node,
+			query:     entry.Query,
+			outboxKey: key,
+		})
+		recovered++
+	}
+	if err := iter.Error(); err != nil {
+		log.Printf("replication outbox recovery iterator failed: %v", err)
+	}
+	if recovered > 0 {
+		log.Printf("recovered %d pending replication outbox records", recovered)
+	}
+}
+
+// ReplicateAsync — fire and forget, client wartet nicht
+func (c *Cluster) ReplicateAsync(metric, query string) error {
+	replicas := c.GetReplicaNodes(metric)
+	if len(replicas) == 0 {
+		return nil
+	}
+
+	records := make([]replicationRecord, 0, len(replicas))
+	for _, replica := range replicas {
+		key, err := c.persistReplication(replica, query)
+		if err != nil {
+			return fmt.Errorf("replication outbox persist failed for %s: %w", replica.ID, err)
+		}
+		records = append(records, replicationRecord{
+			node:      replica,
+			query:     query,
+			outboxKey: key,
+		})
+	}
+
+	c.enqueueFanout(metric, records)
+	return nil
+}
+
+func (c *Cluster) enqueueFanout(metric string, records []replicationRecord) {
 	q := c.getFanoutQueue(metric)
 	q.ch <- fanoutTask{
-		query:    query,
-		replicas: replicas,
+		records: records,
 	}
 }
 
@@ -79,15 +196,22 @@ func (c *Cluster) getFanoutQueue(metric string) *fanoutQueue {
 
 func (c *Cluster) fanoutWorker(q *fanoutQueue) {
 	for task := range q.ch {
-		for _, replica := range task.replicas {
-			c.enqueueReplication(replica, task.query)
+		for _, record := range task.records {
+			c.enqueueReplicationRecord(record)
 		}
 	}
 }
 
-func (c *Cluster) enqueueReplication(node Node, query string) {
-	q := c.getReplicationQueue(node)
-	q.ch <- query
+func (c *Cluster) persistReplication(node Node, query string) ([]byte, error) {
+	if c.outbox == nil {
+		return nil, nil
+	}
+	return c.outbox.put(node, query)
+}
+
+func (c *Cluster) enqueueReplicationRecord(record replicationRecord) {
+	q := c.getReplicationQueue(record.node)
+	q.ch <- record
 }
 
 func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
@@ -97,7 +221,7 @@ func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
 
 	q := &replicationQueue{
 		node: node,
-		ch:   make(chan string, asyncReplicationQueueSize),
+		ch:   make(chan replicationRecord, asyncReplicationQueueSize),
 	}
 	actual, loaded := c.replicationQueues.LoadOrStore(node.ID, q)
 	if loaded {
@@ -111,28 +235,28 @@ func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
 }
 
 func (c *Cluster) replicationWorker(q *replicationQueue) {
-	batch := make([]string, 0, asyncReplicationBatchSize)
+	batch := make([]replicationRecord, 0, asyncReplicationBatchSize)
 	timer := time.NewTimer(asyncReplicationBatchWait)
 	if !timer.Stop() {
 		<-timer.C
 	}
 
 	for {
-		query, ok := <-q.ch
+		record, ok := <-q.ch
 		if !ok {
 			return
 		}
-		batch = append(batch, query)
+		batch = append(batch, record)
 		timer.Reset(asyncReplicationBatchWait)
 
 	drain:
 		for len(batch) < asyncReplicationBatchSize {
 			select {
-			case query, ok := <-q.ch:
+			case record, ok := <-q.ch:
 				if !ok {
 					return
 				}
-				batch = append(batch, query)
+				batch = append(batch, record)
 			case <-timer.C:
 				break drain
 			}
@@ -149,27 +273,49 @@ func (c *Cluster) replicationWorker(q *replicationQueue) {
 	}
 }
 
-func (c *Cluster) sendReplicationBatch(node Node, queries []string) {
-	if len(queries) == 0 {
+func (c *Cluster) sendReplicationBatch(node Node, records []replicationRecord) {
+	if len(records) == 0 {
 		return
+	}
+
+	queries := make([]string, 0, len(records))
+	keys := make([][]byte, 0, len(records))
+	for _, record := range records {
+		queries = append(queries, record.query)
+		if len(record.outboxKey) > 0 {
+			keys = append(keys, record.outboxKey)
+		}
 	}
 
 	line := queries[0]
 	if len(queries) == 1 {
 		c.sendReplicationLineWithRetry(node, line)
+		if c.outbox != nil {
+			c.outbox.deleteBatch(keys)
+		}
 		return
 	}
 
 	line = "REPL_BATCH " + strings.Join(queries, replicationBatchSeparator)
 	c.sendReplicationLineWithRetry(node, line)
+	if c.outbox != nil {
+		c.outbox.deleteBatch(keys)
+	}
 }
 
 func (c *Cluster) sendReplicationLineWithRetry(node Node, line string) {
 	delay := replicationRetryInitialDelay
 	attempt := 0
 	for {
-		if _, err := c.pool.Send(node, line); err == nil {
-			return
+		if data, err := c.pool.Send(node, line); err == nil {
+			if err := replicationResponseError(data); err == nil {
+				return
+			} else {
+				attempt++
+				if attempt == 1 || attempt%100 == 0 {
+					log.Printf("replication to %s returned error, retrying (attempt=%d): %v", node.ID, attempt, err)
+				}
+			}
 		} else {
 			attempt++
 			if attempt == 1 || attempt%100 == 0 {
@@ -185,6 +331,20 @@ func (c *Cluster) sendReplicationLineWithRetry(node Node, line string) {
 			}
 		}
 	}
+}
+
+func replicationResponseError(data []byte) error {
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("invalid replication response: %w", err)
+	}
+	if errValue, ok := resp["error"].(string); ok && errValue != "" {
+		return errors.New(errValue)
+	}
+	if okValue, ok := resp["ok"].(bool); ok && !okValue {
+		return errors.New("replication batch failed")
+	}
+	return nil
 }
 
 // ReplicateQuorum — warte bis majority replicas geschrieben haben
@@ -247,6 +407,5 @@ func (c *Cluster) ReplicateWrite(metric, query string, quorum bool) error {
 	if quorum {
 		return c.ReplicateQuorum(metric, query)
 	}
-	c.ReplicateAsync(metric, query)
-	return nil
+	return c.ReplicateAsync(metric, query)
 }

@@ -48,6 +48,86 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 	return nil, nil
 }
 
+func (e *Executor) ExecuteBatch(queries []*Query) (*BatchResult, error) {
+	result := &BatchResult{OK: true}
+	if len(queries) == 0 {
+		return result, nil
+	}
+
+	type plainWrite struct {
+		index int
+		event storage.Event
+	}
+
+	var plain []plainWrite
+	plainSync := false
+	now := time.Now().UnixNano()
+	for i, q := range queries {
+		if q == nil {
+			result.Failed++
+			result.Errors = append(result.Errors, BatchItemError{Index: i, Error: "nil query"})
+			continue
+		}
+		if q.Type != QueryTypeWrite {
+			result.Failed++
+			result.Errors = append(result.Errors, BatchItemError{Index: i, Error: "batch only supports WRITE"})
+			continue
+		}
+
+		ts := q.Timestamp
+		if ts == 0 {
+			ts = now + int64(i)
+		}
+		event := storage.Event{
+			Timestamp: ts,
+			Metric:    q.Metric,
+			Value:     q.Value,
+			Tags:      q.Tags,
+		}
+
+		if q.UpdateLB {
+			if err := e.store.WriteEvent(event, q.Quorum); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			if err := e.lb.Increment(q.Metric, q.LBEntityID, q.Value); err != nil {
+				result.Failed++
+				result.Errors = append(result.Errors, BatchItemError{Index: i, Error: err.Error()})
+				continue
+			}
+			e.cache.Invalidate(q.Metric)
+			result.Accepted++
+			continue
+		}
+
+		if q.Quorum {
+			plainSync = true
+		}
+		plain = append(plain, plainWrite{index: i, event: event})
+	}
+
+	if len(plain) > 0 {
+		events := make([]storage.Event, 0, len(plain))
+		for _, item := range plain {
+			events = append(events, item.event)
+		}
+		if err := e.store.WriteEvents(events, plainSync); err != nil {
+			for _, item := range plain {
+				result.Failed++
+				result.Errors = append(result.Errors, BatchItemError{Index: item.index, Error: err.Error()})
+			}
+		} else {
+			result.Accepted += len(plain)
+		}
+	}
+
+	if result.Failed > 0 {
+		result.OK = false
+	}
+	return result, nil
+}
+
 func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 	if len(q.Groups) == 0 {
 		return &Result{Leaderboard: []aggregates.LeaderboardEntry{}}, nil

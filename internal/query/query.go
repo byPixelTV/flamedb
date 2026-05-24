@@ -69,6 +69,18 @@ type Result struct {
 	SeriesByMetric map[string][]SeriesPoint      `json:"series_by_metric,omitempty"`
 }
 
+type BatchItemError struct {
+	Index int    `json:"index"`
+	Error string `json:"error"`
+}
+
+type BatchResult struct {
+	OK       bool             `json:"ok"`
+	Accepted int              `json:"accepted"`
+	Failed   int              `json:"failed"`
+	Errors   []BatchItemError `json:"errors,omitempty"`
+}
+
 type SeriesPoint struct {
 	TS    int64   `json:"ts"`
 	Value float64 `json:"value"`
