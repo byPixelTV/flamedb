@@ -22,10 +22,21 @@ func Parse(input string) (*Query, error) {
 	}
 
 	switch strings.ToUpper(tokens[0]) {
+	case "STATS":
+		q.Type = QueryTypeStats
+		if len(tokens) < 2 {
+			return nil, fmt.Errorf("STATS requires metric")
+		}
+		q.Metric = tokens[1]
+		// rest sind tag keys
+		if len(tokens) > 2 && strings.ToUpper(tokens[2]) == "TAGS" {
+			q.TagKeys = tokens[3:]
+		}
+		return q, nil
 	case "WRITE":
 		q.Type = QueryTypeWrite
 		if len(tokens) < 3 {
-			return nil, fmt.Errorf("WRITE braucht metric und value")
+			return nil, fmt.Errorf("WRITE requires metric and value")
 		}
 		q.Metric = tokens[1]
 		val, err := strconv.ParseFloat(tokens[2], 64)
@@ -36,11 +47,25 @@ func Parse(input string) (*Query, error) {
 
 		i := 3
 		for i < len(tokens) {
-			if i+2 >= len(tokens)+1 {
+			key := tokens[i]
+
+			// standalone flags zuerst checken (kein = nötig)
+			switch strings.ToUpper(key) {
+			case "QUORUM":
+				q.Quorum = true
+				i++
+				continue
+			case "__REPLICA":
+				q.IsReplica = true
+				i++
+				continue
+			}
+
+			// rest braucht key = value format
+			if i+2 >= len(tokens) {
 				break
 			}
-			key := tokens[i]
-			if i+1 >= len(tokens) || tokens[i+1] != "=" {
+			if tokens[i+1] != "=" {
 				break
 			}
 			value := strings.Trim(tokens[i+2], `"`)
@@ -64,7 +89,7 @@ func Parse(input string) (*Query, error) {
 	case "SET":
 		q.Type = QueryTypeSet
 		if len(tokens) < 3 {
-			return nil, fmt.Errorf("SET braucht metric und value")
+			return nil, fmt.Errorf("SET requires metric and value")
 		}
 		q.Metric = tokens[1]
 		val, err := strconv.ParseFloat(tokens[2], 64)
@@ -97,7 +122,7 @@ func Parse(input string) (*Query, error) {
 	case "DELETE":
 		q.Type = QueryTypeDelete
 		if len(tokens) < 2 {
-			return nil, fmt.Errorf("DELETE braucht metric")
+			return nil, fmt.Errorf("DELETE requires metric")
 		}
 		q.Metric = tokens[1]
 		q.Tags = make(map[string]string)

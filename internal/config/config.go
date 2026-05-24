@@ -17,10 +17,11 @@ type AuthConfig struct {
 }
 
 type ServerConfig struct {
-	Port     int    `yaml:"port"`
-	Host     string `yaml:"host"`
-	NodeID   string `yaml:"node_id"`
-	DataPath string `yaml:"data_path"`
+	Port          int    `yaml:"port"`
+	Host          string `yaml:"host"`
+	AdvertiseAddr string `yaml:"advertise_addr"`
+	NodeID        string `yaml:"node_id"`
+	DataPath      string `yaml:"data_path"`
 }
 
 type Config struct {
@@ -30,7 +31,8 @@ type Config struct {
 }
 
 type ClusterConfig struct {
-	Seeds []string `yaml:"seeds"`
+	Seeds             []string `yaml:"seeds"`
+	ReplicationFactor int      `yaml:"replication_factor"`
 }
 
 type NodeConfig struct {

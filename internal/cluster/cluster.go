@@ -1,25 +1,105 @@
 package cluster
 
 import (
-	"bufio"
 	"fmt"
-	"net"
+	"log"
 	"sync"
 )
 
 type Cluster struct {
-	Self     Node
-	Ring     *Ring
-	failures sync.Map
+	Self              Node
+	Ring              *Ring
+	failures          sync.Map
+	pool              *ConnPool
+	ReplicationFactor int
 }
 
-func New(self Node, replicas int) *Cluster {
+func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {
 	c := &Cluster{
-		Self: self,
-		Ring: NewRing(replicas),
+		Self:              self,
+		Ring:              NewRing(replicas),
+		pool:              NewConnPool(apiKey),
+		ReplicationFactor: replicationFactor,
 	}
-	c.Ring.Add(self)
+	c.Ring.Add(self) // self immer zuerst adden
 	return c
+}
+
+func (c *Cluster) ForwardToPrimary(metric, apiKey, query string) ([]byte, error) {
+	nodes := c.Ring.GetN(metric, 1)
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("no primary found for metric: %s", metric)
+	}
+	primary := nodes[0]
+	if primary.ID == c.Self.ID {
+		return nil, fmt.Errorf("self is primary, should not forward")
+	}
+	return c.pool.Send(primary, query)
+}
+
+func (c *Cluster) GetAllNodes() []NodeInfo {
+	c.Ring.mu.RLock()
+	defer c.Ring.mu.RUnlock()
+	seen := make(map[string]bool)
+	var nodes []NodeInfo
+	for _, n := range c.Ring.nodes {
+		if !seen[n.ID] {
+			seen[n.ID] = true
+			nodes = append(nodes, NodeInfo{ID: n.ID, Addr: n.Addr})
+		}
+	}
+	return nodes
+}
+
+func (c *Cluster) ForwardWithFailover(metric, apiKey, query string) ([]byte, error) {
+	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
+
+	var lastErr error
+	for _, node := range nodes {
+		if node.ID == c.Self.ID {
+			continue
+		}
+		result, err := c.pool.Send(node, query)
+		if err != nil {
+			lastErr = err
+			log.Printf("forward to %s failed, trying next replica: %v", node.ID, err)
+			continue
+		}
+		return result, nil
+	}
+	return nil, fmt.Errorf("all nodes failed: %v", lastErr)
+}
+
+func (c *Cluster) GetReplicaNodes(metric string) []Node {
+	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
+	// primary rausfiltern, nur replicas
+	var replicas []Node
+	for _, n := range nodes {
+		if n.ID != c.Self.ID {
+			replicas = append(replicas, n)
+		}
+	}
+	return replicas
+}
+
+func (c *Cluster) IsPrimaryFor(metric string) bool {
+	nodes := c.Ring.GetN(metric, 1)
+	if len(nodes) == 0 {
+		return true
+	}
+	return nodes[0].ID == c.Self.ID
+}
+
+// IsLocal jetzt: bin ich primary ODER replica für diese metric?
+func (c *Cluster) IsLocal(metric string) bool {
+	nodes := c.Ring.GetN(metric, c.ReplicationFactor)
+	log.Printf("IsLocal check for %s: replicationFactor=%d, nodes=%v, self=%s", metric, c.ReplicationFactor, nodes, c.Self.ID)
+	for _, n := range nodes {
+		if n.ID == c.Self.ID {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Cluster) AddNode(node Node) {
@@ -30,12 +110,24 @@ func (c *Cluster) RemoveNode(nodeID string) {
 	c.Ring.Remove(nodeID)
 }
 
-func (c *Cluster) IsLocal(metric string) bool {
-	node, ok := c.Ring.Get(metric)
-	if !ok {
-		return true // fallback: lokal handlen
+func (c *Cluster) PropagateJoin(node Node, apiKey string) {
+	c.propagateJoin(node, apiKey)
+}
+
+func (c *Cluster) HandleJoin(node Node, apiKey string) {
+	c.AddNode(node)
+	go c.propagateJoin(node, apiKey)
+}
+
+func (c *Cluster) Knows(nodeID string) bool {
+	c.Ring.mu.RLock()
+	defer c.Ring.mu.RUnlock()
+	for _, n := range c.Ring.nodes {
+		if n.ID == nodeID {
+			return true
+		}
 	}
-	return node.ID == c.Self.ID
+	return false
 }
 
 func (c *Cluster) Forward(metric, apiKey, query string) ([]byte, error) {
@@ -43,23 +135,5 @@ func (c *Cluster) Forward(metric, apiKey, query string) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("no node found for metric: %s", metric)
 	}
-
-	conn, err := net.Dial("tcp", node.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s: %w", node.Addr, err)
-	}
-	defer conn.Close()
-
-	scanner := bufio.NewScanner(conn)
-
-	// auth
-	scanner.Scan() // {"auth":"required"}
-	fmt.Fprintf(conn, "AUTH %s\n", apiKey)
-	scanner.Scan() // {"auth":"ok"}
-
-	// query senden
-	fmt.Fprintf(conn, "%s\n", query)
-	scanner.Scan()
-
-	return scanner.Bytes(), nil
+	return c.pool.Send(node, query)
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -92,9 +93,19 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			switch msg.Type {
 			case "JOIN":
-				s.cluster.AddNode(cluster.Node{ID: msg.NodeID, Addr: msg.Addr})
+				newNode := cluster.Node{ID: msg.NodeID, Addr: msg.Addr}
+				isNew := !s.cluster.Knows(newNode.ID)
+				s.cluster.AddNode(newNode)
 				log.Printf("node joined: %s (%s)", msg.NodeID, msg.Addr)
-				writeJSON(conn, map[string]string{"cluster": "ok"})
+				if isNew {
+					go s.cluster.PropagateJoin(newNode, s.apiKey)
+				}
+				// alle bekannten nodes zurückschicken
+				peers := s.cluster.GetAllNodes()
+				writeJSON(conn, map[string]interface{}{
+					"cluster": "ok",
+					"peers":   peers,
+				})
 			}
 			continue
 		}
@@ -112,15 +123,16 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
 				continue
 			}
-		case query.QueryTypeGet, query.QueryTypeLeaderboard:
+		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats:
 			if !session.Can(auth.PermRead) {
 				writeJSON(conn, map[string]string{"error": "permission denied: read required"})
 				continue
 			}
 		}
 
+		// forwarden wenn nicht lokal
 		if !s.cluster.IsLocal(q.Metric) {
-			result, err := s.cluster.Forward(q.Metric, s.apiKey, line)
+			result, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, line)
 			if err != nil {
 				writeJSON(conn, map[string]string{"error": err.Error()})
 				continue
@@ -128,12 +140,36 @@ func (s *Server) handleConn(conn net.Conn) {
 			conn.Write(append(result, '\n'))
 			continue
 		}
+		switch q.Type {
+		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
+			if !s.cluster.IsPrimaryFor(q.Metric) && !q.IsReplica {
+				result, err := s.cluster.ForwardToPrimary(q.Metric, s.apiKey, line)
+				if err != nil {
+					writeJSON(conn, map[string]string{"error": err.Error()})
+					continue
+				}
+				conn.Write(append(result, '\n'))
+				continue
+			}
+		}
 
-		// lokal handlen wie vorher
+		// lokal ausführen (primary oder replica write)
 		result, err := s.exec.Execute(q)
 		if err != nil {
 			writeJSON(conn, map[string]string{"error": err.Error()})
 			continue
+		}
+
+		// replication nur vom primary, nicht von replicas
+		switch q.Type {
+		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
+			if s.cluster.IsPrimaryFor(q.Metric) && !q.IsReplica {
+				replicaQuery := line + " __replica"
+				if err := s.cluster.ReplicateWrite(q.Metric, replicaQuery, q.Quorum); err != nil {
+					writeJSON(conn, map[string]string{"error": fmt.Sprintf("quorum failed: %v", err)})
+					continue
+				}
+			}
 		}
 
 		writeJSON(conn, result)

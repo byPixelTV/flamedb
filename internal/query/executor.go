@@ -1,16 +1,12 @@
 package query
 
 import (
+	"math"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
 )
-
-type Result struct {
-	Events      []storage.Event               `json:"events,omitempty"`
-	Leaderboard []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
-}
 
 type Executor struct {
 	store *storage.Storage
@@ -33,8 +29,20 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 		return e.executeLeaderboard(q)
 	case QueryTypeGet:
 		return e.executeGet(q)
+	case QueryTypeStats:
+		return e.executeStats(q)
 	}
 	return nil, nil
+}
+
+func (e *Executor) executeStats(q *Query) (*Result, error) {
+	stats := e.store.GetTagStats(q.Metric, q.TagKeys)
+	return &Result{
+		Stats: &StatsResult{
+			Metric:   q.Metric,
+			TagStats: stats,
+		},
+	}, nil
 }
 
 func (e *Executor) executeSet(q *Query) (*Result, error) {
@@ -93,30 +101,29 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 }
 
 func (e *Executor) executeGet(q *Query) (*Result, error) {
-	events, err := e.store.ReadRange(q.Metric, q.From, q.To)
+	from := q.From
+	to := q.To
+	if from == 0 {
+		from = 0
+	}
+	if to == 0 {
+		to = math.MaxInt64
+	}
+
+	var events []storage.Event
+	var err error
+
+	if len(q.Where) > 0 {
+		events, err = e.store.ReadRangeWithTags(q.Metric, from, to, q.Where)
+	} else {
+		events, err = e.store.ReadRange(q.Metric, from, to)
+	}
 	if err != nil {
 		return nil, err
 	}
+
 	if events == nil {
 		events = []storage.Event{}
-	}
-
-	// filter by tags
-	if len(q.Where) > 0 {
-		var filtered []storage.Event
-		for _, ev := range events {
-			match := true
-			for k, v := range q.Where {
-				if ev.Tags[k] != v {
-					match = false
-					break
-				}
-			}
-			if match {
-				filtered = append(filtered, ev)
-			}
-		}
-		events = filtered
 	}
 
 	// pagination

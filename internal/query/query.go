@@ -1,5 +1,10 @@
 package query
 
+import (
+	"github.com/byPixelTV/flamedb/internal/aggregates"
+	"github.com/byPixelTV/flamedb/internal/storage"
+)
+
 type QueryType string
 
 const (
@@ -8,6 +13,7 @@ const (
 	QueryTypeWrite       QueryType = "WRITE"
 	QueryTypeSet         QueryType = "SET"
 	QueryTypeDelete      QueryType = "DELETE"
+	QueryTypeStats       QueryType = "STATS"
 )
 
 type Query struct {
@@ -23,6 +29,20 @@ type Query struct {
 	// write specific
 	Value      float64
 	Tags       map[string]string
-	UpdateLB   bool   // should this update the leaderboard?
-	LBEntityID string // entity ID for leaderboard updates
+	UpdateLB   bool     // should this update the leaderboard?
+	LBEntityID string   // entity ID for leaderboard updates
+	TagKeys    []string // for get queries, which tag keys to return
+	Quorum     bool
+	IsReplica  bool
+}
+
+type Result struct {
+	Events      []storage.Event               `json:"events,omitempty"`
+	Leaderboard []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
+	Stats       *StatsResult                  `json:"stats,omitempty"`
+}
+
+type StatsResult struct {
+	Metric   string             `json:"metric"`
+	TagStats []storage.TagStats `json:"tag_stats"`
 }

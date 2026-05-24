@@ -33,13 +33,23 @@ func main() {
 
 	lb := aggregates.New(store.DB())
 	a := auth.New(cfg.Auth)
+	advertiseAddr := cfg.Server.AdvertiseAddr
+	if advertiseAddr == "" {
+		advertiseAddr = fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+	}
+
 	self := cluster.Node{
 		ID:   cfg.Server.NodeID,
-		Addr: fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		Addr: advertiseAddr,
 	}
-	c := cluster.New(self, 150)
 
 	internalKey := cfg.Auth.Keys[0].Key
+
+	replicationFactor := cfg.Cluster.ReplicationFactor
+	if replicationFactor < 1 {
+		replicationFactor = 1
+	}
+	c := cluster.New(self, 150, internalKey, replicationFactor)
 
 	// seeds joinen, kein pre-loading von nodes aus config
 	go func() {

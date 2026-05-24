@@ -31,6 +31,13 @@ func (r *Ring) Add(node Node) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// check ob node bereits im ring ist
+	for _, existing := range r.nodes {
+		if existing.ID == node.ID {
+			return // bereits drin, nichts tun
+		}
+	}
+
 	for i := 0; i < r.replicas; i++ {
 		hash := hashKey(fmt.Sprintf("%s:%d", node.ID, i))
 		r.nodes[hash] = node
@@ -58,6 +65,41 @@ func (r *Ring) Remove(nodeID string) {
 	sort.Slice(r.keys, func(i, j int) bool {
 		return r.keys[i] < r.keys[j]
 	})
+}
+
+func (r *Ring) GetN(metric string, n int) []Node {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.keys) == 0 || n <= 0 {
+		return nil
+	}
+
+	hash := hashKey(metric)
+	idx := sort.Search(len(r.keys), func(i int) bool {
+		return r.keys[i] >= hash
+	})
+	if idx >= len(r.keys) {
+		idx = 0
+	}
+
+	seen := make(map[string]bool)
+	var nodes []Node
+
+	// iterate über alle keys, nicht nur n keys
+	for i := 0; i < len(r.keys); i++ {
+		pos := (idx + i) % len(r.keys)
+		node := r.nodes[r.keys[pos]]
+		if !seen[node.ID] {
+			seen[node.ID] = true
+			nodes = append(nodes, node)
+		}
+		if len(nodes) >= n {
+			break
+		}
+	}
+
+	return nodes
 }
 
 func (r *Ring) Get(metric string) (Node, bool) {
