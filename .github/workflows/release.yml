@@ -270,6 +270,9 @@ jobs:
   publish_sdks:
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -304,25 +307,34 @@ jobs:
           set -euo pipefail
           npm install -g npm@latest
           npm --version
-      
-      - run: npm whoami
+
+      - name: Prepare npm config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/npmrc" <<'EOF'
+          registry=https://registry.npmjs.org/
+          always-auth=false
+          EOF
 
       - name: Publish TypeScript SDK
         working-directory: pkg/typescript
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc
         shell: bash
         run: |
           set -euo pipefail
-
+          unset NODE_AUTH_TOKEN
+          unset NPM_TOKEN
           npm ci
           npm version --no-git-tag-version "$VERSION"
           npm run build --if-present
 
           if [ "${DRY_RUN}" = "true" ]; then
-            npm publish --dry-run --provenance --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+            npm publish --dry-run --tag "${{ steps.sdkvars.outputs.npm_tag }}"
           else
-            npm publish --provenance --access public --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+            npm publish --access public --tag "${{ steps.sdkvars.outputs.npm_tag }}"
           fi
 
       - name: Tag Go SDK
