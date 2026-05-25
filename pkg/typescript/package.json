@@ -1,0 +1,40 @@
+{
+  "name": "flamedb-typescript-sdk",
+  "version": "0.1.0",
+  "description": "FlameDB TypeScript/Node.js SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^5.4.0"
+  },
+ "repository": {
+    "type": "git",
+    "url": "git+https://github.com/byPixelTV/FlameDB.git"
+  },
+  "keywords": [
+    "database",
+    "sdk",
+    "flamedb",
+    "stats",
+    "metrics",
+    "storage"
+  ],
+  "author": "byPixelTV",
+  "bugs": {
+    "url": "https://github.com/byPixelTV/FlameDB/issues"
+  },
+  "homepage": "https://github.com/byPixelTV/FlameDB#readme"
+}

@@ -14,7 +14,48 @@ import (
 	"github.com/byPixelTV/flamedb/internal/config"
 	"github.com/byPixelTV/flamedb/internal/server"
 	"github.com/byPixelTV/flamedb/internal/storage"
+	"github.com/byPixelTV/flamedb/internal/util"
 )
+
+func printBanner(version string) {
+	const reset = "\x1b[0m"
+
+	lines := []string{
+		" _______  _        _______  _______  _______  ______   ______  ",
+		"(  ____ \\( \\      (  ___  )(       )(  ____ \\(  __  \\ (  ___ \\ ",
+		"| (    \\/| (      | (   ) || () () || (    \\/| (  \\  )| (   ) )",
+		"| (__    | |      | (___) || || || || (__    | |   ) || (__/ / ",
+		"|  __)   | |      |  ___  || |(_)| ||  __)   | |   | ||  __ (  ",
+		"| (      | |      | (   ) || |   | || (      | |   ) || (  \\ \\ ",
+		"| )      | (____/\\| )   ( || )   ( || (____/\\| (__/  )| )___) )",
+		"|/       (_______/|/     \\||/     \\|(_______/(______/ |/ \\___/ ",
+	}
+
+	startR, startG, startB := 255, 120, 120
+	endR, endG, endB := 255, 40, 40
+
+	for i, line := range lines {
+		t := float64(i) / float64(len(lines)-1)
+
+		r := int(float64(startR)*(1-t) + float64(endR)*t)
+		g := int(float64(startG)*(1-t) + float64(endG)*t)
+		b := int(float64(startB)*(1-t) + float64(endB)*t)
+
+		color := fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, b)
+		fmt.Println(color + line + reset)
+	}
+
+	versionColor := "\x1b[38;2;140;140;140m"
+	accentColor := "\x1b[38;2;255;80;80m"
+
+	fmt.Printf(
+		"%s╰─%s v%s%s\n\n",
+		versionColor,
+		accentColor,
+		version,
+		reset,
+	)
+}
 
 func main() {
 	configPath := "config.yaml"
@@ -25,6 +66,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	printBanner(util.CurrentVersion())
 
 	store, err := storage.Open(cfg.Server.DataPath, cfg.Storage.Compression)
 	if err != nil {

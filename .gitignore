@@ -5,3 +5,5 @@
 *.log
 .antigravitycli
 data*
+node_modules
+dist
