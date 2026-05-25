@@ -15,8 +15,8 @@ data class Event(
 
 @Serializable
 data class LeaderboardEntry(
-    @SerialName("entity_id") val entityId: String,
-    val score: Double,
+    @SerialName("EntityID") val entityId: String,
+    @SerialName("Value") val score: Double,
 )
 
 @Serializable
