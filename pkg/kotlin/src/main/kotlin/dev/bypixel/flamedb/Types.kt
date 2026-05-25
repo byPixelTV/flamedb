@@ -102,6 +102,9 @@ data class GetOptions(
 
 enum class SortOrder { ASC, DESC }
 
+/** Aggregate operators supported by GET. */
+enum class Aggregate { SUM, COUNT, AVG }
+
 /** Options for LEADERBOARD / GROUP_LEADERBOARD. */
 data class LeaderboardOptions(
     val limit: Int? = null,

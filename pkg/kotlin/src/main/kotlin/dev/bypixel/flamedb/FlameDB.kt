@@ -207,6 +207,48 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         return json.decodeFromString(resp.toString())
     }
 
+    private fun buildMetricSpec(
+        metrics: Array<out String>,
+        aggregate: Aggregate? = null,
+        groupBy: String? = null,
+    ): String {
+        require(metrics.isNotEmpty()) { "at least one metric is required" }
+        val base = metrics.joinToString(",")
+        val aggPart = aggregate?.let { " $it" } ?: ""
+        val groupPart = groupBy?.let { " GROUP BY $it" } ?: ""
+        return base + aggPart + groupPart
+    }
+
+    /** GET with aggregate (SUM/COUNT/AVG). */
+    suspend fun getAggregate(
+        aggregate: Aggregate,
+        vararg metrics: String,
+        options: GetOptions = GetOptions(),
+    ): GetResult {
+        val metricSpec = buildMetricSpec(metrics, aggregate = aggregate)
+        return get(metricSpec, options = options)
+    }
+
+    /** GET with time buckets (GROUP BY). Aggregate is optional; default is SUM. */
+    suspend fun getSeries(
+        groupBy: String,
+        vararg metrics: String,
+        aggregate: Aggregate? = null,
+        options: GetOptions = GetOptions(),
+    ): GetResult {
+        val metricSpec = buildMetricSpec(metrics, aggregate = aggregate, groupBy = groupBy)
+        return get(metricSpec, options = options)
+    }
+
+    suspend fun getSum(vararg metrics: String, options: GetOptions = GetOptions()): GetResult =
+        getAggregate(Aggregate.SUM, *metrics, options = options)
+
+    suspend fun getCount(vararg metrics: String, options: GetOptions = GetOptions()): GetResult =
+        getAggregate(Aggregate.COUNT, *metrics, options = options)
+
+    suspend fun getAvg(vararg metrics: String, options: GetOptions = GetOptions()): GetResult =
+        getAggregate(Aggregate.AVG, *metrics, options = options)
+
     // ─── Leaderboard ──────────────────────────────────────────────────────────
 
     /**
