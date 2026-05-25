@@ -1,0 +1,415 @@
+name: Build & Release
+
+permissions:
+  contents: write
+  packages: write
+
+on:
+  push:
+    branches:
+      - release
+      - master
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip publishing (npm, tags, releases, docker push)"
+        type: boolean
+        default: false
+
+env:
+  APP_NAME: flamedb
+  REGISTRY: ghcr.io
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+jobs:
+  prepare:
+    runs-on: selfhosted
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      prerelease_tag: ${{ steps.version.outputs.prerelease_tag }}
+      is_release: ${{ steps.version.outputs.is_release }}
+      no_new_commits: ${{ steps.check_commits.outputs.no_new_commits }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all Git tags
+        run: git fetch --tags --force
+
+      - name: Check for new commits since last tag
+        id: check_commits
+        shell: bash
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+
+          if [ -z "$LAST_TAG" ]; then
+            echo "no_last_tag=true" >> $GITHUB_OUTPUT
+          else
+            NEW_COMMITS=$(git log ${LAST_TAG}..HEAD --oneline)
+            if [ -z "$NEW_COMMITS" ]; then
+              echo "no_new_commits=true" >> $GITHUB_OUTPUT
+            else
+              echo "no_new_commits=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Get next version + create tag
+        if: github.ref == 'refs/heads/release'
+        id: tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          release_branches: release
+          tag_prefix: "v"
+          custom_release_rules: |
+            major:major:Breaking Changes
+            minor:minor:Features
+            patch:patch:Bug Fixes or other non-feature changes
+
+      - name: Fetch tags after tagging
+        if: github.ref == 'refs/heads/release'
+        run: git fetch --tags --force
+
+      - name: Compute version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IS_RELEASE=false
+          RELEASE_TAG=""
+          PRERELEASE_TAG="pre-master-${GITHUB_RUN_NUMBER}"
+
+          if [ "${GITHUB_REF}" = "refs/heads/release" ]; then
+            IS_RELEASE=true
+            if [ -n "${{ steps.tag.outputs.new_tag }}" ]; then
+              RELEASE_TAG="${{ steps.tag.outputs.new_tag }}"
+            else
+              RELEASE_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
+            fi
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="v1.0.0"
+          fi
+
+          VERSION="${RELEASE_TAG#v}"
+          if [ "$IS_RELEASE" != "true" ]; then
+            MAJOR="$(echo "$RELEASE_TAG" | cut -d. -f1 | sed 's/^v//')"
+            MINOR="$(echo "$RELEASE_TAG" | cut -d. -f2)"
+            PATCH="$(echo "$RELEASE_TAG" | cut -d. -f3)"
+            NEXT_PATCH=$((PATCH + 1))
+            RUN_NUMBER="${GITHUB_RUN_NUMBER:-local}"
+            ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+            SNAPSHOT_ID="${RUN_NUMBER}"
+            if [ "$ATTEMPT" != "1" ]; then
+              SNAPSHOT_ID="${RUN_NUMBER}.${ATTEMPT}"
+            fi
+            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-SNAPSHOT.${SNAPSHOT_ID}"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "prerelease_tag=$PRERELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          PREV_TAG=${{ steps.check_commits.outputs.last_tag }}
+          CURR_TAG=${{ steps.tag.outputs.new_tag || github.sha }}
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          git log $RANGE --pretty=format:"%H|%s" > /tmp/commits.txt || true
+          echo "Commits found: $(wc -l < /tmp/commits.txt)"
+
+          while IFS="|" read -r COMMIT_HASH MESSAGE || [[ -n "$COMMIT_HASH" ]]; do
+            [[ -z "$COMMIT_HASH" ]] && continue
+
+            AUTHOR_LOGIN=$(gh api repos/${{ github.repository }}/commits/$COMMIT_HASH --jq '.author.login // empty' 2>/dev/null || echo "")
+            AUTHOR_NAME=$(gh api repos/${{ github.repository }}/commits/$COMMIT_HASH --jq '.commit.author.name // empty' 2>/dev/null || echo "")
+
+            if [[ "$AUTHOR_LOGIN" == *"bot"* ]]; then
+              echo "- $MESSAGE ([${COMMIT_HASH:0:7}](https://github.com/${{ github.repository }}/commit/$COMMIT_HASH)) by $AUTHOR_NAME" >> RELEASE_NOTES.md
+            elif [[ -n "$AUTHOR_LOGIN" ]]; then
+              echo "- $MESSAGE ([${COMMIT_HASH:0:7}](https://github.com/${{ github.repository }}/commit/$COMMIT_HASH)) by @$AUTHOR_LOGIN" >> RELEASE_NOTES.md
+            else
+              echo "- $MESSAGE ([${COMMIT_HASH:0:7}](https://github.com/${{ github.repository }}/commit/$COMMIT_HASH)) by $AUTHOR_NAME" >> RELEASE_NOTES.md
+            fi
+          done < /tmp/commits.txt
+
+          echo "" >> RELEASE_NOTES.md
+          echo "- **Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${CURR_TAG}" >> RELEASE_NOTES.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+
+  build:
+    needs: prepare
+    runs-on: selfhosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: windows
+            goarch: amd64
+          - goos: darwin
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          BIN_NAME="${APP_NAME}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BIN_NAME="${APP_NAME}.exe"
+          fi
+
+          BUILD_DIR="dist/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$BUILD_DIR"
+
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X github.com/byPixelTV/flamedb/internal/util.GitCommit=${VERSION}" \
+            -o "${BUILD_DIR}/${BIN_NAME}" ./cmd/flamedb
+
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            (cd "$BUILD_DIR" && zip -r "../${APP_NAME}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.zip" "$BIN_NAME")
+          else
+            tar -C "$BUILD_DIR" -czf "dist/${APP_NAME}-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" "$BIN_NAME"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ env.APP_NAME }}-${{ needs.prepare.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.*
+
+  docker:
+    needs: prepare
+    runs-on: selfhosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set Docker tags
+        id: dockertags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          TAGS="${IMAGE}:${{ needs.prepare.outputs.version }}"
+
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            TAGS="${TAGS}\n${IMAGE}:latest"
+          fi
+
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          printf "tags<<EOF\n%s\nEOF\n" "$TAGS" >> $GITHUB_OUTPUT
+
+      - name: Log in to registry
+        if: env.DRY_RUN != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ env.DRY_RUN != 'true' }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+          tags: ${{ steps.dockertags.outputs.tags }}
+
+  publish_sdks:
+    needs: prepare
+    runs-on: selfhosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all Git tags
+        run: git fetch --tags --force
+
+      - name: Set SDK publish vars
+        id: sdkvars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            echo "npm_tag=latest" >> $GITHUB_OUTPUT
+          else
+            echo "npm_tag=snapshot" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish TypeScript SDK
+        working-directory: pkg/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm version --no-git-tag-version "$VERSION"
+          npm run build
+          if [ "${DRY_RUN}" = "true" ]; then
+            npm publish --dry-run --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+          else
+            npm publish --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+          fi
+
+      - name: Tag Go SDK
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Dry run: skip Go SDK tag"
+            exit 0
+          fi
+
+          TAG="pkg/go/v${VERSION}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag exists: ${TAG}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${TAG}"
+          git push origin "${TAG}"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: 21
+          distribution: temurin
+          cache: gradle
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+        working-directory: pkg/kotlin
+
+      - name: Build Gradle project
+        run: ./gradlew build
+        working-directory: pkg/kotlin
+
+      - name: Publish Kotlin SDK (release)
+        if: github.ref == 'refs/heads/release' && needs.prepare.outputs.no_new_commits != 'true' && env.DRY_RUN != 'true'
+        working-directory: pkg/kotlin
+        run: |
+          echo "bypixelRepoUser=${{ secrets.BYPIXEL_REPO_USER }}" >> gradle.properties
+          echo "bypixelRepoToken=${{ secrets.BYPIXEL_REPO_TOKEN }}" >> gradle.properties
+          ./gradlew :publishMavenPublicationToBypixelReleasesRepository
+        env:
+          bypixelRepoUser: ${{ secrets.BYPIXEL_REPO_USER }}
+          bypixelRepoToken: ${{ secrets.BYPIXEL_REPO_TOKEN }}
+
+      - name: Publish Kotlin SDK (snapshot)
+        if: github.ref == 'refs/heads/master' && env.DRY_RUN != 'true'
+        working-directory: pkg/kotlin
+        run: |
+          echo "bypixelRepoUser=${{ secrets.BYPIXEL_REPO_USER }}" >> gradle.properties
+          echo "bypixelRepoToken=${{ secrets.BYPIXEL_REPO_TOKEN }}" >> gradle.properties
+          ./gradlew :publishMavenPublicationToBypixelSnapshotsRepository
+        env:
+          bypixelRepoUser: ${{ secrets.BYPIXEL_REPO_USER }}
+          bypixelRepoToken: ${{ secrets.BYPIXEL_REPO_TOKEN }}
+
+  release:
+    needs: [prepare, build, publish_sdks]
+    runs-on: selfhosted
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: .
+
+      - name: Set release variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
+            echo "tag=${{ needs.prepare.outputs.release_tag }}" >> $GITHUB_OUTPUT
+            echo "name=Release ${{ needs.prepare.outputs.release_tag }}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ needs.prepare.outputs.prerelease_tag }}" >> $GITHUB_OUTPUT
+            echo "name=Pre-Release (master) #${{ github.run_number }}" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        if: env.DRY_RUN != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ${{ steps.vars.outputs.name }}
+          prerelease: ${{ steps.vars.outputs.prerelease }}
+          body_path: RELEASE_NOTES.md
+          files: dist/**/*
