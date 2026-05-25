@@ -48,7 +48,7 @@ fun getCurrentGitCommit(): String {
     }
 }
 
-fun latestReleaseTagOrDefault(defaultTag: String = "v1.0.0"): String {
+fun latestReleaseTagOrDefault(defaultTag: String = "v0.0.0"): String {
     val releaseTagPattern = Regex("""^v\d+\.\d+\.\d+$""")
     val tags = runGit("tag", "--list", "v[0-9]*.[0-9]*.[0-9]*", "--sort=-v:refname")
         ?.lineSequence()
@@ -87,7 +87,7 @@ fun isFullReleaseBuild(): Boolean {
 }
 
 fun computeVersion(): String {
-    val releaseTag = latestReleaseTagOrDefault("v1.0.0")
+    val releaseTag = latestReleaseTagOrDefault("v0.0.0")
     val (major, minor, patch) = parseReleaseTag(releaseTag) ?: Triple(1, 0, 0)
     val releaseVersion = "$major.$minor.$patch"
 

@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-const defaultReleaseTag = "v1.0.0"
+const defaultReleaseTag = "v0.0.0"
 
 var releaseTagPattern = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)$`)
 
@@ -42,7 +42,7 @@ func computeVersion() (string, bool) {
 
 	major, minor, patch, ok := parseReleaseTag(releaseTag)
 	if !ok {
-		major, minor, patch = 1, 0, 0
+		major, minor, patch = 0, 0, 0
 	}
 
 	releaseVersion := fmt.Sprintf("%d.%d.%d", major, minor, patch)
