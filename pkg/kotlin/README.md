@@ -9,7 +9,7 @@ callbacks.
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("net.eramc:flamedb-kotlin-sdk:0.1.0")
+    implementation("dev.bypixel:flamedb-kotlin-sdk:0.1.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
 }
 ```
@@ -17,7 +17,7 @@ dependencies {
 ## Usage
 
 ```kotlin
-import net.eramc.flamedb.*
+import dev.bypixel.flamedb.*
 import kotlinx.coroutines.*
 
 fun main() = runBlocking {

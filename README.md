@@ -126,7 +126,7 @@ Use `config2.yml`, `config3.yml`, `config4.yml` as templates. Set each node's:
 
 - Go: `go get github.com/byPixelTV/flamedb/pkg/go`
 - TypeScript: `npm install flamedb-typescript-sdk`
-- Kotlin: `implementation("net.eramc:flamedb-kotlin-sdk:<version>")`
+- Kotlin: `implementation("dev.bypixelc:flamedb-kotlin-sdk:<version>")`
 
 ## Protocol (tiny example)
 
