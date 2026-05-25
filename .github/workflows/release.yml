@@ -378,7 +378,7 @@ jobs:
         working-directory: pkg/kotlin
 
       - name: Publish Kotlin SDK (release)
-        if: github.ref == 'refs/heads/release' && needs.prepare.outputs.no_new_commits != 'true' && env.DRY_RUN != 'true'
+        if: github.ref == 'refs/heads/release' && env.DRY_RUN != 'true'
         working-directory: pkg/kotlin
         run: |
           echo "bypixelRepoUser=${{ secrets.BYPIXEL_REPO_USER }}" >> gradle.properties
