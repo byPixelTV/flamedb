@@ -298,6 +298,13 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
+      - name: Use npm 11.5.1+
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g npm@11.5.1
+          npm --version
+
       - name: Publish TypeScript SDK
         working-directory: pkg/typescript
         env:
