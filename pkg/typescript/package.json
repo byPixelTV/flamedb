@@ -22,7 +22,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/byPixelTV/FlameDB.git",
+    "url": "https://github.com/byPixelTV/flamedb",
     "directory": "pkg/typescript"
   },
   "keywords": [
@@ -35,7 +35,7 @@
   ],
   "author": "byPixelTV",
   "bugs": {
-    "url": "https://github.com/byPixelTV/FlameDB/issues"
+    "url": "https://github.com/byPixelTV/flamedb/issues"
   },
-  "homepage": "https://github.com/byPixelTV/FlameDB#readme"
+  "homepage": "https://github.com/byPixelTV/flamedb#readme"
 }
