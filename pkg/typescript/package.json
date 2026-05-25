@@ -1,5 +1,5 @@
 {
-  "name": "flamedb-typescript-sdk",
+  "name": "@bypixeltv/flamedb-typescript-sdk",
   "version": "0.1.0",
   "description": "FlameDB TypeScript/Node.js SDK",
   "main": "dist/index.js",
