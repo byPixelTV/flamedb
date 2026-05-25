@@ -241,9 +241,9 @@ jobs:
           TAGS="${IMAGE}:${{ needs.prepare.outputs.version }}"
 
           if [ "${{ needs.prepare.outputs.is_release }}" = "true" ]; then
-            TAGS="${TAGS}\n${IMAGE}:latest"
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest"
           elif [ "${GITHUB_REF}" = "refs/heads/master" ]; then
-            TAGS="${TAGS}\n${IMAGE}:dev"
+            TAGS="${TAGS}"$'\n'"${IMAGE}:dev"
           fi
 
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
