@@ -96,7 +96,7 @@ fun computeVersion(): String {
     }
 
     val nextPatchVersion = "$major.$minor.${patch + 1}"
-    return "$nextPatchVersion-SNAPSHOT.${snapshotBuildId()}"
+    return "$nextPatchVersion-dev.${snapshotBuildId()}"
 }
 
 group = "dev.bypixel"

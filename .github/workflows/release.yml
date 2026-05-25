@@ -115,7 +115,7 @@ jobs:
             if [ "$ATTEMPT" != "1" ]; then
               SNAPSHOT_ID="${RUN_NUMBER}.${ATTEMPT}"
             fi
-            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-SNAPSHOT.${SNAPSHOT_ID}"
+            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-dev.${SNAPSHOT_ID}"
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -312,13 +312,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           npm ci
           npm version --no-git-tag-version "$VERSION"
           npm run build
+
           if [ "${DRY_RUN}" = "true" ]; then
-            npm publish --dry-run --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+            npm publish --dry-run --provenance --tag "${{ steps.sdkvars.outputs.npm_tag }}"
           else
-            npm publish --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+            npm publish --provenance --tag "${{ steps.sdkvars.outputs.npm_tag }}"
           fi
 
       - name: Tag Go SDK

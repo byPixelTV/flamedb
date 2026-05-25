@@ -51,7 +51,7 @@ func computeVersion() (string, bool) {
 	}
 
 	nextPatchVersion := fmt.Sprintf("%d.%d.%d", major, minor, patch+1)
-	return fmt.Sprintf("%s-SNAPSHOT.%s", nextPatchVersion, snapshotBuildID()), true
+	return fmt.Sprintf("%s-dev.%s", nextPatchVersion, snapshotBuildID()), true
 }
 
 func latestReleaseTag() (string, bool) {
