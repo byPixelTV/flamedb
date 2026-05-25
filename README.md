@@ -8,13 +8,13 @@
     <img src="https://github.com/byPixelTV/flamedb/actions/workflows/release.yml/badge.svg" alt="build" />
   </a>
   <a href="https://github.com/byPixelTV/flamedb/releases">
-    <img src="https://img.shields.io/github/v/release/byPixelTV/flamedb?display_name=tag&style=for-the-badge" alt="release" />
+    <img src="https://img.shields.io/github/v/release/byPixelTV/flamedb?display_name=tag" alt="release" />
   </a>
   <a href="https://pkg.go.dev/github.com/byPixelTV/flamedb/pkg/go">
     <img src="https://pkg.go.dev/badge/github.com/byPixelTV/flamedb/pkg/go.svg" alt="go reference" />
   </a>
   <a href="https://www.npmjs.com/package/flamedb-typescript-sdk">
-    <img src="https://img.shields.io/npm/v/flamedb-typescript-sdk?style=for-the-badge" alt="npm" />
+    <img src="https://img.shields.io/npm/v/flamedb-typescript-sdk" alt="npm" />
   </a>
 </div>
 
