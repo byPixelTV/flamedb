@@ -260,6 +260,8 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             append("LEADERBOARD $metric")
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
+            options.from?.let { append(" FROM $it") }
+            options.to?.let { append(" TO $it") }
         }
         val resp = command(cmd)
         val raw = resp["leaderboard"]?.toString() ?: return emptyList()
@@ -275,8 +277,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     suspend fun groupLeaderboard(
         metric: String,
         groups: List<GroupDef>,
-        from: LocalDate? = null,
-        to: LocalDate? = null,
         options: LeaderboardOptions = LeaderboardOptions(),
     ): List<GroupLeaderboardEntry> {
         val cmd = buildString {
@@ -286,8 +286,8 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             }
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
-            from?.let { append(" FROM $it") }
-            to?.let { append(" TO $it") }
+            options.from?.let { append(" FROM $it") }
+            options.to?.let { append(" TO $it") }
         }
         val resp = command(cmd)
         val raw = resp["leaderboard"]?.toString() ?: return emptyList()
