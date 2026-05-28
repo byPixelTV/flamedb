@@ -292,80 +292,80 @@ jobs:
             echo "npm_tag=snapshot" >> $GITHUB_OUTPUT
           fi
 
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-          package-manager-cache: false
+      # - name: Set up Node
+      #   uses: actions/setup-node@v6
+      #   with:
+      #     node-version: "24"
+      #     registry-url: "https://registry.npmjs.org"
+      #     package-manager-cache: false
 
-      - name: Use latest npm
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm install -g npm@latest
-          npm --version
+      # - name: Use latest npm
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     npm install -g npm@latest
+      #     npm --version
 
-      - name: Prepare npm config
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "${RUNNER_TEMP}/npmrc" <<'EOF'
-          registry=https://registry.npmjs.org/
-          always-auth=false
-          EOF
+      # - name: Prepare npm config
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     cat > "${RUNNER_TEMP}/npmrc" <<'EOF'
+      #     registry=https://registry.npmjs.org/
+      #     always-auth=false
+      #     EOF
 
-      - name: Publish TypeScript SDK
-        working-directory: pkg/typescript
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc
-        shell: bash
-        run: |
-          set -euo pipefail
-          unset NODE_AUTH_TOKEN
-          unset NPM_TOKEN
-          npm ci
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          PUBLISHED_VERSION=$(npm view . version || echo "")
-          if [ "$PKG_VERSION" = "$PUBLISHED_VERSION" ]; then
-            echo "Version $PKG_VERSION is already published. Bumping patch version..."
-            NEXT_VERSION=$(node -e "const v=process.env.PKG_VERSION.split('.').map(Number);v[2]++;console.log(v.join('.'))")
-            npm version --no-git-tag-version "$NEXT_VERSION"
-            VERSION="$NEXT_VERSION"
-          elif [ "$PKG_VERSION" != "$VERSION" ]; then
-            npm version --no-git-tag-version "$VERSION"
-          fi
-          npm run build --if-present
+      # - name: Publish TypeScript SDK
+      #   working-directory: pkg/typescript
+      #   env:
+      #     VERSION: ${{ needs.prepare.outputs.version }}
+      #     NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc
+      #   shell: bash
+      #   run: |
+      #     set -euo pipefail
+      #     unset NODE_AUTH_TOKEN
+      #     unset NPM_TOKEN
+      #     npm ci
+      #     PKG_VERSION=$(node -p "require('./package.json').version")
+      #     PUBLISHED_VERSION=$(npm view . version || echo "")
+      #     if [ "$PKG_VERSION" = "$PUBLISHED_VERSION" ]; then
+      #       echo "Version $PKG_VERSION is already published. Bumping patch version..."
+      #       NEXT_VERSION=$(node -e "const v=process.env.PKG_VERSION.split('.').map(Number);v[2]++;console.log(v.join('.'))")
+      #       npm version --no-git-tag-version "$NEXT_VERSION"
+      #       VERSION="$NEXT_VERSION"
+      #     elif [ "$PKG_VERSION" != "$VERSION" ]; then
+      #       npm version --no-git-tag-version "$VERSION"
+      #     fi
+      #     npm run build --if-present
 
-          if [ "${DRY_RUN}" = "true" ]; then
-            npm publish --dry-run --tag "${{ steps.sdkvars.outputs.npm_tag }}"
-          else
-            npm publish --access public --tag "${{ steps.sdkvars.outputs.npm_tag }}"
-          fi
+      #     if [ "${DRY_RUN}" = "true" ]; then
+      #       npm publish --dry-run --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+      #     else
+      #       npm publish --access public --tag "${{ steps.sdkvars.outputs.npm_tag }}"
+      #     fi
 
-      - name: Tag Go SDK
-        shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
+      # - name: Tag Go SDK
+      #   shell: bash
+      #   env:
+      #     VERSION: ${{ needs.prepare.outputs.version }}
+      #   run: |
+      #     set -euo pipefail
 
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "Dry run: skip Go SDK tag"
-            exit 0
-          fi
+      #     if [ "${DRY_RUN}" = "true" ]; then
+      #       echo "Dry run: skip Go SDK tag"
+      #       exit 0
+      #     fi
 
-          TAG="pkg/go/v${VERSION}"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "Tag exists: ${TAG}"
-            exit 0
-          fi
+      #     TAG="pkg/go/v${VERSION}"
+      #     if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+      #       echo "Tag exists: ${TAG}"
+      #       exit 0
+      #     fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${TAG}"
-          git push origin "${TAG}"
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git tag "${TAG}"
+      #     git push origin "${TAG}"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v5

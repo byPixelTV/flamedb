@@ -42,6 +42,71 @@ func Parse(input string) (*Query, error) {
 		return q, nil
 	case "GROUP_LEADERBOARD":
 		q.Type = QueryTypeGroupLeaderboard
+		if len(tokens) < 2 {
+			return nil, fmt.Errorf("missing metric")
+		}
+		q.Metric = tokens[1]
+		i := 2
+		for i < len(tokens) {
+			switch strings.ToUpper(tokens[i]) {
+			case "GROUP":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing GROUP spec")
+				}
+				spec := strings.Trim(tokens[i+1], `"`)
+				q.GroupBySpec = spec // oder ggf. eine Liste, falls mehrere GROUPs erlaubt sind
+				i += 2
+			case "FROM":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing FROM value")
+				}
+				ts, err := parseTimeValue(tokens[i+1])
+				if err != nil {
+					return nil, err
+				}
+				q.From = ts
+				i += 2
+			case "TO":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing TO value")
+				}
+				ts, err := parseTimeValue(tokens[i+1])
+				if err != nil {
+					return nil, err
+				}
+				q.To = ts
+				i += 2
+			case "LIMIT":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing LIMIT value")
+				}
+				n, err := strconv.Atoi(tokens[i+1])
+				if err != nil {
+					return nil, fmt.Errorf("invalid LIMIT: %s", tokens[i+1])
+				}
+				q.Limit = n
+				i += 2
+			case "OFFSET":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing OFFSET value")
+				}
+				n, err := strconv.Atoi(tokens[i+1])
+				if err != nil {
+					return nil, fmt.Errorf("invalid OFFSET: %s", tokens[i+1])
+				}
+				q.Offset = n
+				i += 2
+			case "ORDER":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing ORDER value")
+				}
+				q.Order = strings.ToUpper(tokens[i+1])
+				i += 2
+			default:
+				return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
+			}
+		}
+		return q, nil
 	case "WRITE":
 		q.Type = QueryTypeWrite
 		if len(tokens) < 3 {

@@ -109,6 +109,10 @@ enum class Aggregate { SUM, COUNT, AVG }
 data class LeaderboardOptions(
     val limit: Int? = null,
     val offset: Int? = null,
+    /** Inclusive start date (YYYY-MM-DD). */
+    val from: String? = null,
+    /** Inclusive end date (YYYY-MM-DD). */
+    val to: String? = null,
 )
 
 /** A group definition for GROUP_LEADERBOARD. */
