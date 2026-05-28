@@ -47,6 +47,7 @@ func Parse(input string) (*Query, error) {
 		}
 		q.Metric = tokens[1]
 		i := 2
+		var groups []GroupDef
 		for i < len(tokens) {
 			switch strings.ToUpper(tokens[i]) {
 			case "GROUP":
@@ -54,7 +55,11 @@ func Parse(input string) (*Query, error) {
 					return nil, fmt.Errorf("missing GROUP spec")
 				}
 				spec := strings.Trim(tokens[i+1], `"`)
-				q.GroupBySpec = spec // oder ggf. eine Liste, falls mehrere GROUPs erlaubt sind
+				name, members, err := parseGroupSpec(spec)
+				if err != nil {
+					return nil, err
+				}
+				groups = append(groups, GroupDef{Name: name, Members: members})
 				i += 2
 			case "FROM":
 				if i+1 >= len(tokens) {
@@ -106,6 +111,7 @@ func Parse(input string) (*Query, error) {
 				return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
 			}
 		}
+		q.Groups = groups
 		return q, nil
 	case "WRITE":
 		q.Type = QueryTypeWrite
