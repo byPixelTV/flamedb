@@ -11,16 +11,12 @@ on:
       - release
       - master
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Skip publishing (npm, tags, releases, docker push)"
-        type: boolean
-        default: false
+    {}
 
 env:
   APP_NAME: flamedb
   REGISTRY: ghcr.io
-  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+  DRY_RUN: false
 
 jobs:
   prepare:
