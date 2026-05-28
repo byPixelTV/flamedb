@@ -21,8 +21,8 @@ data class LeaderboardEntry(
 
 @Serializable
 data class GroupLeaderboardEntry(
-    val group: String,
-    val score: Double,
+    @SerialName("EntityID") val group: String,
+    @SerialName("Value") val score: Double,
 )
 
 @Serializable
