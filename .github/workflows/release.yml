@@ -327,7 +327,13 @@ jobs:
           unset NPM_TOKEN
           npm ci
           PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$PKG_VERSION" != "$VERSION" ]; then
+          PUBLISHED_VERSION=$(npm view . version || echo "")
+          if [ "$PKG_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "Version $PKG_VERSION is already published. Bumping patch version..."
+            NEXT_VERSION=$(node -e "const v=process.env.PKG_VERSION.split('.').map(Number);v[2]++;console.log(v.join('.'))")
+            npm version --no-git-tag-version "$NEXT_VERSION"
+            VERSION="$NEXT_VERSION"
+          elif [ "$PKG_VERSION" != "$VERSION" ]; then
             npm version --no-git-tag-version "$VERSION"
           fi
           npm run build --if-present
