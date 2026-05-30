@@ -6,6 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.BufferedReader
@@ -20,28 +21,6 @@ import java.time.LocalDate
  * All public methods are `suspend` functions safe to call from any coroutine.
  * I/O is dispatched to [Dispatchers.IO]; the internal mutex serializes
  * concurrent callers over the single TCP connection.
- *
- * ```kotlin
- * val db = FlameDB.connect(FlameDBConfig(host = "127.0.0.1", port = 7777, apiKey = "flame_abc123"))
- *
- * // Write — lb= updates the all-time index, player= tag enables windowed queries
- * db.write("kills", 5.0, WriteOptions(leaderboardEntity = "pixel", tags = mapOf("player" to "pixel")))
- *
- * // All-time leaderboard (instant, pre-aggregated)
- * val allTime = db.leaderboard("kills", LeaderboardOptions(limit = 10))
- *
- * // Weekly leaderboard (on-the-fly from raw events)
- * val weekly = db.leaderboard("kills", LeaderboardOptions(from = "now-7d", entityTag = "player", limit = 10))
- *
- * // Group leaderboard with time window
- * val teams = db.groupLeaderboard(
- *     "kills",
- *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
- *     LeaderboardOptions(from = "now-7d", entityTag = "player"),
- * )
- *
- * db.close()
- * ```
  */
 class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseable {
 
@@ -130,17 +109,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     /**
      * Sends a WRITE command.
-     *
-     * To make an entity eligible for windowed leaderboards, pass the entity ID
-     * both as [WriteOptions.leaderboardEntity] (updates all-time index) **and**
-     * as a tag (enables time-range queries):
-     *
-     * ```kotlin
-     * db.write("kills", 5.0, WriteOptions(
-     *     leaderboardEntity = "pixel",
-     *     tags = mapOf("player" to "pixel", "region" to "eu"),
-     * ))
-     * ```
      */
     suspend fun write(metric: String, value: Double, options: WriteOptions = WriteOptions()) {
         command(buildWrite(metric, value, options))
@@ -156,7 +124,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             add("END")
         }
         val resp = command(lines)
-        return json.decodeFromString(resp.toString())
+        return json.decodeFromJsonElement(resp)
     }
 
     private fun buildWrite(metric: String, value: Double, opts: WriteOptions): String =
@@ -206,9 +174,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     /**
      * Sends a GET command and returns the raw events (or aggregated result).
-     *
-     * @param metrics One or more metric names. Multiple metrics are fetched
-     *   in a single request and returned under [GetResult.metrics].
      */
     suspend fun get(vararg metrics: String, options: GetOptions = GetOptions()): GetResult {
         val cmd = buildString {
@@ -225,7 +190,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             options.order?.let { append(" ORDER $it") }
         }
         val resp = command(cmd)
-        return json.decodeFromString(resp.toString())
+        return json.decodeFromJsonElement(resp)
     }
 
     private fun buildMetricSpec(
@@ -274,22 +239,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     /**
      * Sends a LEADERBOARD command.
-     *
-     * **All-time** (pre-aggregated, instant — no [LeaderboardOptions.entityTag] needed):
-     * ```kotlin
-     * db.leaderboard("kills", LeaderboardOptions(limit = 10))
-     * ```
-     *
-     * **Time-windowed** (on-the-fly from raw events — [LeaderboardOptions.entityTag] required):
-     * ```kotlin
-     * db.leaderboard("kills", LeaderboardOptions(
-     *     from = "now-7d",
-     *     entityTag = "player",
-     *     limit = 10,
-     * ))
-     * ```
-     *
-     * @throws FlameDBException if [from] or [to] is set but [entityTag] is null.
      */
     suspend fun leaderboard(
         metric: String,
@@ -306,40 +255,19 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             append("LEADERBOARD $metric")
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
-            // ENTITY muss vor LIMIT/OFFSET stehen (Parser-Reihenfolge ist flexibel,
-            // aber konsistente Reihenfolge ist leichter zu lesen)
             if (windowed) options.entityTag?.let { append(" ENTITY $it") }
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
         }
         val resp = command(cmd)
-        val raw = resp["leaderboard"]?.toString() ?: return emptyList()
-        return json.decodeFromString(raw)
+        val rawElement = resp["leaderboard"] ?: return emptyList()
+        return json.decodeFromJsonElement(rawElement)
     }
 
     // ─── Group Leaderboard ────────────────────────────────────────────────────
 
     /**
      * Sends a GROUP_LEADERBOARD command for ad-hoc team/group ranking.
-     *
-     * **All-time:**
-     * ```kotlin
-     * db.groupLeaderboard(
-     *     "kills",
-     *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
-     * )
-     * ```
-     *
-     * **Time-windowed** ([LeaderboardOptions.entityTag] required):
-     * ```kotlin
-     * db.groupLeaderboard(
-     *     "kills",
-     *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
-     *     LeaderboardOptions(from = "now-7d", entityTag = "player"),
-     * )
-     * ```
-     *
-     * @throws FlameDBException if [from] or [to] is set but [entityTag] is null.
      */
     suspend fun groupLeaderboard(
         metric: String,
@@ -365,21 +293,19 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             options.offset?.let { append(" OFFSET $it") }
         }
         val resp = command(cmd)
-        val raw = resp["leaderboard"]?.toString() ?: return emptyList()
-        return json.decodeFromString(raw)
+        val rawElement = resp["leaderboard"] ?: return emptyList()
+        return json.decodeFromJsonElement(rawElement)
     }
 
     // ─── Stats ────────────────────────────────────────────────────────────────
 
     /**
      * Sends a STATS command.
-     * Returns cardinality information for [tags] on [metric], useful for
-     * understanding index selection and query performance.
      */
     suspend fun stats(metric: String, vararg tags: String): StatsResult {
         val cmd = "STATS $metric TAGS ${tags.joinToString(" ")}"
         val resp = command(cmd)
-        return json.decodeFromString(resp.toString())
+        return json.decodeFromJsonElement(resp)
     }
 }
 
@@ -387,11 +313,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
 /**
  * Configuration for a [FlameDB] client.
- *
- * @property host FlameDB server host.
- * @property port FlameDB server port (default: 7777).
- * @property apiKey API key for authentication.
- * @property timeoutMs Socket read/write timeout in milliseconds (default: 5000).
  */
 data class FlameDBConfig(
     val host: String,
