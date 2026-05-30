@@ -11,6 +11,7 @@ import (
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
+	"github.com/byPixelTV/flamedb/internal/types"
 	"github.com/cockroachdb/pebble"
 )
 
@@ -130,38 +131,95 @@ func (e *Executor) ExecuteBatch(queries []*Query) (*BatchResult, error) {
 
 func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 	if len(q.Groups) == 0 {
-		return &Result{Leaderboard: []aggregates.LeaderboardEntry{}}, nil
+		return &Result{Leaderboard: []types.LeaderboardEntry{}}, nil
 	}
 
-	entries := make([]aggregates.LeaderboardEntry, 0, len(q.Groups))
+	// Windowed query: FROM oder TO gesetzt → Entity-Summen aus dem Index
+	if q.From != 0 || q.To != 0 {
+		entityTag := q.EntityTag
+		if entityTag == "" {
+			return nil, fmt.Errorf("GROUP_LEADERBOARD mit FROM/TO erfordert ENTITY <tag-key>")
+		}
+		to := q.To
+		if to == 0 {
+			to = math.MaxInt64
+		}
+
+		// Alle Member-IDs aus allen Gruppen sammeln (dedupliziert)
+		allMembers := make([]string, 0)
+		seen := make(map[string]struct{})
+		for _, g := range q.Groups {
+			for _, m := range g.Members {
+				if _, ok := seen[m]; !ok {
+					seen[m] = struct{}{}
+					allMembers = append(allMembers, m)
+				}
+			}
+		}
+
+		// Einzelne gezielte Index-Scans pro Member (effizient: kennen die IDs)
+		memberSums, err := e.store.WindowedEntitySums(q.Metric, entityTag, allMembers, q.From, to)
+		if err != nil {
+			return nil, err
+		}
+
+		entries := make([]types.LeaderboardEntry, 0, len(q.Groups))
+		for _, g := range q.Groups {
+			var sum float64
+			for _, member := range g.Members {
+				sum += memberSums[member]
+			}
+			entries = append(entries, types.LeaderboardEntry{
+				EntityID: g.Name,
+				Value:    sum,
+			})
+		}
+
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].Value != entries[j].Value {
+				return entries[i].Value > entries[j].Value
+			}
+			return entries[i].EntityID < entries[j].EntityID
+		})
+
+		if q.Offset >= len(entries) {
+			return &Result{Leaderboard: []types.LeaderboardEntry{}}, nil
+		}
+		entries = entries[q.Offset:]
+		if q.Limit > 0 && len(entries) > q.Limit {
+			entries = entries[:q.Limit]
+		}
+		return &Result{Leaderboard: entries}, nil
+	}
+
+	// All-time query: pre-aggregierter Index
+	entries := make([]types.LeaderboardEntry, 0, len(q.Groups))
 	for _, g := range q.Groups {
 		var sum float64
 		for _, member := range g.Members {
 			v, _ := e.lb.Get(q.Metric, member)
 			sum += v
 		}
-		entries = append(entries, aggregates.LeaderboardEntry{
+		entries = append(entries, types.LeaderboardEntry{
 			EntityID: g.Name,
 			Value:    sum,
 		})
 	}
 
 	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].Value == entries[j].Value {
-			return entries[i].EntityID < entries[j].EntityID
+		if entries[i].Value != entries[j].Value {
+			return entries[i].Value > entries[j].Value
 		}
-		return entries[i].Value > entries[j].Value
+		return entries[i].EntityID < entries[j].EntityID
 	})
 
-	// pagination
 	if q.Offset >= len(entries) {
-		return &Result{Leaderboard: []aggregates.LeaderboardEntry{}}, nil
+		return &Result{Leaderboard: []types.LeaderboardEntry{}}, nil
 	}
 	entries = entries[q.Offset:]
 	if q.Limit > 0 && len(entries) > q.Limit {
 		entries = entries[:q.Limit]
 	}
-
 	return &Result{Leaderboard: entries}, nil
 }
 
@@ -255,7 +313,24 @@ func (e *Executor) executeWrite(q *Query) (*Result, error) {
 }
 
 func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
-	// cache check
+	// Windowed query: FROM oder TO gesetzt → on-the-fly aus dem Sekundärindex
+	if q.From != 0 || q.To != 0 {
+		entityTag := q.EntityTag
+		if entityTag == "" {
+			return nil, fmt.Errorf("LEADERBOARD mit FROM/TO erfordert ENTITY <tag-key>")
+		}
+		to := q.To
+		if to == 0 {
+			to = math.MaxInt64
+		}
+		entries, err := e.store.WindowedLeaderboard(q.Metric, entityTag, q.From, to, q.Limit, q.Offset)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Leaderboard: entries}, nil
+	}
+
+	// All-time query: pre-aggregierter Index → cache
 	if cached, ok := e.cache.Get(q.Metric, q.Limit, q.Offset); ok {
 		return &Result{Leaderboard: cached}, nil
 	}
@@ -264,10 +339,11 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if entries == nil {
+		entries = []types.LeaderboardEntry{}
+	}
 
-	// in cache schreiben
 	e.cache.Set(q.Metric, q.Limit, q.Offset, entries)
-
 	return &Result{Leaderboard: entries}, nil
 }
 

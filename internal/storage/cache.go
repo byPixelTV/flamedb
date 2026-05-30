@@ -5,18 +5,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/byPixelTV/flamedb/internal/aggregates"
+	"github.com/byPixelTV/flamedb/internal/types"
 )
 
 type cacheEntry struct {
-	entries   []aggregates.LeaderboardEntry
+	entries   []types.LeaderboardEntry
 	expiresAt time.Time
 }
 
+// LeaderboardCache ist ein TTL-basierter In-Memory Cache für all-time
+// Leaderboard-Abfragen. Windowed Queries (FROM/TO) werden nicht gecacht.
 type LeaderboardCache struct {
-	mu  sync.RWMutex
-	ttl time.Duration
-	// key: "metric:limit:offset"
+	mu      sync.RWMutex
+	ttl     time.Duration
 	entries map[string]*cacheEntry
 }
 
@@ -33,7 +34,7 @@ func cacheKey(metric string, limit, offset int) string {
 	return fmt.Sprintf("%s:%d:%d", metric, limit, offset)
 }
 
-func (c *LeaderboardCache) Get(metric string, limit, offset int) ([]aggregates.LeaderboardEntry, bool) {
+func (c *LeaderboardCache) Get(metric string, limit, offset int) ([]types.LeaderboardEntry, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -44,7 +45,7 @@ func (c *LeaderboardCache) Get(metric string, limit, offset int) ([]aggregates.L
 	return entry.entries, true
 }
 
-func (c *LeaderboardCache) Set(metric string, limit, offset int, entries []aggregates.LeaderboardEntry) {
+func (c *LeaderboardCache) Set(metric string, limit, offset int, entries []types.LeaderboardEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

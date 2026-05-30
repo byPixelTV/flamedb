@@ -23,8 +23,23 @@ import java.time.LocalDate
  *
  * ```kotlin
  * val db = FlameDB.connect(FlameDBConfig(host = "127.0.0.1", port = 7777, apiKey = "flame_abc123"))
- * db.write("kills", 1.0, WriteOptions(leaderboardEntity = "pixel", tags = mapOf("region" to "eu")))
- * val top = db.leaderboard("kills", LeaderboardOptions(limit = 10))
+ *
+ * // Write — lb= updates the all-time index, player= tag enables windowed queries
+ * db.write("kills", 5.0, WriteOptions(leaderboardEntity = "pixel", tags = mapOf("player" to "pixel")))
+ *
+ * // All-time leaderboard (instant, pre-aggregated)
+ * val allTime = db.leaderboard("kills", LeaderboardOptions(limit = 10))
+ *
+ * // Weekly leaderboard (on-the-fly from raw events)
+ * val weekly = db.leaderboard("kills", LeaderboardOptions(from = "now-7d", entityTag = "player", limit = 10))
+ *
+ * // Group leaderboard with time window
+ * val teams = db.groupLeaderboard(
+ *     "kills",
+ *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
+ *     LeaderboardOptions(from = "now-7d", entityTag = "player"),
+ * )
+ *
  * db.close()
  * ```
  */
@@ -116,9 +131,16 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     /**
      * Sends a WRITE command.
      *
-     * @param metric Name of the metric, e.g. `"kills"`.
-     * @param value  Numeric value to record.
-     * @param options Optional write configuration.
+     * To make an entity eligible for windowed leaderboards, pass the entity ID
+     * both as [WriteOptions.leaderboardEntity] (updates all-time index) **and**
+     * as a tag (enables time-range queries):
+     *
+     * ```kotlin
+     * db.write("kills", 5.0, WriteOptions(
+     *     leaderboardEntity = "pixel",
+     *     tags = mapOf("player" to "pixel", "region" to "eu"),
+     * ))
+     * ```
      */
     suspend fun write(metric: String, value: Double, options: WriteOptions = WriteOptions()) {
         command(buildWrite(metric, value, options))
@@ -137,15 +159,14 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         return json.decodeFromString(resp.toString())
     }
 
-    private fun buildWrite(metric: String, value: Double, opts: WriteOptions): String {
-        return buildString {
+    private fun buildWrite(metric: String, value: Double, opts: WriteOptions): String =
+        buildString {
             append("WRITE $metric $value")
             opts.leaderboardEntity?.let { append(""" lb="$it"""") }
             opts.tags.forEach { (k, v) -> append(""" $k="$v"""") }
             opts.timestampNs?.let { append(" ts=$it") }
             if (opts.quorum) append(" QUORUM")
         }
-    }
 
     // ─── Set ──────────────────────────────────────────────────────────────────
 
@@ -253,15 +274,43 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     /**
      * Sends a LEADERBOARD command.
-     * Returns entries sorted by descending score.
+     *
+     * **All-time** (pre-aggregated, instant — no [LeaderboardOptions.entityTag] needed):
+     * ```kotlin
+     * db.leaderboard("kills", LeaderboardOptions(limit = 10))
+     * ```
+     *
+     * **Time-windowed** (on-the-fly from raw events — [LeaderboardOptions.entityTag] required):
+     * ```kotlin
+     * db.leaderboard("kills", LeaderboardOptions(
+     *     from = "now-7d",
+     *     entityTag = "player",
+     *     limit = 10,
+     * ))
+     * ```
+     *
+     * @throws FlameDBException if [from] or [to] is set but [entityTag] is null.
      */
-    suspend fun leaderboard(metric: String, options: LeaderboardOptions = LeaderboardOptions()): List<LeaderboardEntry> {
+    suspend fun leaderboard(
+        metric: String,
+        options: LeaderboardOptions = LeaderboardOptions(),
+    ): List<LeaderboardEntry> {
+        val windowed = options.from != null || options.to != null
+        if (windowed && options.entityTag == null) {
+            throw FlameDBException(
+                "LeaderboardOptions.entityTag is required when from or to is set"
+            )
+        }
+
         val cmd = buildString {
             append("LEADERBOARD $metric")
-            options.limit?.let { append(" LIMIT $it") }
-            options.offset?.let { append(" OFFSET $it") }
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
+            // ENTITY muss vor LIMIT/OFFSET stehen (Parser-Reihenfolge ist flexibel,
+            // aber konsistente Reihenfolge ist leichter zu lesen)
+            if (windowed) options.entityTag?.let { append(" ENTITY $it") }
+            options.limit?.let { append(" LIMIT $it") }
+            options.offset?.let { append(" OFFSET $it") }
         }
         val resp = command(cmd)
         val raw = resp["leaderboard"]?.toString() ?: return emptyList()
@@ -272,22 +321,48 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     /**
      * Sends a GROUP_LEADERBOARD command for ad-hoc team/group ranking.
-     * Groups are defined per-query; no server-side pre-configuration needed.
+     *
+     * **All-time:**
+     * ```kotlin
+     * db.groupLeaderboard(
+     *     "kills",
+     *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
+     * )
+     * ```
+     *
+     * **Time-windowed** ([LeaderboardOptions.entityTag] required):
+     * ```kotlin
+     * db.groupLeaderboard(
+     *     "kills",
+     *     listOf(GroupDef("red", listOf("pixel", "notch")), GroupDef("blue", listOf("dream"))),
+     *     LeaderboardOptions(from = "now-7d", entityTag = "player"),
+     * )
+     * ```
+     *
+     * @throws FlameDBException if [from] or [to] is set but [entityTag] is null.
      */
     suspend fun groupLeaderboard(
         metric: String,
         groups: List<GroupDef>,
         options: LeaderboardOptions = LeaderboardOptions(),
     ): List<GroupLeaderboardEntry> {
+        val windowed = options.from != null || options.to != null
+        if (windowed && options.entityTag == null) {
+            throw FlameDBException(
+                "LeaderboardOptions.entityTag is required when from or to is set"
+            )
+        }
+
         val cmd = buildString {
             append("GROUP_LEADERBOARD $metric")
+            options.from?.let { append(" FROM $it") }
+            options.to?.let { append(" TO $it") }
+            if (windowed) options.entityTag?.let { append(" ENTITY $it") }
             groups.forEach { g ->
                 append(""" GROUP "${g.name}:${g.members.joinToString(",")}"""")
             }
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
-            options.from?.let { append(" FROM $it") }
-            options.to?.let { append(" TO $it") }
         }
         val resp = command(cmd)
         val raw = resp["leaderboard"]?.toString() ?: return emptyList()

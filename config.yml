@@ -1,7 +1,7 @@
 auth:
   keys:
     - name: "eramc"
-      key: "flame_abc123"
+      key: "test"
       permissions: ["read", "write"]
 
 storage:

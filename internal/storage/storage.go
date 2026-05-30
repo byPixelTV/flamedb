@@ -170,20 +170,28 @@ func (s *Storage) WriteEvents(events []Event, sync bool) error {
 }
 
 func (s *Storage) updateLatest(e Event) {
-	for {
-		current, ok := s.latest.Load(e.Metric)
-		if ok && e.Timestamp <= current.(Event).Timestamp {
+	// Attempt to update the latest event for the metric if the provided
+	// event is newer than the stored one. Use LoadOrStore to avoid races
+	// when there is no existing entry.
+	current, ok := s.latest.Load(e.Metric)
+	if ok {
+		if e.Timestamp <= current.(Event).Timestamp {
 			return
-		}
-		if !ok {
-			actual, loaded := s.latest.LoadOrStore(e.Metric, e)
-			if !loaded || e.Timestamp <= actual.(Event).Timestamp {
-				return
-			}
 		}
 		s.latest.Store(e.Metric, e)
 		return
 	}
+
+	// No current entry; try to store ours. If another goroutine stored one
+	// concurrently, check which is newer and store if ours is newer.
+	actual, loaded := s.latest.LoadOrStore(e.Metric, e)
+	if !loaded {
+		return
+	}
+	if e.Timestamp <= actual.(Event).Timestamp {
+		return
+	}
+	s.latest.Store(e.Metric, e)
 }
 
 func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {

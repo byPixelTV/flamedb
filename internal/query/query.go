@@ -3,8 +3,8 @@ package query
 import (
 	"time"
 
-	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
+	"github.com/byPixelTV/flamedb/internal/types"
 )
 
 type QueryType string
@@ -46,27 +46,32 @@ type Query struct {
 	// write specific
 	Value       float64
 	Tags        map[string]string
-	UpdateLB    bool     // should this update the leaderboard?
-	LBEntityID  string   // entity ID for leaderboard updates
-	TagKeys     []string // for get queries, which tag keys to return
+	UpdateLB    bool
+	LBEntityID  string
+	TagKeys     []string
 	Quorum      bool
 	IsReplica   bool
 	ForceLocal  bool
 	Groups      []GroupDef
 	Aggregate   AggType
 	GroupBy     time.Duration
-	GroupBySpec string // original spec, z.B. "1y6m"
+	GroupBySpec string
+
+	// EntityTag ist der Tag-Key für die entityID bei windowed Leaderboards.
+	// Pflichtfeld wenn FROM oder TO gesetzt ist.
+	// Beispiel: LEADERBOARD kills FROM now-7d TO now ENTITY player
+	EntityTag string
 }
 
 type Result struct {
-	Events         []storage.Event               `json:"events,omitempty"`
-	Metrics        map[string][]storage.Event    `json:"metrics,omitempty"`
-	Leaderboard    []aggregates.LeaderboardEntry `json:"leaderboard,omitempty"`
-	Stats          *StatsResult                  `json:"stats,omitempty"`
-	Aggregate      *AggregateResult              `json:"aggregate,omitempty"`
-	Aggregates     map[string]*AggregateResult   `json:"aggregates,omitempty"`
-	Series         []SeriesPoint                 `json:"series,omitempty"`
-	SeriesByMetric map[string][]SeriesPoint      `json:"series_by_metric,omitempty"`
+	Events         []storage.Event             `json:"events,omitempty"`
+	Metrics        map[string][]storage.Event  `json:"metrics,omitempty"`
+	Leaderboard    []types.LeaderboardEntry    `json:"leaderboard,omitempty"`
+	Stats          *StatsResult                `json:"stats,omitempty"`
+	Aggregate      *AggregateResult            `json:"aggregate,omitempty"`
+	Aggregates     map[string]*AggregateResult `json:"aggregates,omitempty"`
+	Series         []SeriesPoint               `json:"series,omitempty"`
+	SeriesByMetric map[string][]SeriesPoint    `json:"series_by_metric,omitempty"`
 }
 
 type BatchItemError struct {

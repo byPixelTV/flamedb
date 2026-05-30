@@ -7,13 +7,12 @@ import (
 	"math"
 	"sync"
 
+	"github.com/byPixelTV/flamedb/internal/types"
 	"github.com/cockroachdb/pebble"
 )
 
-type LeaderboardEntry struct {
-	EntityID string // player id, server id, whatever
-	Value    float64
-}
+// LeaderboardEntry ist ein Alias auf types.LeaderboardEntry für Rückwärtskompatibilität.
+type LeaderboardEntry = types.LeaderboardEntry
 
 type Leaderboard struct {
 	db *pebble.DB
@@ -76,7 +75,7 @@ func (l *Leaderboard) Increment(metric, entityID string, delta float64) error {
 }
 
 func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
-	// O(1) lookup via index
+	// O(1) lookup via entity index
 	data, closer, err := l.db.Get(lbEntityKey(metric, entityID))
 	if err == nil {
 		defer closer.Close()
@@ -88,7 +87,7 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 		return 0, err
 	}
 
-	// fallback: scan (for old data without index)
+	// fallback: scan (für alte Daten ohne entity-index)
 	prefix := []byte("lb:" + metric + ":")
 	iter, err := l.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -115,7 +114,7 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 func (l *Leaderboard) Delete(metric, entityID string) error {
 	current, err := l.Get(metric, entityID)
 	if err != nil {
-		return nil // existiert nicht, okay
+		return nil
 	}
 	batch := l.db.NewBatch()
 	batch.Delete(lbKey(metric, entityID, current), pebble.Sync)

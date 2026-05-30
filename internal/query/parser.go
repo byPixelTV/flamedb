@@ -107,6 +107,12 @@ func Parse(input string) (*Query, error) {
 				}
 				q.Order = strings.ToUpper(tokens[i+1])
 				i += 2
+			case "ENTITY":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing ENTITY value")
+				}
+				q.EntityTag = strings.Trim(tokens[i+1], `"`)
+				i += 2
 			default:
 				return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
 			}
@@ -383,6 +389,15 @@ func Parse(input string) (*Query, error) {
 				return nil, fmt.Errorf("missing ORDER value")
 			}
 			q.Order = strings.ToUpper(tokens[i+1])
+			i += 2
+		case "ENTITY":
+			if q.Type != QueryTypeLeaderboard && q.Type != QueryTypeGroupLeaderboard {
+				return nil, fmt.Errorf("ENTITY is only valid for LEADERBOARD")
+			}
+			if i+1 >= len(tokens) {
+				return nil, fmt.Errorf("missing ENTITY value")
+			}
+			q.EntityTag = strings.Trim(tokens[i+1], `"`)
 			i += 2
 		default:
 			return nil, fmt.Errorf("unknown keyword: %s", tokens[i])

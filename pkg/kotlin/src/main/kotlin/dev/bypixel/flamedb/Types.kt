@@ -13,16 +13,26 @@ data class Event(
     val tags: Map<String, String> = emptyMap(),
 )
 
+/**
+ * One entry in a LEADERBOARD response.
+ *
+ * Field names match the JSON emitted by types.go:
+ *   {"entity_id":"pixel","value":42.0}
+ */
 @Serializable
 data class LeaderboardEntry(
-    @SerialName("EntityID") val entityId: String,
-    @SerialName("Value") val score: Double,
+    @SerialName("entity_id") val entityId: String,
+    @SerialName("value")     val score: Double,
 )
 
+/**
+ * One entry in a GROUP_LEADERBOARD response.
+ * The group name is in [group]; score is the sum of all members.
+ */
 @Serializable
 data class GroupLeaderboardEntry(
-    @SerialName("EntityID") val group: String,
-    @SerialName("Value") val score: Double,
+    @SerialName("entity_id") val group: String,
+    @SerialName("value")     val score: Double,
 )
 
 @Serializable
@@ -79,7 +89,7 @@ data class BatchResult(
 
 /** Options for a WRITE command. */
 data class WriteOptions(
-    /** Sets lb= and increments the leaderboard for this entity. */
+    /** Sets lb= and increments the all-time leaderboard for this entity. */
     val leaderboardEntity: String? = null,
     val tags: Map<String, String> = emptyMap(),
     /** Override timestamp in unix nanoseconds. */
@@ -91,9 +101,9 @@ data class WriteOptions(
 /** Options for a GET command. */
 data class GetOptions(
     val where: Map<String, String> = emptyMap(),
-    /** Inclusive start date (YYYY-MM-DD). */
+    /** Start of time range, e.g. "now-7d" or "2026-01-01". */
     val from: String? = null,
-    /** Inclusive end date (YYYY-MM-DD). */
+    /** End of time range, e.g. "now" or "2026-02-01". */
     val to: String? = null,
     val limit: Int? = null,
     val offset: Int? = null,
@@ -105,14 +115,31 @@ enum class SortOrder { ASC, DESC }
 /** Aggregate operators supported by GET. */
 enum class Aggregate { SUM, COUNT, AVG }
 
-/** Options for LEADERBOARD / GROUP_LEADERBOARD. */
+/**
+ * Options for LEADERBOARD and GROUP_LEADERBOARD.
+ *
+ * When [from] or [to] is set the server computes the leaderboard on-the-fly
+ * from raw events. In that case [entityTag] is **required** — it names the
+ * tag whose value is used as the entity ID.
+ *
+ * Example: if you write `WRITE kills 5 lb="pixel" player="pixel"` then
+ * [entityTag] should be `"player"`.
+ *
+ * Without [from]/[to] the pre-aggregated all-time index is used and
+ * [entityTag] is ignored.
+ */
 data class LeaderboardOptions(
     val limit: Int? = null,
     val offset: Int? = null,
-    /** Inclusive start date (YYYY-MM-DD). */
+    /** Start of time window, e.g. "now-7d" or "2026-01-01". */
     val from: String? = null,
-    /** Inclusive end date (YYYY-MM-DD). */
+    /** End of time window, e.g. "now" or "2026-02-01". */
     val to: String? = null,
+    /**
+     * Tag key whose value is the entity ID.
+     * Required when [from] or [to] is set, ignored otherwise.
+     */
+    val entityTag: String? = null,
 )
 
 /** A group definition for GROUP_LEADERBOARD. */
@@ -121,12 +148,12 @@ data class GroupDef(
     val members: List<String>,
 )
 
-/** One entry in a WRITE_BATCH. */
+/** One item in a WRITE_BATCH request. */
 data class WriteBatchItem(
     val metric: String,
     val value: Double,
     val options: WriteOptions = WriteOptions(),
 )
 
-/** Thrown when FlameDB returns an error field in its JSON response. */
+/** Thrown when FlameDB returns an error or the connection is broken. */
 class FlameDBException(message: String) : RuntimeException(message)
