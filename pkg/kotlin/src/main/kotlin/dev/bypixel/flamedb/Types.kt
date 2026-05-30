@@ -4,7 +4,7 @@ import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.descriptors.PrimitiveKind
-import kotlinx.serialization.descriptors.PrimitiveScalarDescriptor
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
@@ -15,8 +15,8 @@ import kotlinx.serialization.json.jsonPrimitive
 // ─── Custom Serializer für unsaubere API-Numbers ──────────────────────────────
 
 object FlexibleDoubleSerializer : KSerializer<Double> {
-    override val descriptor: SerialDescriptor = 
-        PrimitiveScalarDescriptor("FlexibleDouble", PrimitiveKind.DOUBLE)
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("FlexibleDouble", PrimitiveKind.DOUBLE)
 
     override fun deserialize(decoder: Decoder): Double {
         val jsonPrimitive = (decoder as JsonDecoder).decodeJsonElement().jsonPrimitive
