@@ -119,7 +119,7 @@ func isFullReleaseBuild() bool {
 	}
 
 	branch, err := runGit("rev-parse", "--abbrev-ref", "HEAD")
-	return err == nil && branch == "prod"
+	return err == nil && branch == "release"
 }
 
 func runGit(args ...string) (string, error) {
