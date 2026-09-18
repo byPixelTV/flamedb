@@ -2,13 +2,17 @@ package server
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/auth"
@@ -19,18 +23,25 @@ import (
 )
 
 type Server struct {
-	exec    *query.Executor
-	auth    *auth.Auth
-	cluster *cluster.Cluster
-	apiKey  string
-	store   *storage.Storage // neu
-	cfgPath string
-	cfgMu   sync.Mutex
-	cfg     *config.Config
+	mutations [256]sync.Mutex
+	connMu    sync.Mutex
+	listener  net.Listener
+	conns     map[net.Conn]struct{}
+	connWG    sync.WaitGroup
+	closed    bool
+	exec      *query.Executor
+	auth      *auth.Auth
+	cluster   *cluster.Cluster
+	apiKey    string
+	store     *storage.Storage // neu
+	cfgPath   string
+	cfgMu     sync.Mutex
+	cfg       *config.Config
 }
 
 func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cluster.Cluster, internalKey string, cfg *config.Config, cfgPath string) *Server {
 	return &Server{
+		conns:   make(map[net.Conn]struct{}),
 		exec:    query.NewExecutor(store, lb),
 		auth:    a,
 		cluster: c,
@@ -76,29 +87,57 @@ func (s *Server) Listen(addr string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("FlameDB listening on %s", addr)
+	return s.Serve(ln)
+}
+
+func (s *Server) Serve(ln net.Listener) error {
+	s.connMu.Lock()
+	if s.closed {
+		s.connMu.Unlock()
+		ln.Close()
+		return net.ErrClosed
+	}
+	s.listener = ln
+	s.connMu.Unlock()
+	log.Printf("FlameDB listening on %s", ln.Addr())
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept error: %v", err)
+			return err
+		}
+		s.connMu.Lock()
+		if s.closed || len(s.conns) >= 1024 {
+			s.connMu.Unlock()
+			conn.Close()
 			continue
 		}
-		go s.handleConn(conn)
+		s.conns[conn] = struct{}{}
+		s.connWG.Add(1)
+		s.connMu.Unlock()
+		go func() {
+			defer s.connWG.Done()
+			defer func() { s.connMu.Lock(); delete(s.conns, conn); s.connMu.Unlock() }()
+			s.handleConn(conn)
+		}()
 	}
 }
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 0, 64*1024), 64<<20)
+	reader := bufio.NewReaderSize(conn, 4096)
 
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	// auth handshake
 	writeJSON(conn, map[string]string{"auth": "required"})
 
 	var session *auth.Session
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for {
+		authLine, err := reader.ReadSlice('\n')
+		if err != nil {
+			return
+		}
+		line := strings.TrimSpace(string(authLine))
 		if !strings.HasPrefix(strings.ToUpper(line), "AUTH ") {
 			writeJSON(conn, map[string]string{"error": "authenticate first"})
 			continue
@@ -121,53 +160,91 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), (9<<20)+1024)
+	_ = conn.SetDeadline(time.Time{})
 	// main loop
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		limit := 8 << 20
+		if session.Can(auth.PermInternal) {
+			limit = 9 << 20
+		}
+		if len(line) > limit {
+			writeJSON(conn, map[string]string{"error": "command too large"})
+			return
+		}
 		if line == "" {
 			continue
 		}
 
 		if strings.HasPrefix(line, "REPL_BATCH ") {
-			if !session.Can(auth.PermWrite) {
-				writeJSON(conn, map[string]string{"error": "permission denied"})
+			if !session.Can(auth.PermInternal) {
+				writeJSON(conn, map[string]string{"error": "internal permission required"})
 				continue
 			}
-			queries := strings.Split(strings.TrimSpace(line[len("REPL_BATCH "):]), "\x1f")
+			lines := strings.Split(strings.TrimSpace(line[len("REPL_BATCH "):]), "\x1f")
+			var parseErr error
 			var batch []*query.Query
-			for _, replicaLine := range queries {
-				replicaLine = strings.TrimSpace(replicaLine)
-				if replicaLine == "" {
-					continue
-				}
-				q, err := query.Parse(replicaLine)
+			for _, item := range lines {
+				q, err := query.Parse(item)
 				if err != nil {
-					writeJSON(conn, map[string]string{"error": err.Error()})
-					continue
+					parseErr = err
+					break
 				}
 				q.IsReplica = true
 				q.ForceLocal = true
 				batch = append(batch, q)
 			}
-			res, err := s.exec.ExecuteBatch(batch)
-			if err != nil {
-				writeJSON(conn, map[string]string{"error": err.Error()})
+			if parseErr != nil {
+				writeJSON(conn, map[string]string{"error": parseErr.Error()})
 				continue
 			}
-			if res.Failed > 0 {
-				writeJSON(conn, res)
-				continue
+			// Replication batches also carry SET and DELETE; reply exactly once.
+			for _, q := range batch {
+				if q.Type != query.QueryTypeWrite && q.Type != query.QueryTypeSet && q.Type != query.QueryTypeDelete {
+					parseErr = fmt.Errorf("invalid replica operation")
+					break
+				}
 			}
-			writeJSON(conn, map[string]string{"cluster": "ok"})
+			if parseErr == nil {
+				allWrites := true
+				for _, q := range batch {
+					if q.Type != query.QueryTypeWrite {
+						allWrites = false
+						break
+					}
+				}
+				if allWrites {
+					result, err := s.exec.ExecuteBatch(batch)
+					if err != nil {
+						parseErr = err
+					} else if result.Failed > 0 {
+						parseErr = fmt.Errorf("replication batch failed: %v", result.Errors)
+					}
+				} else {
+					for _, q := range batch {
+						if _, err := s.exec.Execute(q); err != nil {
+							parseErr = err
+							break
+						}
+					}
+				}
+			}
+			if parseErr != nil {
+				writeJSON(conn, map[string]string{"error": parseErr.Error()})
+			} else {
+				writeJSON(conn, map[string]string{"cluster": "ok"})
+			}
 			continue
 		}
 
-		if strings.HasPrefix(strings.ToUpper(line), "WRITE_BATCH") {
+		if strings.EqualFold(line, "WRITE_BATCH") || strings.EqualFold(line, "WRITE_BATCH QUORUM") {
 			if !session.Can(auth.PermWrite) {
 				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
-				continue
+				return
 			}
-			s.handleWriteBatch(conn, scanner, line)
+			s.handleWriteBatch(conn, scanner, line, session.Can(auth.PermInternal))
 			continue
 		}
 
@@ -186,8 +263,8 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, s.cluster.Topology())
 				continue
 			}
-			if !session.Can(auth.PermWrite) {
-				writeJSON(conn, map[string]string{"error": "permission denied"})
+			if !session.Can(auth.PermInternal) {
+				writeJSON(conn, map[string]string{"error": "internal permission required"})
 				continue
 			}
 			switch msg.Type {
@@ -257,6 +334,10 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
+		if (q.IsReplica || q.ForceLocal || q.OperationID != "") && !session.Can(auth.PermInternal) {
+			writeJSON(conn, map[string]string{"error": "internal flags require internal permission"})
+			continue
+		}
 		// permission check
 		switch q.Type {
 		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
@@ -274,13 +355,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		// multi-metric GET: scatter/gather across nodes
 		if q.Type == query.QueryTypeGet && len(q.Metrics) > 1 {
 			// build suffix after metric list (keeps WHERE/FROM/TO/etc)
-			cmdEnd := strings.Index(line, " ")
+			cmdEnd := strings.IndexAny(line, " \t")
 			if cmdEnd == -1 {
 				writeJSON(conn, map[string]string{"error": "invalid query"})
 				continue
 			}
 			metricStart := cmdEnd + 1
-			nextSpace := strings.Index(line[metricStart:], " ")
+			for metricStart < len(line) && (line[metricStart] == ' ' || line[metricStart] == '\t') {
+				metricStart++
+			}
+			nextSpace := strings.IndexAny(line[metricStart:], " \t")
 			suffix := ""
 			if nextSpace != -1 {
 				suffix = line[metricStart+nextSpace:]
@@ -290,6 +374,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			aggregatesOut := make(map[string]*query.AggregateResult, len(q.Metrics))
 			seriesOut := make(map[string][]query.SeriesPoint, len(q.Metrics))
 
+			var multiErr error
 			for _, metric := range q.Metrics {
 				metricLine := "GET " + metric + suffix
 				readNode := s.cluster.GetReadNode(metric)
@@ -301,26 +386,33 @@ func (s *Server) handleConn(conn net.Conn) {
 					q2.Metrics = nil
 					r, err := s.exec.Execute(&q2)
 					if err != nil {
-						writeJSON(conn, map[string]string{"error": err.Error()})
-						continue
+						multiErr = err
+						break
 					}
 					res = *r
 				} else {
 					bytes, err := s.cluster.SendToNodeLocal(readNode, metricLine)
 					if err != nil {
-						writeJSON(conn, map[string]string{"error": err.Error()})
-						continue
+						multiErr = err
+						break
+					}
+					if err := upstreamError(bytes); err != nil {
+						multiErr = err
+						break
 					}
 					if err := json.Unmarshal(bytes, &res); err != nil {
-						writeJSON(conn, map[string]string{"error": "invalid upstream response"})
-						continue
+						multiErr = fmt.Errorf("invalid upstream response")
+						break
 					}
 				}
 
-				if res.Aggregate != nil {
-					aggregatesOut[metric] = res.Aggregate
-				} else if len(res.Series) > 0 {
+				if q.GroupBySpec != "" {
+					if res.Series == nil {
+						res.Series = []query.SeriesPoint{}
+					}
 					seriesOut[metric] = res.Series
+				} else if q.Aggregate != "" {
+					aggregatesOut[metric] = res.Aggregate
 				} else {
 					if res.Events == nil {
 						res.Events = []storage.Event{}
@@ -329,6 +421,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				}
 			}
 
+			if multiErr != nil {
+				writeJSON(conn, map[string]string{"error": multiErr.Error()})
+				continue
+			}
 			var out query.Result
 			if len(aggregatesOut) > 0 {
 				out.Aggregates = aggregatesOut
@@ -344,7 +440,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		requiresPrimary := q.Type == query.QueryTypeSet ||
 			q.Type == query.QueryTypeDelete ||
-			(q.Type == query.QueryTypeWrite && q.UpdateLB)
+			q.Type == query.QueryTypeWrite
 
 		if requiresPrimary &&
 			!q.IsReplica &&
@@ -372,7 +468,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 		// für reads: round-robin über replicas
 		switch q.Type {
-		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats:
+		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
 			readNode := s.cluster.GetReadNode(q.Metric)
 			if !q.ForceLocal && readNode.ID != s.cluster.Self.ID {
 				result, err := s.cluster.SendToNodeLocal(readNode, line)
@@ -385,24 +481,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
-		// lokal ausführen (primary oder replica write)
-		result, err := s.exec.Execute(q)
+		if !q.IsReplica && q.OperationID == "" {
+			q.OperationID = newOperationID()
+		}
+		result, err := s.executeLocal(line, q)
 		if err != nil {
 			writeJSON(conn, map[string]string{"error": err.Error()})
 			continue
 		}
-
-		// replication nur vom primary, nicht von replicas
-		switch q.Type {
-		case query.QueryTypeWrite, query.QueryTypeSet, query.QueryTypeDelete:
-			replicateFromThisNode := !q.IsReplica && (s.cluster.IsPrimaryFor(q.Metric) || (q.Type == query.QueryTypeWrite && !q.UpdateLB))
-			if replicateFromThisNode {
-				replicaQuery := line + " __replica"
-				if err := s.cluster.ReplicateWrite(q.Metric, replicaQuery, q.Quorum); err != nil {
-					writeJSON(conn, map[string]string{"error": fmt.Sprintf("quorum failed: %v", err)})
-					continue
-				}
-			}
+		if q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete {
 			writeEmptyResult(conn)
 			continue
 		}
@@ -428,19 +515,35 @@ func isConnectionClosed(err error) bool {
 		strings.Contains(s, "connection reset")
 }
 
-func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header string) {
+func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header string, internal bool) {
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	ended := false
+	size := 0
 	batchQuorum := strings.Contains(strings.ToUpper(header), "QUORUM")
 	var lines []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if strings.EqualFold(line, "END") {
+			ended = true
 			break
 		}
 		if line != "" {
+			size += len(line)
+			if len(lines) >= 10000 || size > 8<<20 {
+				writeJSON(conn, map[string]string{"error": "batch limit exceeded"})
+				conn.Close()
+				return
+			}
 			lines = append(lines, line)
 		}
 	}
 
+	if !ended {
+		writeJSON(conn, map[string]string{"error": "incomplete batch"})
+		conn.Close()
+		return
+	}
 	if len(lines) == 0 {
 		writeJSON(conn, query.BatchResult{OK: true})
 		return
@@ -467,6 +570,11 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: err.Error()})
 			continue
 		}
+		if (q.IsReplica || q.ForceLocal || q.OperationID != "") && !internal {
+			result.Failed++
+			result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: "internal flags require internal permission"})
+			continue
+		}
 		if q.Type != query.QueryTypeWrite {
 			result.Failed++
 			result.Errors = append(result.Errors, query.BatchItemError{Index: i, Error: "WRITE_BATCH only supports WRITE items"})
@@ -476,7 +584,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			q.Quorum = true
 		}
 
-		requiresPrimary := q.UpdateLB
+		requiresPrimary := true
 		if requiresPrimary && !q.IsReplica && !s.cluster.IsPrimaryFor(q.Metric) {
 			node, ok := s.cluster.GetPrimaryNode(q.Metric)
 			if !ok {
@@ -502,13 +610,16 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			continue
 		}
 
+		if !q.IsReplica && q.OperationID == "" {
+			q.OperationID = newOperationID()
+		}
 		local = append(local, localItem{index: i, line: itemLine, q: q})
 	}
 
 	for nodeID, items := range remote {
 		node := remoteNodes[nodeID]
 		batchLines := make([]string, 0, len(items)+2)
-		batchLines = append(batchLines, "WRITE_BATCH")
+		batchLines = append(batchLines, header)
 		for _, item := range items {
 			batchLines = append(batchLines, item.line)
 		}
@@ -548,6 +659,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			localIndexByBatchIndex[i] = item.index
 		}
 
+		unlock := s.lockMutations(localQueries)
 		localResult, err := s.exec.ExecuteBatch(localQueries)
 		if err != nil {
 			for _, item := range local {
@@ -576,7 +688,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 				}
 				replicationItems = append(replicationItems, cluster.ReplicationItem{
 					Metric: item.q.Metric,
-					Query:  item.line + " __replica",
+					Query:  replicaLine(item.line, item.q),
 					Quorum: item.q.Quorum,
 				})
 				replicationIndexByItem = append(replicationIndexByItem, item.index)
@@ -589,6 +701,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 				}
 			}
 		}
+		unlock()
 	}
 
 	if result.Failed > 0 {
@@ -627,10 +740,89 @@ func upstreamError(data []byte) error {
 }
 
 func writeJSON(conn net.Conn, v any) {
-	data, _ := json.Marshal(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		data = []byte(`{"error":"response serialization failed"}`)
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	conn.Write(append(data, '\n'))
 }
 
 func writeEmptyResult(conn net.Conn) {
 	_, _ = conn.Write([]byte("{}\n"))
+}
+
+func replicaLine(line string, q *query.Query) string {
+	if q.Type == query.QueryTypeWrite {
+		line += fmt.Sprintf(" ts=%d", q.Timestamp)
+	}
+	if q.Type == query.QueryTypeDelete {
+		if q.From != 0 {
+			line += " FROM " + time.Unix(0, q.From).UTC().Format(time.RFC3339Nano)
+		}
+		if q.To != 0 {
+			line += " TO " + time.Unix(0, q.To).UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return line + " __replica __op=" + q.OperationID
+}
+
+func newOperationID() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(id[:])
+}
+
+func (s *Server) Close() {
+	s.connMu.Lock()
+	s.closed = true
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	for conn := range s.conns {
+		conn.Close()
+	}
+	s.connMu.Unlock()
+	s.connWG.Wait()
+}
+
+func (s *Server) lockMutations(queries []*query.Query) func() {
+	var used [256]bool
+	for _, q := range queries {
+		if q.IsReplica || (q.Type != query.QueryTypeWrite && q.Type != query.QueryTypeSet && q.Type != query.QueryTypeDelete) {
+			continue
+		}
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(q.Metric))
+		used[h.Sum32()%256] = true
+	}
+	for i, yes := range used {
+		if yes {
+			s.mutations[i].Lock()
+		}
+	}
+	return func() {
+		for i := len(used) - 1; i >= 0; i-- {
+			if used[i] {
+				s.mutations[i].Unlock()
+			}
+		}
+	}
+}
+
+func (s *Server) executeLocal(line string, q *query.Query) (*query.Result, error) {
+	unlock := s.lockMutations([]*query.Query{q})
+	defer unlock()
+	result, err := s.exec.Execute(q)
+	if err != nil {
+		return nil, err
+	}
+	if !q.IsReplica && (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) {
+		if err := s.cluster.ReplicateWrite(q.Metric, replicaLine(line, q), q.Quorum); err != nil {
+			return nil, fmt.Errorf("replication failed (local write applied): %w", err)
+		}
+	}
+	return result, nil
 }

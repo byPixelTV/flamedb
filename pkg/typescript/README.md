@@ -81,3 +81,15 @@ db.disconnect();
 | `leaderboard(metric, opts?)` | Fetch sorted leaderboard |
 | `groupLeaderboard(metric, groups, opts?)` | Ad-hoc group leaderboard |
 | `stats(metric, tags)` | Cardinality stats |
+
+
+### Exact nanosecond timestamps (Node.js >= 22)
+
+Use `bigint` for precise write timestamps, for example `timestampNs: 1790000000123456789n`.
+Read exact values from `event.timestampNs` and `point.tsNs`. Existing `timestamp`/`ts`
+number fields remain available but may round nanoseconds. Convert bigint fields to
+strings when serializing SDK results with `JSON.stringify`.
+
+A timeout closes the connection and rejects every pending command. A write may
+already have been applied; do not automatically retry increments. Call
+`disconnect()` before establishing a new connection.

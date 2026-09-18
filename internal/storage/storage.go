@@ -2,14 +2,15 @@ package storage
 
 import (
 	"encoding/binary"
+	"fmt"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/cluster"
-	"github.com/cockroachdb/pebble"
-	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble/v2/sstable"
 )
 
 const (
@@ -35,17 +36,19 @@ type Storage struct {
 	cardCache   *cardCache
 	cardUpdater *cardUpdater
 	cache       *pebble.Cache
-	latest      sync.Map
 }
 
 func Open(path, compression string) (*Storage, error) {
+	if err := prepareLegacy(path); err != nil {
+		return nil, err
+	}
 	opts := &pebble.Options{}
 	opts.EnsureDefaults()
 	applyPerfOptions(opts)
 
 	comp := parseCompression(compression)
 	for i := range opts.Levels {
-		opts.Levels[i].Compression = comp
+		opts.Levels[i].Compression = func() *sstable.CompressionProfile { return comp }
 	}
 
 	blockCache := pebble.NewCache(blockCacheSizeBytes)
@@ -83,10 +86,10 @@ func applyPerfOptions(opts *pebble.Options) {
 	opts.BytesPerSync = bytesPerSync
 	opts.WALBytesPerSync = walBytesPerSync
 	opts.WALMinSyncInterval = func() time.Duration { return 200 * time.Microsecond }
-	opts.MaxConcurrentCompactions = func() int {
+	opts.CompactionConcurrencyRange = func() (int, int) {
 		cpus := runtime.GOMAXPROCS(0)
 		if cpus < 2 {
-			return 2
+			return 1, 2
 		}
 		n := cpus / 2
 		if n > 8 {
@@ -95,21 +98,18 @@ func applyPerfOptions(opts *pebble.Options) {
 		if n < 2 {
 			n = 2
 		}
-		return n
+		return 1, n
 	}
 
 	filter := bloom.FilterPolicy(10)
 	for i := range opts.Levels {
 		opts.Levels[i].BlockSize = blockSizeBytes
 		opts.Levels[i].IndexBlockSize = indexBlockSizeBytes
-		opts.Levels[i].TargetFileSize = targetFileSizeBytes
+		opts.TargetFileSizes[i] = targetFileSizeBytes
 		opts.Levels[i].FilterPolicy = filter
 		opts.Levels[i].FilterType = pebble.TableFilter
 	}
 
-	if opts.Experimental.MaxWriterConcurrency <= 0 {
-		opts.Experimental.MaxWriterConcurrency = runtime.GOMAXPROCS(0)
-	}
 }
 
 func appendUint64(dst []byte, v uint64) []byte {
@@ -130,6 +130,10 @@ func (s *Storage) WriteEvent(e Event, sync bool) error {
 }
 
 func (s *Storage) WriteEvents(events []Event, sync bool) error {
+	return s.WriteEventsWithReceipts(events, nil, sync)
+}
+
+func (s *Storage) WriteEventsWithReceipts(events []Event, receipts []string, sync bool) error {
 	if len(events) == 0 {
 		return nil
 	}
@@ -137,7 +141,21 @@ func (s *Storage) WriteEvents(events []Event, sync bool) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	for _, e := range events {
+	for i, e := range events {
+		if i < len(receipts) && receipts[i] != "" {
+			key := []byte("repl-applied:" + receipts[i])
+			_, closer, err := s.db.Get(key)
+			if err == nil {
+				closer.Close()
+				continue
+			}
+			if err != pebble.ErrNotFound {
+				return err
+			}
+			if err := batch.Set(key, []byte{1}, nil); err != nil {
+				return err
+			}
+		}
 		primaryKey := eventKey(e.Metric, e.Timestamp)
 
 		val, err := encodeEventValue(e)
@@ -156,42 +174,20 @@ func (s *Storage) WriteEvents(events []Event, sync bool) error {
 			}
 		}
 
-		if s.cardUpdater != nil {
-			s.cardUpdater.Add(e.Metric, e.Tags)
-		}
-		s.updateLatest(e)
 	}
-
 	opts := pebble.NoSync
 	if sync {
 		opts = pebble.Sync
 	}
-	return batch.Commit(opts)
-}
-
-func (s *Storage) updateLatest(e Event) {
-	// Attempt to update the latest event for the metric if the provided
-	// event is newer than the stored one. Use LoadOrStore to avoid races
-	// when there is no existing entry.
-	current, ok := s.latest.Load(e.Metric)
-	if ok {
-		if e.Timestamp <= current.(Event).Timestamp {
-			return
+	if err := batch.Commit(opts); err != nil {
+		return err
+	}
+	for _, e := range events {
+		if s.cardUpdater != nil {
+			s.cardUpdater.Add(e.Metric, e.Tags)
 		}
-		s.latest.Store(e.Metric, e)
-		return
 	}
-
-	// No current entry; try to store ours. If another goroutine stored one
-	// concurrently, check which is newer and store if ours is newer.
-	actual, loaded := s.latest.LoadOrStore(e.Metric, e)
-	if !loaded {
-		return
-	}
-	if e.Timestamp <= actual.(Event).Timestamp {
-		return
-	}
-	s.latest.Store(e.Metric, e)
+	return nil
 }
 
 func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
@@ -207,16 +203,16 @@ func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
 	return appendUint64(key, uint64(timestamp))
 }
 
-func parseCompression(s string) pebble.Compression {
+func parseCompression(s string) *sstable.CompressionProfile {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "snappy":
-		return pebble.SnappyCompression
+		return sstable.SnappyCompression
 	case "zstd":
-		return pebble.ZstdCompression
+		return sstable.ZstdCompression
 	case "none", "no":
-		return pebble.NoCompression
+		return sstable.NoCompression
 	default:
-		return pebble.SnappyCompression
+		return sstable.SnappyCompression
 	}
 }
 
@@ -226,7 +222,7 @@ func (s *Storage) DB() *pebble.DB {
 
 func (s *Storage) Close() error {
 	if s.cardUpdater != nil {
-		_ = s.cardUpdater.Flush(true)
+		_ = s.cardUpdater.Close()
 	}
 
 	err := s.db.Close()
@@ -237,197 +233,76 @@ func (s *Storage) Close() error {
 }
 
 func (s *Storage) ReadRange(metric string, from, to int64) ([]Event, error) {
-	lower := eventKey(metric, from)
-	upper := eventKey(metric, to)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	var events []Event
-	for iter.First(); iter.Valid(); iter.Next() {
-		e, err := decodeEventValue(iter.Value(), metric)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, e)
-	}
-
-	return events, iter.Error()
+	return s.ReadPage(metric, from, to, nil, 0, 0, false)
 }
-
 func (s *Storage) ReadRangeDesc(metric string, from, to int64, limit, offset int) ([]Event, error) {
-	if limit == 1 && offset == 0 {
-		if latest, ok := s.latest.Load(metric); ok {
-			e := latest.(Event)
-			if e.Timestamp >= from && e.Timestamp <= to {
-				return []Event{e}, nil
-			}
-		}
+	return s.ReadPage(metric, from, to, nil, limit, offset, true)
+}
+func (s *Storage) ReadRangeWithTags(metric string, from, to int64, tags map[string]string) ([]Event, error) {
+	return s.ReadPage(metric, from, to, tags, 0, 0, false)
+}
+func (s *Storage) ReadRangeWithTagsDesc(metric string, from, to int64, tags map[string]string, limit, offset int) ([]Event, error) {
+	return s.ReadPage(metric, from, to, tags, limit, offset, true)
+}
+
+// ReadPage bounds scans by both time and pagination. A snapshot keeps secondary
+// index references consistent with primary values during concurrent overwrites.
+func (s *Storage) ReadPage(metric string, from, to int64, tags map[string]string, limit, offset int, desc bool) ([]Event, error) {
+	if limit < 0 || offset < 0 {
+		return nil, fmt.Errorf("invalid pagination")
 	}
-
-	lower := eventKey(metric, from)
-	upper := eventKey(metric, to)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
+	lower, upper := eventKey(metric, from), eventKey(metric, to)
+	indexed := len(tags) > 0
+	if indexed {
+		k, v := s.BestIndexTag(metric, tags)
+		lower = indexKey(metric, k, v, from)
+		upper = indexKey(metric, k, v, to)
+	}
+	snapshot := s.db.NewSnapshot()
+	defer snapshot.Close()
+	iter, err := snapshot.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
-
-	if !iter.Last() {
-		return []Event{}, nil
+	events := []Event{}
+	valid := iter.First()
+	if desc {
+		valid = iter.Last()
 	}
-
-	for skipped := 0; skipped < offset && iter.Valid(); skipped++ {
-		iter.Prev()
-	}
-	if !iter.Valid() {
-		return []Event{}, nil
-	}
-
-	capHint := 0
-	if limit > 0 {
-		capHint = limit
-	}
-	var events []Event
-	if capHint > 0 {
-		events = make([]Event, 0, capHint)
-	}
-
-	for iter.Valid() {
-		e, err := decodeEventValue(iter.Value(), metric)
+	for valid {
+		var e Event
+		if indexed {
+			data, closer, getErr := snapshot.Get(iter.Value())
+			if getErr == pebble.ErrNotFound {
+				if desc {
+					valid = iter.Prev()
+				} else {
+					valid = iter.Next()
+				}
+				continue
+			}
+			if getErr != nil {
+				return nil, getErr
+			}
+			e, err = decodeEventValue(data, metric)
+			closer.Close()
+		} else {
+			e, err = decodeEventValue(iter.Value(), metric)
+		}
 		if err != nil {
 			return nil, err
 		}
-		events = append(events, e)
-		if limit > 0 && len(events) >= limit {
-			break
-		}
-		iter.Prev()
-	}
-
-	return events, iter.Error()
-}
-
-func (s *Storage) ReadRangeWithTags(metric string, from, to int64, tags map[string]string) ([]Event, error) {
-	if len(tags) == 0 {
-		return s.ReadRange(metric, from, to)
-	}
-
-	// besten index tag via cardinality wählen
-	primaryKey, primaryVal := s.BestIndexTag(metric, tags)
-
-	lower := indexKey(metric, primaryKey, primaryVal, from)
-	upper := indexKey(metric, primaryKey, primaryVal, to)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	var events []Event
-	for iter.First(); iter.Valid(); iter.Next() {
-		data, closer, err := s.db.Get(iter.Value())
-		if err != nil {
-			continue
-		}
-		e, err := decodeEventValue(data, metric)
-		closer.Close()
-		if err != nil {
-			continue
-		}
-
-		// restliche tags filtern
 		match := true
 		for k, v := range tags {
-			if k == primaryKey {
-				continue
-			}
-			if e.Tags[k] != v {
+			if actual, exists := e.Tags[k]; !exists || actual != v {
 				match = false
 				break
 			}
 		}
 		if match {
-			events = append(events, e)
-		}
-	}
-
-	return events, iter.Error()
-}
-
-func (s *Storage) ReadRangeWithTagsDesc(metric string, from, to int64, tags map[string]string, limit, offset int) ([]Event, error) {
-	if len(tags) == 0 {
-		return s.ReadRangeDesc(metric, from, to, limit, offset)
-	}
-
-	primaryKey, primaryVal := s.BestIndexTag(metric, tags)
-	lower := indexKey(metric, primaryKey, primaryVal, from)
-	upper := indexKey(metric, primaryKey, primaryVal, to)
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lower,
-		UpperBound: upper,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
-	if !iter.Last() {
-		return []Event{}, nil
-	}
-
-	capHint := 0
-	if limit > 0 {
-		capHint = limit
-	}
-	var events []Event
-	if capHint > 0 {
-		events = make([]Event, 0, capHint)
-	}
-
-	skipped := 0
-
-	for iter.Valid() {
-		data, closer, err := s.db.Get(iter.Value())
-		if err != nil {
-			iter.Prev()
-			continue
-		}
-		e, err := decodeEventValue(data, metric)
-		closer.Close()
-		if err != nil {
-			iter.Prev()
-			continue
-		}
-
-		match := true
-		for k, v := range tags {
-			if k == primaryKey {
-				continue
-			}
-			if e.Tags[k] != v {
-				match = false
-				break
-			}
-		}
-		if match {
-			if skipped < offset {
-				skipped++
+			if offset > 0 {
+				offset--
 			} else {
 				events = append(events, e)
 				if limit > 0 && len(events) >= limit {
@@ -435,10 +310,12 @@ func (s *Storage) ReadRangeWithTagsDesc(metric string, from, to int64, tags map[
 				}
 			}
 		}
-
-		iter.Prev()
+		if desc {
+			valid = iter.Prev()
+		} else {
+			valid = iter.Next()
+		}
 	}
-
 	return events, iter.Error()
 }
 
@@ -505,8 +382,11 @@ func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
 // ImportRawKVs schreibt raw keys direkt in pebble
 func (s *Storage) ImportRawKVs(kvs []RawKV) error {
 	batch := s.db.NewBatch()
+	defer batch.Close()
 	for _, kv := range kvs {
-		batch.Set(kv.Key, kv.Value, pebble.Sync)
+		if err := batch.Set(kv.Key, kv.Value, nil); err != nil {
+			return err
+		}
 	}
 	return batch.Commit(pebble.Sync)
 }
@@ -558,5 +438,76 @@ func (s *Storage) ImportRebalanceData(data cluster.RebalanceData) error {
 	for _, lb := range data.Leaderboard {
 		kvs = append(kvs, RawKV{Key: lb.Key, Value: lb.Value})
 	}
+	// Rebuild tag indexes, which are not part of the export payload.
+	for _, raw := range data.Events {
+		e, err := decodeEventValue(raw.Value, data.Metric)
+		if err != nil {
+			return err
+		}
+		for k, v := range e.Tags {
+			kvs = append(kvs, RawKV{Key: indexKey(e.Metric, k, v, e.Timestamp), Value: raw.Key})
+		}
+	}
 	return s.ImportRawKVs(kvs)
+}
+
+// StageEvent adds the event and its indexes to the caller's atomic mutation.
+func (s *Storage) StageEvent(batch *pebble.Batch, e Event) error {
+	key := eventKey(e.Metric, e.Timestamp)
+	val, err := encodeEventValue(e)
+	if err != nil {
+		return err
+	}
+	if old, closer, err := s.db.Get(key); err == nil {
+		previous, decodeErr := decodeEventValue(old, e.Metric)
+		closer.Close()
+		if decodeErr != nil {
+			return decodeErr
+		}
+		for k, v := range previous.Tags {
+			if err := batch.Delete(indexKey(e.Metric, k, v, e.Timestamp), nil); err != nil {
+				return err
+			}
+		}
+	} else if err != pebble.ErrNotFound {
+		return err
+	}
+	if err := batch.Set(key, val, nil); err != nil {
+		return err
+	}
+	for k, v := range e.Tags {
+		if err := batch.Set(indexKey(e.Metric, k, v, e.Timestamp), key, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Storage) RecordCommittedEvent(e Event) {
+	if s.cardUpdater != nil {
+		s.cardUpdater.Add(e.Metric, e.Tags)
+	}
+}
+
+func (s *Storage) StageDeleteRange(batch *pebble.Batch, metric string, from, to int64) error {
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: eventKey(metric, from), UpperBound: eventKey(metric, to)})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		e, err := decodeEventValue(iter.Value(), metric)
+		if err != nil {
+			return err
+		}
+		for k, v := range e.Tags {
+			if err := batch.Delete(indexKey(metric, k, v, e.Timestamp), nil); err != nil {
+				return err
+			}
+		}
+		if err := batch.Delete(iter.Key(), nil); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
 }

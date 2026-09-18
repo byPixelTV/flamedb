@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,7 +45,7 @@ type Config struct {
 }
 
 func (c *Config) addr() string {
-	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
 func (c *Config) timeout() time.Duration {
@@ -67,7 +68,7 @@ type Event struct {
 // LeaderboardEntry is a ranked entry returned by LEADERBOARD.
 type LeaderboardEntry struct {
 	EntityID string  `json:"entity_id"`
-	Score    float64 `json:"score"`
+	Score    float64 `json:"value"`
 }
 
 // SeriesPoint is a time-bucketed aggregate returned by GROUP BY queries.
@@ -98,20 +99,20 @@ type TagStats struct {
 
 // GetResult is returned by Get queries.
 type GetResult struct {
-	Events        []Event                     `json:"events,omitempty"`
-	Metrics       map[string][]Event          `json:"metrics,omitempty"`
-	Aggregate     *AggregateResult            `json:"aggregate,omitempty"`
-	Aggregates    map[string]*AggregateResult `json:"aggregates,omitempty"`
-	Series        []SeriesPoint               `json:"series,omitempty"`
-	SeriesByMetric map[string][]SeriesPoint   `json:"series_by_metric,omitempty"`
+	Events         []Event                     `json:"events,omitempty"`
+	Metrics        map[string][]Event          `json:"metrics,omitempty"`
+	Aggregate      *AggregateResult            `json:"aggregate,omitempty"`
+	Aggregates     map[string]*AggregateResult `json:"aggregates,omitempty"`
+	Series         []SeriesPoint               `json:"series,omitempty"`
+	SeriesByMetric map[string][]SeriesPoint    `json:"series_by_metric,omitempty"`
 }
 
 // BatchResult is returned by WriteBatch.
 type BatchResult struct {
-	OK       bool              `json:"ok"`
-	Accepted int               `json:"accepted"`
-	Failed   int               `json:"failed"`
-	Errors   []BatchItemError  `json:"errors,omitempty"`
+	OK       bool             `json:"ok"`
+	Accepted int              `json:"accepted"`
+	Failed   int              `json:"failed"`
+	Errors   []BatchItemError `json:"errors,omitempty"`
 }
 
 // BatchItemError describes a failed item in a batch.
@@ -175,6 +176,9 @@ type Client struct {
 
 // New creates a new Client and opens + authenticates a TCP connection.
 func New(cfg Config) (*Client, error) {
+	if strings.ContainsAny(cfg.APIKey, "\r\n") {
+		return nil, fmt.Errorf("flamedb: invalid API key")
+	}
 	c := &Client{cfg: cfg}
 	if err := c.dial(); err != nil {
 		return nil, err
@@ -201,12 +205,18 @@ func (c *Client) dial() error {
 	if err != nil {
 		return fmt.Errorf("flamedb: connect: %w", err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(c.cfg.timeout()))
 	c.conn = conn
 	c.scanner = bufio.NewScanner(conn)
 	c.scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
 	c.writer = bufio.NewWriter(conn)
 	c.authed = false
-	return c.auth()
+	if err := c.auth(); err != nil {
+		conn.Close()
+		c.conn = nil
+		return err
+	}
+	return nil
 }
 
 func (c *Client) auth() error {
@@ -240,7 +250,7 @@ func (c *Client) auth() error {
 }
 
 func (c *Client) readLine() (string, error) {
-	_ = c.conn.SetReadDeadline(time.Now().Add(c.cfg.timeout()))
+
 	if !c.scanner.Scan() {
 		if err := c.scanner.Err(); err != nil {
 			return "", fmt.Errorf("flamedb: read: %w", err)
@@ -251,7 +261,7 @@ func (c *Client) readLine() (string, error) {
 }
 
 func (c *Client) sendLine(line string) error {
-	_ = c.conn.SetWriteDeadline(time.Now().Add(c.cfg.timeout()))
+
 	if _, err := c.writer.WriteString(line + "\n"); err != nil {
 		return fmt.Errorf("flamedb: write: %w", err)
 	}
@@ -259,7 +269,7 @@ func (c *Client) sendLine(line string) error {
 }
 
 func (c *Client) sendLines(lines []string) error {
-	_ = c.conn.SetWriteDeadline(time.Now().Add(c.cfg.timeout()))
+
 	for _, l := range lines {
 		if _, err := c.writer.WriteString(l + "\n"); err != nil {
 			return fmt.Errorf("flamedb: write: %w", err)
@@ -275,18 +285,42 @@ func (c *Client) command(ctx context.Context, line string) (map[string]json.RawM
 }
 
 func (c *Client) commandMulti(ctx context.Context, lines []string) (map[string]json.RawMessage, error) {
+	if c.conn == nil {
+		return nil, fmt.Errorf("flamedb: connection closed")
+	}
+	for _, line := range lines {
+		if strings.ContainsAny(line, "\r\n\x1f") {
+			return nil, fmt.Errorf("flamedb: invalid command framing")
+		}
+	}
+	deadline := time.Now().Add(c.cfg.timeout())
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = c.conn.SetDeadline(deadline)
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetDeadline(time.Now()); close(done) })
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := c.sendLines(lines); err != nil {
+		c.conn.Close()
 		return nil, err
 	}
 	raw, err := c.readLine()
 	if err != nil {
+		c.conn.Close()
 		return nil, err
 	}
 	var result map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		c.conn.Close()
 		return nil, fmt.Errorf("flamedb: parse response: %w", err)
 	}
 	if errMsg, ok := result["error"]; ok {
@@ -301,6 +335,9 @@ func (c *Client) commandMulti(ctx context.Context, lines []string) (map[string]j
 
 // Write sends a WRITE command.
 func (c *Client) Write(ctx context.Context, metric string, value float64, opts WriteOpts) error {
+	if err := validateIdentifiers([]string{metric}, opts.Tags); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.command(ctx, buildWrite(metric, value, opts))
@@ -310,10 +347,10 @@ func (c *Client) Write(ctx context.Context, metric string, value float64, opts W
 func buildWrite(metric string, value float64, opts WriteOpts) string {
 	parts := []string{fmt.Sprintf("WRITE %s %g", metric, value)}
 	if opts.LeaderboardEntity != "" {
-		parts = append(parts, fmt.Sprintf(`lb="%s"`, opts.LeaderboardEntity))
+		parts = append(parts, fmt.Sprintf(`lb=%q`, opts.LeaderboardEntity))
 	}
 	for k, v := range opts.Tags {
-		parts = append(parts, fmt.Sprintf(`%s="%s"`, k, v))
+		parts = append(parts, fmt.Sprintf(`%s=%q`, k, v))
 	}
 	if opts.TimestampNs != 0 {
 		parts = append(parts, fmt.Sprintf("ts=%d", opts.TimestampNs))
@@ -326,6 +363,11 @@ func buildWrite(metric string, value float64, opts WriteOpts) string {
 
 // WriteBatch sends a WRITE_BATCH command with multiple items.
 func (c *Client) WriteBatch(ctx context.Context, items []WriteBatchItem) (*BatchResult, error) {
+	for _, item := range items {
+		if err := validateIdentifiers([]string{item.Metric}, item.Opts.Tags); err != nil {
+			return nil, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -352,11 +394,14 @@ func (c *Client) WriteBatch(ctx context.Context, items []WriteBatchItem) (*Batch
 
 // Set sends a SET command (absolute leaderboard value).
 func (c *Client) Set(ctx context.Context, metric string, value float64, leaderboardEntity string) error {
+	if err := validateIdentifiers([]string{metric}, nil); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cmd := fmt.Sprintf("SET %s %g", metric, value)
 	if leaderboardEntity != "" {
-		cmd += fmt.Sprintf(` lb="%s"`, leaderboardEntity)
+		cmd += fmt.Sprintf(` lb=%q`, leaderboardEntity)
 	}
 	_, err := c.command(ctx, cmd)
 	return err
@@ -373,11 +418,14 @@ type DeleteOpts struct {
 
 // Delete sends a DELETE command.
 func (c *Client) Delete(ctx context.Context, metric string, opts DeleteOpts) error {
+	if err := validateIdentifiers([]string{metric}, nil); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	parts := []string{"DELETE " + metric}
 	if opts.LeaderboardEntity != "" {
-		parts = append(parts, fmt.Sprintf(`lb="%s"`, opts.LeaderboardEntity))
+		parts = append(parts, fmt.Sprintf(`lb=%q`, opts.LeaderboardEntity))
 	}
 	if !opts.From.IsZero() {
 		parts = append(parts, "FROM "+fmtDate(opts.From))
@@ -393,6 +441,15 @@ func (c *Client) Delete(ctx context.Context, metric string, opts DeleteOpts) err
 
 // Get sends a GET command and returns the result.
 func (c *Client) Get(ctx context.Context, metrics []string, opts GetOpts) (*GetResult, error) {
+	if len(metrics) == 0 {
+		return nil, fmt.Errorf("flamedb: metric required")
+	}
+	if err := validateIdentifiers(metrics, opts.Where); err != nil {
+		return nil, err
+	}
+	if opts.Order != "" && opts.Order != "ASC" && opts.Order != "DESC" {
+		return nil, fmt.Errorf("flamedb: invalid order")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -401,7 +458,7 @@ func (c *Client) Get(ctx context.Context, metrics []string, opts GetOpts) (*GetR
 	if len(opts.Where) > 0 {
 		var clauses []string
 		for k, v := range opts.Where {
-			clauses = append(clauses, fmt.Sprintf(`%s="%s"`, k, v))
+			clauses = append(clauses, fmt.Sprintf(`%s=%q`, k, v))
 		}
 		parts = append(parts, "WHERE "+strings.Join(clauses, " AND "))
 	}
@@ -438,6 +495,9 @@ func (c *Client) Get(ctx context.Context, metrics []string, opts GetOpts) (*GetR
 
 // Leaderboard sends a LEADERBOARD command.
 func (c *Client) Leaderboard(ctx context.Context, metric string, opts LeaderboardOpts) ([]LeaderboardEntry, error) {
+	if err := validateIdentifiers([]string{metric}, nil); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -468,18 +528,21 @@ func (c *Client) Leaderboard(ctx context.Context, metric string, opts Leaderboar
 
 // GroupLeaderboardEntry is one entry returned by GROUP_LEADERBOARD.
 type GroupLeaderboardEntry struct {
-	Group string  `json:"group"`
-	Score float64 `json:"score"`
+	Group string  `json:"entity_id"`
+	Score float64 `json:"value"`
 }
 
 // GroupLeaderboard sends a GROUP_LEADERBOARD command.
 func (c *Client) GroupLeaderboard(ctx context.Context, metric string, groups []GroupDef, opts LeaderboardOpts) ([]GroupLeaderboardEntry, error) {
+	if err := validateIdentifiers([]string{metric}, nil); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	parts := []string{"GROUP_LEADERBOARD " + metric}
 	for _, g := range groups {
-		parts = append(parts, fmt.Sprintf(`GROUP "%s:%s"`, g.Name, strings.Join(g.Members, ",")))
+		parts = append(parts, fmt.Sprintf("GROUP %q", g.Name+":"+strings.Join(g.Members, ",")))
 	}
 	if opts.Limit > 0 {
 		parts = append(parts, fmt.Sprintf("LIMIT %d", opts.Limit))
@@ -507,6 +570,9 @@ func (c *Client) GroupLeaderboard(ctx context.Context, metric string, groups []G
 
 // Stats sends a STATS command.
 func (c *Client) Stats(ctx context.Context, metric string, tags []string) (*StatsResult, error) {
+	if err := validateIdentifiers(append([]string{metric}, tags...), nil); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -516,16 +582,30 @@ func (c *Client) Stats(ctx context.Context, metric string, tags []string) (*Stat
 		return nil, err
 	}
 
-	var sr StatsResult
+	var envelope struct {
+		Stats StatsResult `json:"stats"`
+	}
 	raw, _ := json.Marshal(result)
-	if err := json.Unmarshal(raw, &sr); err != nil {
+	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, fmt.Errorf("flamedb: parse stats: %w", err)
 	}
-	return &sr, nil
+	return &envelope.Stats, nil
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func fmtDate(t time.Time) string {
 	return t.UTC().Format("2006-01-02")
+}
+
+func validateIdentifiers(names []string, tags map[string]string) error {
+	for k := range tags {
+		names = append(names, k)
+	}
+	for _, name := range names {
+		if name == "" || strings.ContainsAny(name, ":=\", \t\r\n\x00\x1f") {
+			return fmt.Errorf("flamedb: invalid identifier")
+		}
+	}
+	return nil
 }

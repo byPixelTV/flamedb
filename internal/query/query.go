@@ -33,16 +33,17 @@ const (
 )
 
 type Query struct {
-	Type      QueryType
-	Metric    string
-	Metrics   []string
-	Where     map[string]string
-	Timestamp int64
-	From      int64
-	To        int64
-	Limit     int
-	Offset    int
-	Order     string
+	OperationID string
+	Type        QueryType
+	Metric      string
+	Metrics     []string
+	Where       map[string]string
+	Timestamp   int64
+	From        int64
+	To          int64
+	Limit       int
+	Offset      int
+	Order       string
 	// write specific
 	Value       float64
 	Tags        map[string]string

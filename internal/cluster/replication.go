@@ -4,21 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
+	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
-const asyncReplicationWorkersPerNode = 64
+const asyncReplicationWorkersPerNode = 1
 const asyncReplicationQueueSize = 262144
 const asyncReplicationBatchSize = 512
 const asyncReplicationBatchWait = 2 * time.Millisecond
-const asyncFanoutWorkersPerMetric = 8
-const asyncFanoutQueueSize = 262144
+const asyncFanoutWorkersPerMetric = 1
+const asyncFanoutQueueSize = 1024
 const replicationBatchSeparator = "\x1f"
 const replicationRetryInitialDelay = 10 * time.Millisecond
 const replicationRetryMaxDelay = time.Second
@@ -61,6 +62,7 @@ type replicationRecord struct {
 	node      Node
 	query     string
 	outboxKey []byte
+	ack       chan string
 }
 
 type outboxEntry struct {
@@ -77,6 +79,20 @@ type replicationOutbox struct {
 func newReplicationOutbox(db *pebble.DB) *replicationOutbox {
 	o := &replicationOutbox{db: db}
 	o.seq.Store(uint64(time.Now().UnixNano()))
+	if db != nil {
+		iter, err := db.NewIter(&pebble.IterOptions{LowerBound: []byte("repl-outbox:"), UpperBound: []byte("repl-outbox;")})
+		if err == nil {
+			for iter.First(); iter.Valid(); iter.Next() {
+				key := string(iter.Key())
+				if at := strings.LastIndexByte(key, ':'); at >= 0 {
+					if seq, err := strconv.ParseUint(key[at+1:], 10, 64); err == nil && seq > o.seq.Load() {
+						o.seq.Store(seq)
+					}
+				}
+			}
+			iter.Close()
+		}
+	}
 	return o
 }
 
@@ -109,7 +125,7 @@ func (o *replicationOutbox) putBatch(records []replicationRecord) ([][]byte, err
 		keys = append(keys, key)
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := batch.Commit(pebble.Sync); err != nil {
 		return nil, err
 	}
 	o.depth.Add(int64(len(keys)))
@@ -140,7 +156,8 @@ func (c *Cluster) AttachReplicationOutbox(db *pebble.DB) {
 		return
 	}
 	c.outbox = newReplicationOutbox(db)
-	c.recoverReplicationOutbox()
+	c.recoveryDone = make(chan struct{})
+	c.startWorker(func() { defer close(c.recoveryDone); c.recoverReplicationOutbox() })
 }
 
 func (c *Cluster) recoverReplicationOutbox() {
@@ -159,12 +176,18 @@ func (c *Cluster) recoverReplicationOutbox() {
 
 	recovered := 0
 	for iter.First(); iter.Valid(); iter.Next() {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
 		var entry outboxEntry
 		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
 			log.Printf("replication outbox decode failed for %s: %v", string(iter.Key()), err)
 			continue
 		}
 		key := append([]byte(nil), iter.Key()...)
+		c.outbox.depth.Add(1)
 		c.enqueueReplicationRecord(replicationRecord{
 			node:      entry.Node,
 			query:     entry.Query,
@@ -172,7 +195,7 @@ func (c *Cluster) recoverReplicationOutbox() {
 		})
 		recovered++
 	}
-	c.outbox.depth.Store(int64(recovered))
+
 	if err := iter.Error(); err != nil {
 		log.Printf("replication outbox recovery iterator failed: %v", err)
 	}
@@ -183,84 +206,56 @@ func (c *Cluster) recoverReplicationOutbox() {
 
 // ReplicateAsync — fire and forget, client wartet nicht
 func (c *Cluster) ReplicateAsync(metric, query string) error {
-	replicas := c.GetReplicaNodes(metric)
-	if len(replicas) == 0 {
-		return nil
-	}
-
-	records := make([]replicationRecord, 0, len(replicas))
-	for _, replica := range replicas {
-		key, err := c.persistReplication(replica, query)
-		if err != nil {
-			return fmt.Errorf("replication outbox persist failed for %s: %w", replica.ID, err)
-		}
-		records = append(records, replicationRecord{
-			node:      replica,
-			query:     query,
-			outboxKey: key,
-		})
-	}
-
-	if err := c.enqueueFanout(metric, records); err != nil {
-		return err
-	}
-	return nil
+	return c.ReplicateBatch([]ReplicationItem{{Metric: metric, Query: query}})
 }
 
 func (c *Cluster) ReplicateBatch(items []ReplicationItem) error {
-	if len(items) == 0 {
-		return nil
+	if err := c.waitRecovery(); err != nil {
+		return err
 	}
-
-	type pendingRecord struct {
-		metric string
-		record replicationRecord
-	}
-	var pending []pendingRecord
-	for _, item := range items {
-		if item.Quorum {
-			if err := c.ReplicateQuorum(item.Metric, item.Query); err != nil {
-				return err
-			}
+	start := 0
+	for i, item := range items {
+		if !item.Quorum {
 			continue
 		}
-		replicas := c.GetReplicaNodes(item.Metric)
-		for _, replica := range replicas {
-			pending = append(pending, pendingRecord{
-				metric: item.Metric,
-				record: replicationRecord{
-					node:  replica,
-					query: item.Query,
-				},
-			})
+		if err := c.replicateAsyncBatch(items[start:i]); err != nil {
+			return err
+		}
+		if err := c.ReplicateQuorum(item.Metric, item.Query); err != nil {
+			return err
+		}
+		start = i + 1
+	}
+	return c.replicateAsyncBatch(items[start:])
+}
+
+func (c *Cluster) replicateAsyncBatch(items []ReplicationItem) error {
+	var records []replicationRecord
+	var metrics []string
+	for _, item := range items {
+		for _, node := range c.GetReplicaNodes(item.Metric) {
+			records = append(records, replicationRecord{node: node, query: item.Query})
+			metrics = append(metrics, item.Metric)
 		}
 	}
-	if len(pending) == 0 {
+	if len(records) == 0 {
 		return nil
 	}
-
-	asyncRecords := make([]replicationRecord, 0, len(pending))
-	for _, p := range pending {
-		asyncRecords = append(asyncRecords, p.record)
-	}
 	if c.outbox != nil {
-		keys, err := c.outbox.putBatch(asyncRecords)
+		keys, err := c.outbox.putBatch(records)
 		if err != nil {
 			return err
 		}
-		for i := range asyncRecords {
-			asyncRecords[i].outboxKey = keys[i]
-			pending[i].record.outboxKey = keys[i]
+		for i := range records {
+			records[i].outboxKey = keys[i]
 		}
 	}
-
-	byMetric := make(map[string][]replicationRecord)
-	for _, p := range pending {
-		byMetric[p.metric] = append(byMetric[p.metric], p.record)
+	grouped := make(map[string][]replicationRecord)
+	for i, record := range records {
+		grouped[metrics[i]] = append(grouped[metrics[i]], record)
 	}
-
-	for metric, records := range byMetric {
-		if err := c.enqueueFanout(metric, records); err != nil {
+	for metric, batch := range grouped {
+		if err := c.enqueueFanout(metric, batch); err != nil {
 			return err
 		}
 	}
@@ -275,12 +270,15 @@ func (c *Cluster) enqueueFanout(metric string, records []replicationRecord) erro
 	select {
 	case q.ch <- task:
 		return nil
-	default:
+	case <-c.done:
 		return ErrServerBusy
 	}
 }
 
 func (c *Cluster) getFanoutQueue(metric string) *fanoutQueue {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(metric))
+	metric = fmt.Sprintf("shard-%d", h.Sum32()%16)
 	if existing, ok := c.fanoutQueues.Load(metric); ok {
 		return existing.(*fanoutQueue)
 	}
@@ -295,15 +293,20 @@ func (c *Cluster) getFanoutQueue(metric string) *fanoutQueue {
 	}
 
 	for i := 0; i < asyncFanoutWorkersPerMetric; i++ {
-		go c.fanoutWorker(q)
+		c.startWorker(func() { c.fanoutWorker(q) })
 	}
 	return q
 }
 
 func (c *Cluster) fanoutWorker(q *fanoutQueue) {
-	for task := range q.ch {
-		for _, record := range task.records {
-			c.enqueueReplicationRecord(record)
+	for {
+		select {
+		case <-c.done:
+			return
+		case task := <-q.ch:
+			for _, record := range task.records {
+				c.enqueueReplicationRecord(record)
+			}
 		}
 	}
 }
@@ -317,7 +320,10 @@ func (c *Cluster) persistReplication(node Node, query string) ([]byte, error) {
 
 func (c *Cluster) enqueueReplicationRecord(record replicationRecord) {
 	q := c.getReplicationQueue(record.node)
-	q.ch <- record
+	select {
+	case q.ch <- record:
+	case <-c.done:
+	}
 }
 
 func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
@@ -335,7 +341,7 @@ func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
 	}
 
 	for i := 0; i < asyncReplicationWorkersPerNode; i++ {
-		go c.replicationWorker(q)
+		c.startWorker(func() { c.replicationWorker(q) })
 	}
 	return q
 }
@@ -343,14 +349,17 @@ func (c *Cluster) getReplicationQueue(node Node) *replicationQueue {
 func (c *Cluster) replicationWorker(q *replicationQueue) {
 	batch := make([]replicationRecord, 0, asyncReplicationBatchSize)
 	timer := time.NewTimer(asyncReplicationBatchWait)
+	defer timer.Stop()
 	if !timer.Stop() {
 		<-timer.C
 	}
 
 	for {
-		record, ok := <-q.ch
-		if !ok {
+		var record replicationRecord
+		select {
+		case <-c.done:
 			return
+		case record = <-q.ch:
 		}
 		batch = append(batch, record)
 		timer.Reset(asyncReplicationBatchWait)
@@ -358,6 +367,8 @@ func (c *Cluster) replicationWorker(q *replicationQueue) {
 	drain:
 		for len(batch) < asyncReplicationBatchSize {
 			select {
+			case <-c.done:
+				return
 			case record, ok := <-q.ch:
 				if !ok {
 					return
@@ -384,6 +395,16 @@ func (c *Cluster) sendReplicationBatch(node Node, records []replicationRecord) {
 		return
 	}
 
+	// Bound each network frame even when individual commands are large.
+	size := 0
+	for i, record := range records {
+		if i > 0 && size+len(record.query)+1 > 8<<20 {
+			c.sendReplicationBatch(node, records[:i])
+			c.sendReplicationBatch(node, records[i:])
+			return
+		}
+		size += len(record.query) + 1
+	}
 	queries := make([]string, 0, len(records))
 	keys := make([][]byte, 0, len(records))
 	for _, record := range records {
@@ -395,7 +416,14 @@ func (c *Cluster) sendReplicationBatch(node Node, records []replicationRecord) {
 
 	line := queries[0]
 	if len(queries) == 1 {
-		c.sendReplicationLineWithRetry(node, line)
+		if !c.sendReplicationLineWithRetry(node, line) {
+			return
+		}
+		for _, record := range records {
+			if record.ack != nil {
+				record.ack <- node.ID
+			}
+		}
 		if c.outbox != nil {
 			c.outbox.deleteBatch(keys)
 		}
@@ -403,19 +431,26 @@ func (c *Cluster) sendReplicationBatch(node Node, records []replicationRecord) {
 	}
 
 	line = "REPL_BATCH " + strings.Join(queries, replicationBatchSeparator)
-	c.sendReplicationLineWithRetry(node, line)
+	if !c.sendReplicationLineWithRetry(node, line) {
+		return
+	}
+	for _, record := range records {
+		if record.ack != nil {
+			record.ack <- node.ID
+		}
+	}
 	if c.outbox != nil {
 		c.outbox.deleteBatch(keys)
 	}
 }
 
-func (c *Cluster) sendReplicationLineWithRetry(node Node, line string) {
+func (c *Cluster) sendReplicationLineWithRetry(node Node, line string) bool {
 	delay := replicationRetryInitialDelay
 	attempt := 0
 	for {
 		if data, err := c.pool.Send(node, line); err == nil {
 			if err := replicationResponseError(data); err == nil {
-				return
+				return true
 			} else {
 				attempt++
 				if attempt == 1 || attempt%100 == 0 {
@@ -429,7 +464,11 @@ func (c *Cluster) sendReplicationLineWithRetry(node Node, line string) {
 			}
 		}
 
-		time.Sleep(delay)
+		select {
+		case <-c.done:
+			return false
+		case <-time.After(delay):
+		}
 		if delay < replicationRetryMaxDelay {
 			delay *= 2
 			if delay > replicationRetryMaxDelay {
@@ -455,56 +494,48 @@ func replicationResponseError(data []byte) error {
 
 // ReplicateQuorum — warte bis majority replicas geschrieben haben
 func (c *Cluster) ReplicateQuorum(metric, query string) error {
+	if err := c.waitRecovery(); err != nil {
+		return err
+	}
 	replicas := c.GetReplicaNodes(metric)
-	if len(replicas) == 0 {
-		return nil // single node, kein quorum nötig
+	needed := c.GetReplicationFactor() / 2
+	if len(replicas) < needed {
+		return fmt.Errorf("not enough available nodes for configured quorum")
 	}
-
-	// majority = mehr als die hälfte aller nodes (inkl. primary der schon geschrieben hat)
-	totalNodes := len(replicas) + 1 // +1 für primary
-	majority := totalNodes/2 + 1
-	needed := majority - 1 // primary hat schon geschrieben
-
-	results := make(chan ReplicationResult, len(replicas))
-	var wg sync.WaitGroup
-
-	for _, replica := range replicas {
-		wg.Add(1)
-		go func(node Node) {
-			defer wg.Done()
-			_, err := c.pool.Send(node, query)
-			results <- ReplicationResult{
-				NodeID:  node.ID,
-				Success: err == nil,
-				Error:   err,
-			}
-		}(replica)
+	if needed == 0 {
+		return c.replicateAsyncBatch([]ReplicationItem{{Metric: metric, Query: query}})
 	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// warte bis genug replicas geantwortet haben
-	succeeded := 0
-	failed := 0
-	maxFail := len(replicas) - needed
-
-	for r := range results {
-		if r.Success {
-			succeeded++
-			if succeeded >= needed {
-				return nil // quorum erreicht
-			}
-		} else {
-			failed++
-			log.Printf("quorum replication to %s failed: %v", r.NodeID, r.Error)
-			if failed > maxFail {
-				return fmt.Errorf("quorum not reached: %d/%d replicas failed", failed, len(replicas))
-			}
+	ack := make(chan string, len(replicas))
+	records := make([]replicationRecord, len(replicas))
+	for i, node := range replicas {
+		records[i] = replicationRecord{node: node, query: query, ack: ack}
+	}
+	if c.outbox != nil {
+		keys, err := c.outbox.putBatch(records)
+		if err != nil {
+			return err
+		}
+		for i := range records {
+			records[i].outboxKey = keys[i]
 		}
 	}
-
+	// Quorum uses the same ordered delivery path as async replication, so a SET
+	// cannot overtake an earlier increment just because it requests a quorum.
+	if err := c.enqueueFanout(metric, records); err != nil {
+		return err
+	}
+	timer := time.NewTimer(poolRequestTimeout)
+	defer timer.Stop()
+	for succeeded := 0; succeeded < needed; {
+		select {
+		case <-ack:
+			succeeded++
+		case <-timer.C:
+			return fmt.Errorf("quorum timeout (outcome unknown; delivery remains pending)")
+		case <-c.done:
+			return ErrServerBusy
+		}
+	}
 	return nil
 }
 
@@ -535,4 +566,16 @@ func (c *Cluster) ReplicationStats() ReplicationStats {
 		return true
 	})
 	return stats
+}
+
+func (c *Cluster) waitRecovery() error {
+	if c.recoveryDone == nil {
+		return nil
+	}
+	select {
+	case <-c.recoveryDone:
+		return nil
+	case <-c.done:
+		return ErrServerBusy
+	}
 }

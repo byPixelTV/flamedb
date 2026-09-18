@@ -13,7 +13,8 @@ export interface FlameDBConfig {
 }
 
 export interface Event {
-  timestamp: number; // unix nanoseconds
+  timestamp: number; // compatibility field; may lose nanosecond precision
+  timestampNs?: bigint; // exact value on supported Node.js runtimes
   metric: string;
   value: number;
   tags?: Record<string, string>;
@@ -31,6 +32,7 @@ export interface GroupLeaderboardEntry {
 
 export interface SeriesPoint {
   ts: number;
+  tsNs?: bigint;
   value: number;
   count: number;
 }
@@ -61,7 +63,7 @@ export interface BatchResult {
 export interface WriteOptions {
   leaderboardEntity?: string;
   tags?: Record<string, string>;
-  timestampNs?: number;
+  timestampNs?: number | bigint;
   quorum?: boolean;
 }
 
@@ -102,121 +104,100 @@ export interface WriteBatchItem {
 // ─── Connection ────────────────────────────────────────────────────────────────
 
 class FlameConnection {
-  private socket: net.Socket;
+  private socket = new net.Socket();
   private buffer = "";
-  private queue: Array<{
-    resolve: (line: string) => void;
-    reject: (err: Error) => void;
-  }> = [];
-  private authenticated = false;
-  private connectPromise: Promise<void>;
+  private inbox: string[] = [];
+  private queue: Array<{ resolve: (line: string) => void; reject: (err: Error) => void }> = [];
+  private failure: Error | null = null;
+  private readyPromise: Promise<void>;
 
-  constructor(
-    private config: Required<FlameDBConfig>,
-  ) {
-    this.socket = new net.Socket();
-    this.connectPromise = this.connect();
-  }
-
-  private connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.socket.connect(this.config.port, this.config.host, () => {
-        resolve();
-      });
-
-      this.socket.on("data", (chunk) => {
-        this.buffer += chunk.toString();
-        const lines = this.buffer.split("\n");
-        this.buffer = lines.pop()!;
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          const pending = this.queue.shift();
-          if (pending) pending.resolve(trimmed);
-        }
-      });
-
-      this.socket.on("error", (err) => {
-        reject(err);
-        // drain pending
-        for (const p of this.queue) p.reject(err);
-        this.queue = [];
-      });
-
-      this.socket.on("close", () => {
-        const err = new Error("FlameDB connection closed");
-        for (const p of this.queue) p.reject(err);
-        this.queue = [];
-      });
+  constructor(private config: Required<FlameDBConfig>) {
+    if (!Number.isInteger(config.timeout) || config.timeout <= 0 || !Number.isInteger(config.pipelineSize) || config.pipelineSize < 1) throw new Error("Invalid connection limits");
+    validateLine(config.apiKey);
+    this.socket.setEncoding("utf8");
+    this.socket.on("data", (chunk: string) => {
+      this.buffer += chunk;
+      if (this.buffer.length > 64 * 1024 * 1024) { this.fail(new Error("FlameDB response too large")); return; }
+      let end: number;
+      while ((end = this.buffer.indexOf("\n")) >= 0) {
+        const line = this.buffer.slice(0, end).trim();
+        this.buffer = this.buffer.slice(end + 1);
+        if (!line) continue;
+        const pending = this.queue.shift();
+        if (pending) pending.resolve(line);
+        else if (this.inbox.length < 2) this.inbox.push(line);
+        else { this.fail(new Error("Unexpected FlameDB response")); return; }
+      }
     });
+    this.socket.on("error", (err) => this.fail(err));
+    this.socket.on("close", () => this.fail(new Error("FlameDB connection closed")));
+    this.readyPromise = this.handshake();
   }
 
-  async ready(): Promise<void> {
-    await this.connectPromise;
-    if (this.authenticated) return;
-
-    // expect {"auth":"required"}
-    const challenge = await this.recv();
-    const parsed = JSON.parse(challenge);
-    if (parsed.auth !== "required") {
-      throw new Error(`Unexpected auth challenge: ${challenge}`);
-    }
-
-    this.send(`AUTH ${this.config.apiKey}`);
-    const resp = await this.recv();
-    const authResp = JSON.parse(resp);
-    if (authResp.auth !== "ok") {
-      throw new Error(`Auth failed: ${authResp.error ?? resp}`);
-    }
-    this.authenticated = true;
-  }
-
-  send(line: string): void {
-    this.socket.write(line + "\n");
-  }
-
-  recv(): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const idx = this.queue.findIndex((q) => q.resolve === resolve);
-        if (idx !== -1) this.queue.splice(idx, 1);
-        reject(new Error("FlameDB command timeout"));
-      }, this.config.timeout);
-
-      this.queue.push({
-        resolve: (line) => {
-          clearTimeout(timer);
-          resolve(line);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      });
-    });
-  }
-
-  async command(line: string): Promise<unknown> {
-    await this.ready();
-    this.send(line);
-    const raw = await this.recv();
-    const parsed = JSON.parse(raw);
-    if (parsed.error) throw new Error(parsed.error);
-    return parsed;
-  }
-
-  async multilineCommand(lines: string[]): Promise<unknown> {
-    await this.ready();
-    for (const l of lines) this.send(l);
-    const raw = await this.recv();
-    const parsed = JSON.parse(raw);
-    if (parsed.error) throw new Error(parsed.error);
-    return parsed;
-  }
-
-  destroy(): void {
+  private fail(err: Error): void {
+    this.failure ??= err;
+    for (const pending of this.queue.splice(0)) pending.reject(this.failure);
+    this.inbox = [];
     this.socket.destroy();
   }
+
+  private async handshake(): Promise<void> {
+    try {
+      // Register before connecting: an immediate server greeting must not be lost.
+      const challenge = this.recv();
+      this.socket.connect(this.config.port, this.config.host);
+      if (JSON.parse(await challenge).auth !== "required") throw new Error("Unexpected auth challenge");
+      const response = this.recv();
+      this.socket.write(`AUTH ${this.config.apiKey}\n`);
+      const auth = JSON.parse(await response);
+      if (auth.auth !== "ok") throw new Error(`Auth failed: ${auth.error ?? "invalid response"}`);
+    } catch (err) { this.fail(err as Error); throw err; }
+  }
+
+  ready(): Promise<void> { return this.readyPromise; }
+
+  private recv(): Promise<string> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.inbox.length) return Promise.resolve(this.inbox.shift()!);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this.fail(new Error("FlameDB command timeout; outcome unknown")), this.config.timeout);
+      this.queue.push({
+        resolve: (line) => { clearTimeout(timer); resolve(line); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+      });
+    });
+  }
+
+  command(line: string): Promise<unknown> { return this.multilineCommand([line]); }
+
+  async multilineCommand(lines: string[]): Promise<unknown> {
+    for (const line of lines) validateLine(line);
+    await this.ready();
+    if (this.failure) throw this.failure;
+    if (this.queue.length >= this.config.pipelineSize) throw new Error("FlameDB pipeline is full");
+    const response = this.recv();
+    this.socket.write(lines.join("\n") + "\n");
+    let parsed: any;
+    try { parsed = JSON.parse(await response, function (key: string, value: unknown, context?: { source: string }) {
+        if ((key === "timestamp" || key === "ts") && typeof value === "number" && context?.source) {
+          this[key === "timestamp" ? "timestampNs" : "tsNs"] = BigInt(context.source);
+        }
+        return value;
+      }); } catch (err) { this.fail(err as Error); throw err; }
+    if (parsed.error) throw new Error(parsed.error);
+    return parsed;
+  }
+
+  destroy(): void { this.fail(new Error("FlameDB connection closed")); }
+}
+
+function validateLine(line: string): void {
+  if (/[\r\n\x00\x1f]/.test(line)) throw new Error("Invalid command framing");
+}
+
+function identifier(value: string): string {
+  if (!value || /[\s:=",]/.test(value)) throw new Error("Invalid identifier");
+  return value;
 }
 
 // ─── FlameDB Client ──────────────────────────────────────────────────────────
@@ -258,14 +239,14 @@ export class FlameDB {
     value: number,
     options: WriteOptions = {},
   ): Promise<void> {
-    const parts: string[] = [`WRITE ${metric} ${value}`];
+    const parts: string[] = [`WRITE ${identifier(metric)} ${finite(value)}`];
 
     if (options.leaderboardEntity !== undefined) {
-      parts.push(`lb="${options.leaderboardEntity}"`);
+      parts.push(`lb=${JSON.stringify(options.leaderboardEntity)}`);
     }
     if (options.tags) {
       for (const [k, v] of Object.entries(options.tags)) {
-        parts.push(`${k}="${v}"`);
+        parts.push(`${identifier(k)}=${JSON.stringify(v)}`);
       }
     }
     if (options.timestampNs !== undefined) {
@@ -282,14 +263,14 @@ export class FlameDB {
   async writeBatch(items: WriteBatchItem[]): Promise<BatchResult> {
     const lines = ["WRITE_BATCH"];
     for (const item of items) {
-      const parts: string[] = [`WRITE ${item.metric} ${item.value}`];
+      const parts: string[] = [`WRITE ${identifier(item.metric)} ${finite(item.value)}`];
       const opts = item.options ?? {};
       if (opts.leaderboardEntity !== undefined) {
-        parts.push(`lb="${opts.leaderboardEntity}"`);
+        parts.push(`lb=${JSON.stringify(opts.leaderboardEntity)}`);
       }
       if (opts.tags) {
         for (const [k, v] of Object.entries(opts.tags)) {
-          parts.push(`${k}="${v}"`);
+          parts.push(`${identifier(k)}=${JSON.stringify(v)}`);
         }
       }
       if (opts.timestampNs !== undefined) parts.push(`ts=${opts.timestampNs}`);
@@ -309,8 +290,8 @@ export class FlameDB {
     value: number,
     leaderboardEntity?: string,
   ): Promise<void> {
-    let cmd = `SET ${metric} ${value}`;
-    if (leaderboardEntity !== undefined) cmd += ` lb="${leaderboardEntity}"`;
+    let cmd = `SET ${identifier(metric)} ${finite(value)}`;
+    if (leaderboardEntity !== undefined) cmd += ` lb=${JSON.stringify(leaderboardEntity)}`;
     await this.getConn().command(cmd);
   }
 
@@ -320,9 +301,9 @@ export class FlameDB {
     metric: string,
     options: { leaderboardEntity?: string; from?: Date; to?: Date } = {},
   ): Promise<void> {
-    const parts = [`DELETE ${metric}`];
+    const parts = [`DELETE ${identifier(metric)}`];
     if (options.leaderboardEntity !== undefined) {
-      parts.push(`lb="${options.leaderboardEntity}"`);
+      parts.push(`lb=${JSON.stringify(options.leaderboardEntity)}`);
     }
     if (options.from) parts.push(`FROM ${fmtDate(options.from)}`);
     if (options.to) parts.push(`TO ${fmtDate(options.to)}`);
@@ -335,12 +316,12 @@ export class FlameDB {
     metrics: string | string[],
     options: GetOptions = {},
   ): Promise<GetResult> {
-    const metricStr = Array.isArray(metrics) ? metrics.join(",") : metrics;
+    const metricStr = Array.isArray(metrics) ? metrics.map(identifier).join(",") : identifier(metrics);
     const parts = [`GET ${metricStr}`];
 
     if (options.where && Object.keys(options.where).length > 0) {
       const clauses = Object.entries(options.where)
-        .map(([k, v]) => `${k}="${v}"`)
+        .map(([k, v]) => `${identifier(k)}=${JSON.stringify(v)}`)
         .join(" AND ");
       parts.push(`WHERE ${clauses}`);
     }
@@ -359,13 +340,13 @@ export class FlameDB {
     metric: string,
     options: LeaderboardOptions = {},
   ): Promise<LeaderboardEntry[]> {
-    const parts = [`LEADERBOARD ${metric}`];
+    const parts = [`LEADERBOARD ${identifier(metric)}`];
     if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`);
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
     const result = (await this.getConn().command(parts.join(" "))) as {
       leaderboard: LeaderboardEntry[];
     };
-    return result.leaderboard ?? [];
+    return (result.leaderboard ?? []).map((entry: any) => ({ entity_id: entry.entity_id, score: entry.value }));
   }
 
   // ─── Group Leaderboard ───────────────────────────────────────────────────────
@@ -375,23 +356,23 @@ export class FlameDB {
     groups: GroupDef[],
     options: LeaderboardOptions = {},
   ): Promise<GroupLeaderboardEntry[]> {
-    const parts = [`GROUP_LEADERBOARD ${metric}`];
+    const parts = [`GROUP_LEADERBOARD ${identifier(metric)}`];
     for (const g of groups) {
-      parts.push(`GROUP "${g.name}:${g.members.join(",")}"`);
+      parts.push(`GROUP ${JSON.stringify(`${g.name}:${g.members.join(",")}`)}`);
     }
     if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`);
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
     const result = (await this.getConn().command(parts.join(" "))) as {
       leaderboard: GroupLeaderboardEntry[];
     };
-    return result.leaderboard ?? [];
+    return (result.leaderboard ?? []).map((entry: any) => ({ group: entry.entity_id, score: entry.value }));
   }
 
   // ─── Stats ───────────────────────────────────────────────────────────────────
 
   async stats(metric: string, tags: string[]): Promise<StatsResult> {
-    const cmd = `STATS ${metric} TAGS ${tags.join(" ")}`;
-    return (await this.getConn().command(cmd)) as StatsResult;
+    const cmd = `STATS ${identifier(metric)} TAGS ${tags.map(identifier).join(" ")}`;
+    return ((await this.getConn().command(cmd)) as { stats: StatsResult }).stats;
   }
 }
 
@@ -402,3 +383,8 @@ function fmtDate(d: Date): string {
 }
 
 export default FlameDB;
+
+function finite(value: number): number {
+  if (!Number.isFinite(value)) throw new Error("Value must be finite");
+  return value;
+}

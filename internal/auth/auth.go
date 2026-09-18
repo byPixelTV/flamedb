@@ -5,8 +5,9 @@ import "github.com/byPixelTV/flamedb/internal/config"
 type Permission string
 
 const (
-	PermRead  Permission = "read"
-	PermWrite Permission = "write"
+	PermInternal Permission = "internal"
+	PermRead     Permission = "read"
+	PermWrite    Permission = "write"
 )
 
 type Session struct {
@@ -29,6 +30,9 @@ func New(cfg config.AuthConfig) *Auth {
 			Name:        k.Name,
 			Permissions: perms,
 		}
+	}
+	if cfg.EffectiveInternalKey() != "" {
+		a.keys[cfg.EffectiveInternalKey()] = &Session{Name: "cluster", Permissions: map[Permission]bool{PermRead: true, PermWrite: true, PermInternal: true}}
 	}
 	return a
 }

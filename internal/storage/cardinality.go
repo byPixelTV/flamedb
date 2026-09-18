@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // key format: card:metric:tagkey:tagvalue → count
@@ -78,15 +78,15 @@ func (s *Storage) GetCardinality(metric, tagKey string) uint64 {
 	return s.getCardCount(cardCountKey(metric, tagKey))
 }
 
-// BestIndexTag gibt den tag mit der niedrigsten cardinality zurück
-// niedrige cardinality = selektivster filter = bester primary index tag
+// BestIndexTag prefers higher distinct-value counts as a selectivity heuristic.
+// Actual value frequencies may be skewed; this is not an exact cost estimate.
 func (s *Storage) BestIndexTag(metric string, tags map[string]string) (string, string) {
 	var bestKey, bestVal string
-	var bestCard uint64 = ^uint64(0) // max uint64
+	var bestCard uint64
 
 	for k, v := range tags {
 		card := s.GetCardinality(metric, k)
-		if card < bestCard {
+		if bestKey == "" || card > bestCard || (card == bestCard && k < bestKey) {
 			bestCard = card
 			bestKey = k
 			bestVal = v

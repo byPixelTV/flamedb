@@ -1,3 +1,5 @@
+> **Upgrade-Hinweis:** Diese Version migriert alte Pebble-Datenbanken beim Start automatisch und behält vorher einen lokalen Checkpoint unter `<data_path>.pre-v2-*/db`. Der Datenpfad bleibt unverändert. Für Cluster wird weiterhin ein getrennter interner Schlüssel benötigt. Vor dem Wechsel einer bestehenden Installation bitte [Audit und Upgrade-Anleitung](AUDIT_2026-09-18.md) lesen.
+
 <div align="center">
   <h1>FlameDB</h1>
   <p><strong>Fast, lightweight event + time-series database with first-class leaderboards.</strong></p>

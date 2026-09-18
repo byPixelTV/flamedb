@@ -26,7 +26,6 @@ func NewLeaderboardCache(ttl time.Duration) *LeaderboardCache {
 		ttl:     ttl,
 		entries: make(map[string]*cacheEntry),
 	}
-	go c.cleanup()
 	return c
 }
 
@@ -49,6 +48,9 @@ func (c *LeaderboardCache) Set(metric string, limit, offset int, entries []types
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if len(c.entries) >= 4096 {
+		clear(c.entries)
+	}
 	c.entries[cacheKey(metric, limit, offset)] = &cacheEntry{
 		entries:   entries,
 		expiresAt: time.Now().Add(c.ttl),

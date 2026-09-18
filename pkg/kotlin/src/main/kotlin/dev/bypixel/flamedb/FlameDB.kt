@@ -13,6 +13,8 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.net.Socket
+import java.net.InetSocketAddress
+import kotlinx.serialization.encodeToString
 import java.time.LocalDate
 
 /**
@@ -48,12 +50,16 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     // ─── Connection ───────────────────────────────────────────────────────────
 
     private fun dial() {
-        socket = Socket(cfg.host, cfg.port).also {
-            it.soTimeout = cfg.timeoutMs
-        }
-        reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-        writer = PrintWriter(socket.getOutputStream(), true)
-        performAuth()
+        require(cfg.timeoutMs > 0) { "timeoutMs must be positive" }
+        require(!cfg.apiKey.contains('\n') && !cfg.apiKey.contains('\r')) { "invalid API key" }
+        socket = Socket()
+        try {
+            socket.connect(InetSocketAddress(cfg.host, cfg.port), cfg.timeoutMs)
+            socket.soTimeout = cfg.timeoutMs
+            reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            writer = PrintWriter(socket.getOutputStream(), false, Charsets.UTF_8)
+            performAuth()
+        } catch (error: Exception) { socket.close(); throw error }
     }
 
     private fun performAuth() {
@@ -64,6 +70,8 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         }
 
         sendLine("AUTH ${cfg.apiKey}")
+        writer.flush()
+        check(!writer.checkError()) { "FlameDB write failed" }
 
         val resp = readLine()
         val authResp = json.parseToJsonElement(resp).jsonObject
@@ -76,16 +84,23 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     private fun readLine(): String =
         reader.readLine() ?: throw FlameDBException("FlameDB connection closed")
 
-    private fun sendLine(line: String) = writer.println(line)
+    private fun sendLine(line: String) {
+        require(!line.contains('\n') && !line.contains('\r') && !line.contains('\u001f')) { "invalid command framing" }
+        writer.println(line)
+    }
 
     /**
      * Sends [lines] and reads one JSON response. Throws [FlameDBException] on
      * server-side errors.
      */
     private fun rawCommand(lines: List<String>): JsonObject {
-        lines.forEach { sendLine(it) }
-        val raw = readLine()
-        val obj = json.parseToJsonElement(raw).jsonObject
+        lines.forEach { require(!it.contains('\n') && !it.contains('\r') && !it.contains('\u001f')) { "invalid command framing" } }
+        val obj = try {
+            lines.forEach { sendLine(it) }
+            writer.flush()
+            check(!writer.checkError()) { "FlameDB write failed" }
+            json.parseToJsonElement(readLine()).jsonObject
+        } catch (error: Exception) { socket.close(); throw error }
         val err = obj["error"]?.jsonPrimitive?.content
         if (err != null) throw FlameDBException(err)
         return obj
@@ -129,9 +144,10 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     private fun buildWrite(metric: String, value: Double, opts: WriteOptions): String =
         buildString {
-            append("WRITE $metric $value")
-            opts.leaderboardEntity?.let { append(""" lb="$it"""") }
-            opts.tags.forEach { (k, v) -> append(""" $k="$v"""") }
+            require(value.isFinite()) { "value must be finite" }
+            append("WRITE ${identifier(metric)} $value")
+            opts.leaderboardEntity?.let { append(" lb=${json.encodeToString(it)}") }
+            opts.tags.forEach { (k, v) -> append(" ${identifier(k)}=${json.encodeToString(v)}") }
             opts.timestampNs?.let { append(" ts=$it") }
             if (opts.quorum) append(" QUORUM")
         }
@@ -143,8 +159,9 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
      */
     suspend fun set(metric: String, value: Double, leaderboardEntity: String? = null) {
         val cmd = buildString {
-            append("SET $metric $value")
-            leaderboardEntity?.let { append(""" lb="$it"""") }
+            require(value.isFinite()) { "value must be finite" }
+            append("SET ${identifier(metric)} $value")
+            leaderboardEntity?.let { append(" lb=${json.encodeToString(it)}") }
         }
         command(cmd)
     }
@@ -162,8 +179,8 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         to: LocalDate? = null,
     ) {
         val cmd = buildString {
-            append("DELETE $metric")
-            leaderboardEntity?.let { append(""" lb="$it"""") }
+            append("DELETE ${identifier(metric)}")
+            leaderboardEntity?.let { append(" lb=${json.encodeToString(it)}") }
             from?.let { append(" FROM $it") }
             to?.let { append(" TO $it") }
         }
@@ -176,11 +193,16 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
      * Sends a GET command and returns the raw events (or aggregated result).
      */
     suspend fun get(vararg metrics: String, options: GetOptions = GetOptions()): GetResult {
+        require(metrics.isNotEmpty()) { "at least one metric is required" }
+        return getWithSpec(metrics.joinToString(",") { identifier(it) }, options)
+    }
+
+    private suspend fun getWithSpec(metricSpec: String, options: GetOptions): GetResult {
         val cmd = buildString {
-            append("GET ${metrics.joinToString(",")}")
+            append("GET $metricSpec")
 
             if (options.where.isNotEmpty()) {
-                val clauses = options.where.entries.joinToString(" AND ") { (k, v) -> """$k="$v"""" }
+                val clauses = options.where.entries.joinToString(" AND ") { (k, v) -> "${identifier(k)}=${json.encodeToString(v)}" }
                 append(" WHERE $clauses")
             }
             options.from?.let { append(" FROM $it") }
@@ -199,7 +221,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         groupBy: String? = null,
     ): String {
         require(metrics.isNotEmpty()) { "at least one metric is required" }
-        val base = metrics.joinToString(",")
+        val base = metrics.joinToString(",") { identifier(it) }
         val aggPart = aggregate?.let { " $it" } ?: ""
         val groupPart = groupBy?.let { " GROUP BY $it" } ?: ""
         return base + aggPart + groupPart
@@ -212,7 +234,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         options: GetOptions = GetOptions(),
     ): GetResult {
         val metricSpec = buildMetricSpec(metrics, aggregate = aggregate)
-        return get(metricSpec, options = options)
+        return getWithSpec(metricSpec, options)
     }
 
     /** GET with time buckets (GROUP BY). Aggregate is optional; default is SUM. */
@@ -223,7 +245,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         options: GetOptions = GetOptions(),
     ): GetResult {
         val metricSpec = buildMetricSpec(metrics, aggregate = aggregate, groupBy = groupBy)
-        return get(metricSpec, options = options)
+        return getWithSpec(metricSpec, options)
     }
 
     suspend fun getSum(vararg metrics: String, options: GetOptions = GetOptions()): GetResult =
@@ -252,10 +274,10 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         }
 
         val cmd = buildString {
-            append("LEADERBOARD $metric")
+            append("LEADERBOARD ${identifier(metric)}")
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
-            if (windowed) options.entityTag?.let { append(" ENTITY $it") }
+            if (windowed) options.entityTag?.let { append(" ENTITY ${identifier(it)}") }
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
         }
@@ -282,12 +304,12 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
         }
 
         val cmd = buildString {
-            append("GROUP_LEADERBOARD $metric")
+            append("GROUP_LEADERBOARD ${identifier(metric)}")
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
-            if (windowed) options.entityTag?.let { append(" ENTITY $it") }
+            if (windowed) options.entityTag?.let { append(" ENTITY ${identifier(it)}") }
             groups.forEach { g ->
-                append(""" GROUP "${g.name}:${g.members.joinToString(",")}"""")
+                append(" GROUP ${json.encodeToString(g.name + ":" + g.members.joinToString(","))}")
             }
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
@@ -303,9 +325,13 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
      * Sends a STATS command.
      */
     suspend fun stats(metric: String, vararg tags: String): StatsResult {
-        val cmd = "STATS $metric TAGS ${tags.joinToString(" ")}"
+        val cmd = "STATS ${identifier(metric)} TAGS ${tags.joinToString(" ") { identifier(it) }}"
         val resp = command(cmd)
-        return json.decodeFromJsonElement(resp)
+        return json.decodeFromJsonElement(resp["stats"] ?: throw FlameDBException("missing stats"))
+    }
+
+    private fun identifier(value: String): String {
+        require(value.isNotEmpty() && value.none { it.isWhitespace() || it in ":=\"," }) { "invalid identifier" }; return value
     }
 }
 

@@ -5,7 +5,7 @@ import (
 	"sort"
 
 	"github.com/byPixelTV/flamedb/internal/types"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 // WindowedLeaderboard berechnet einen Leaderboard on-the-fly direkt aus dem
@@ -76,7 +76,9 @@ func (s *Storage) WindowedLeaderboard(
 			continue
 		}
 
-		sums[entityID] += e.Value
+		if e.Tags[entityTag] == entityID {
+			sums[entityID] += e.Value
+		}
 	}
 	if err := iter.Error(); err != nil {
 		return nil, err
@@ -139,7 +141,9 @@ func (s *Storage) WindowedEntitySums(
 			if err != nil {
 				continue
 			}
-			sum += e.Value
+			if e.Tags[entityTag] == entityID {
+				sum += e.Value
+			}
 		}
 		iterErr := iter.Error()
 		iter.Close()

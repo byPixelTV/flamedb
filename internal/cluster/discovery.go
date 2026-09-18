@@ -69,6 +69,7 @@ func (c *Cluster) announceNodeToAddr(addr string, node Node, apiKey string) erro
 		return err
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Scan() // {"auth":"required"}
@@ -120,6 +121,7 @@ func (c *Cluster) announceToAddr(addr, apiKey string) error {
 		return err
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Scan() // {"auth":"required"}
@@ -154,12 +156,18 @@ func (c *Cluster) announceToAddr(addr, apiKey string) error {
 
 // heartbeat — nur nodes die bereits im ring sind
 func (c *Cluster) StartHeartbeat(apiKey string) {
-	go func() {
+	c.startWorker(func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(5 * time.Second)
-			c.pingAll(apiKey)
+			select {
+			case <-c.done:
+				return
+			case <-ticker.C:
+				c.pingAll(apiKey)
+			}
 		}
-	}()
+	})
 }
 
 func (c *Cluster) pingAll(apiKey string) {

@@ -2,24 +2,51 @@ package query
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 )
 
-func Parse(input string) (*Query, error) {
+func Parse(input string) (result *Query, err error) {
+	defer func() {
+		if err == nil && result != nil {
+			err = validateQuery(result)
+			if err != nil {
+				result = nil
+			}
+		}
+	}()
+	if strings.ContainsAny(input, "\r\n\x00\x1f") {
+		return nil, fmt.Errorf("invalid query framing or unterminated quote")
+	}
+	operationID := ""
+	if pos := strings.LastIndex(input, " __op="); pos >= 0 {
+		candidate := input[pos+6:]
+		if len(candidate) == 32 && strings.Trim(candidate, "0123456789abcdef") == "" {
+			operationID = candidate
+			input = input[:pos]
+		}
+	}
 	tokens := tokenize(input)
+	for _, token := range tokens {
+		if strings.Contains(token, `"`) {
+			if _, err := strconv.Unquote(token); err != nil {
+				return nil, fmt.Errorf("invalid quoted value")
+			}
+		}
+	}
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("empty query")
 	}
 
 	q := &Query{
-		Where:  make(map[string]string),
-		Tags:   make(map[string]string),
-		Limit:  10,
-		Offset: 0,
-		Order:  "DESC",
+		OperationID: operationID,
+		Where:       make(map[string]string),
+		Tags:        make(map[string]string),
+		Limit:       10,
+		Offset:      0,
+		Order:       "DESC",
 	}
 
 	switch strings.ToUpper(tokens[0]) {
@@ -50,11 +77,14 @@ func Parse(input string) (*Query, error) {
 		var groups []GroupDef
 		for i < len(tokens) {
 			switch strings.ToUpper(tokens[i]) {
+			case "__LOCAL":
+				q.ForceLocal = true
+				i++
 			case "GROUP":
 				if i+1 >= len(tokens) {
 					return nil, fmt.Errorf("missing GROUP spec")
 				}
-				spec := strings.Trim(tokens[i+1], `"`)
+				spec := tokenValue(tokens[i+1])
 				name, members, err := parseGroupSpec(spec)
 				if err != nil {
 					return nil, err
@@ -111,7 +141,7 @@ func Parse(input string) (*Query, error) {
 				if i+1 >= len(tokens) {
 					return nil, fmt.Errorf("missing ENTITY value")
 				}
-				q.EntityTag = strings.Trim(tokens[i+1], `"`)
+				q.EntityTag = tokenValue(tokens[i+1])
 				i += 2
 			default:
 				return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
@@ -153,12 +183,12 @@ func Parse(input string) (*Query, error) {
 
 			// rest braucht key = value format
 			if i+2 >= len(tokens) {
-				break
+				return nil, fmt.Errorf("incomplete WRITE argument")
 			}
 			if tokens[i+1] != "=" {
-				break
+				return nil, fmt.Errorf("expected =")
 			}
-			value := strings.Trim(tokens[i+2], `"`)
+			value := tokenValue(tokens[i+2])
 
 			switch key {
 			case "lb":
@@ -201,14 +231,14 @@ func Parse(input string) (*Query, error) {
 				i++
 				continue
 			}
-			if i+2 > len(tokens) {
-				break
+			if i+2 >= len(tokens) {
+				return nil, fmt.Errorf("incomplete SET argument")
 			}
 			key := tokens[i]
 			if i+1 >= len(tokens) || tokens[i+1] != "=" {
 				break
 			}
-			value := strings.Trim(tokens[i+2], `"`)
+			value := tokenValue(tokens[i+2])
 			if key == "lb" {
 				q.UpdateLB = true
 				q.LBEntityID = value
@@ -237,6 +267,9 @@ func Parse(input string) (*Query, error) {
 				q.ForceLocal = true
 				i++
 			case "FROM":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing FROM value")
+				}
 				ts, err := parseTimeValue(tokens[i+1])
 				if err != nil {
 					return nil, err
@@ -244,6 +277,9 @@ func Parse(input string) (*Query, error) {
 				q.From = ts
 				i += 2
 			case "TO":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing TO value")
+				}
 				ts, err := parseTimeValue(tokens[i+1])
 				if err != nil {
 					return nil, err
@@ -254,7 +290,7 @@ func Parse(input string) (*Query, error) {
 				// tag
 				if i+2 < len(tokens) && tokens[i+1] == "=" {
 					key := tokens[i]
-					value := strings.Trim(tokens[i+2], `"`)
+					value := tokenValue(tokens[i+2])
 					if key == "lb" {
 						q.UpdateLB = true
 						q.LBEntityID = value
@@ -307,7 +343,7 @@ func Parse(input string) (*Query, error) {
 			if i+2 >= len(tokens) {
 				return nil, fmt.Errorf("missing GROUP BY value")
 			}
-			spec := strings.Trim(tokens[i+2], `"`)
+			spec := tokenValue(tokens[i+2])
 			q.GroupBySpec = spec
 			dur, err := parseDurationSpec(spec)
 			if err != nil {
@@ -327,7 +363,7 @@ func Parse(input string) (*Query, error) {
 				if tokens[i+1] != "=" {
 					return nil, fmt.Errorf("expected = after %s", key)
 				}
-				value := strings.Trim(tokens[i+2], `"`)
+				value := tokenValue(tokens[i+2])
 				q.Where[key] = value
 				i += 3
 
@@ -397,7 +433,7 @@ func Parse(input string) (*Query, error) {
 			if i+1 >= len(tokens) {
 				return nil, fmt.Errorf("missing ENTITY value")
 			}
-			q.EntityTag = strings.Trim(tokens[i+1], `"`)
+			q.EntityTag = tokenValue(tokens[i+1])
 			i += 2
 		default:
 			return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
@@ -433,8 +469,19 @@ func tokenize(input string) []string {
 	var tokens []string
 	var current strings.Builder
 	inQuote := false
+	escaped := false
 
 	for _, ch := range input {
+		if escaped {
+			current.WriteRune(ch)
+			escaped = false
+			continue
+		}
+		if inQuote && ch == '\\' {
+			current.WriteRune(ch)
+			escaped = true
+			continue
+		}
 		switch {
 		case ch == '"':
 			inQuote = !inQuote
@@ -463,7 +510,7 @@ func tokenize(input string) []string {
 }
 
 func parseTimeValue(token string) (int64, error) {
-	token = strings.Trim(token, `"`)
+	token = tokenValue(token)
 	if strings.HasPrefix(token, "now") {
 		base := time.Now().UTC()
 		if token == "now" {
@@ -484,6 +531,9 @@ func parseTimeValue(token string) (int64, error) {
 		return applyCalendarOffset(base, d, op).UnixNano(), nil
 	}
 
+	if t, err := time.Parse(time.RFC3339Nano, token); err == nil {
+		return t.UnixNano(), nil
+	}
 	// fallback: YYYY-MM-DD
 	t, err := time.Parse("2006-01-02", token)
 	if err != nil {
@@ -527,70 +577,45 @@ func parseGroupSpec(spec string) (string, []string, error) {
 }
 
 func parseDurationSpec(spec string) (time.Duration, error) {
-	if spec == "" {
-		return 0, fmt.Errorf("invalid duration: empty")
+	d, err := parseCalendarSpec(spec)
+	return d.dur, err
+}
+
+func validateQuery(q *Query) error {
+	if q.Limit < 0 || q.Offset < 0 || q.Limit > 1000000 {
+		return fmt.Errorf("invalid pagination (LIMIT must be between 0 and 1000000)")
 	}
-
-	// If spec contains years or explicit months, treat "m" as months.
-	hasCalendar := strings.Contains(spec, "y") || strings.Contains(spec, "mo")
-
-	var total time.Duration
-	i := 0
-	for i < len(spec) {
-		j := i
-		for j < len(spec) && unicode.IsDigit(rune(spec[j])) {
-			j++
+	if q.Order != "ASC" && q.Order != "DESC" {
+		return fmt.Errorf("invalid ORDER")
+	}
+	if math.IsNaN(q.Value) || math.IsInf(q.Value, 0) {
+		return fmt.Errorf("value must be finite")
+	}
+	if q.Timestamp < 0 || q.From < 0 || q.To < 0 || (q.To != 0 && q.From > q.To) {
+		return fmt.Errorf("invalid time range")
+	}
+	for _, m := range append([]string{q.Metric}, q.Metrics...) {
+		if m == "" || strings.ContainsAny(m, ":,=\" \t\r\n") || m == "idx" || m == "lb" || m == "lb-entity" || m == "card" || m == "card-count" || m == "repl-applied" || m == "repl-outbox" {
+			return fmt.Errorf("invalid or reserved metric: %s", m)
 		}
-		if j == i {
-			return 0, fmt.Errorf("invalid duration: %s", spec)
-		}
-		num, err := strconv.Atoi(spec[i:j])
-		if err != nil {
-			return 0, fmt.Errorf("invalid number in duration: %s", spec)
-		}
-
-		unit := ""
-		// check "min" and "mo" before single-char units
-		if j+2 < len(spec) && spec[j:j+3] == "min" {
-			unit = "min"
-			j += 3
-		} else if j+1 < len(spec) && spec[j:j+2] == "mo" {
-			unit = "mo"
-			j += 2
-		} else {
-			unit = spec[j : j+1]
-			j++
-		}
-
-		switch unit {
-		case "y":
-			// calendar unit, encoded via GroupBySpec
-		case "mo":
-			// calendar unit, encoded via GroupBySpec
-		case "m":
-			if hasCalendar {
-				// "m" means month when calendar units are present
-			} else {
-				total += time.Duration(num) * time.Minute
+	}
+	for _, tags := range []map[string]string{q.Tags, q.Where} {
+		for k := range tags {
+			if k == "" || strings.ContainsAny(k, ":=\" \t") {
+				return fmt.Errorf("invalid tag key")
 			}
-		case "min":
-			total += time.Duration(num) * time.Minute
-		case "w":
-			total += time.Duration(num) * 7 * 24 * time.Hour
-		case "d":
-			total += time.Duration(num) * 24 * time.Hour
-		case "h":
-			total += time.Duration(num) * time.Hour
-		case "s":
-			total += time.Duration(num) * time.Second
-		default:
-			return 0, fmt.Errorf("invalid unit in duration: %s", unit)
 		}
-
-		i = j
 	}
-
-	return total, nil
+	if q.EntityTag != "" && strings.ContainsAny(q.EntityTag, ":=\" \t") {
+		return fmt.Errorf("invalid entity tag")
+	}
+	if q.Type == QueryTypeDelete && len(q.Tags) > 0 {
+		return fmt.Errorf("DELETE supports lb and time ranges only")
+	}
+	if q.Type == QueryTypeSet && (!q.UpdateLB || q.LBEntityID == "") {
+		return fmt.Errorf("SET requires lb")
+	}
+	return nil
 }
 
 func splitMetrics(s string) []string {
@@ -603,4 +628,14 @@ func splitMetrics(s string) []string {
 		}
 	}
 	return out
+}
+
+func tokenValue(token string) string {
+	if strings.HasPrefix(token, `"`) {
+		value, err := strconv.Unquote(token)
+		if err == nil {
+			return value
+		}
+	}
+	return token
 }

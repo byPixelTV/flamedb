@@ -21,9 +21,7 @@ func newCardCache(maxEntries int, ttl time.Duration) *cardCache {
 		maxEntries: maxEntries,
 		ttl:        ttl,
 	}
-	if ttl > 0 {
-		go c.cleanup()
-	}
+
 	return c
 }
 

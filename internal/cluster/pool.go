@@ -2,7 +2,9 @@ package cluster
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -22,13 +24,15 @@ type pooledConn struct {
 type ConnPool struct {
 	mu     sync.RWMutex
 	pools  map[string]*nodePool // nodeID → connections
+	closed bool
 	apiKey string
 }
 
 type nodePool struct {
-	mu    sync.Mutex
-	next  atomic.Uint64
-	conns []*pooledConn
+	closed bool
+	mu     sync.Mutex
+	next   atomic.Uint64
+	conns  []*pooledConn
 }
 
 func NewConnPool(apiKey string) *ConnPool {
@@ -40,6 +44,10 @@ func NewConnPool(apiKey string) *ConnPool {
 
 func (p *ConnPool) get(node Node) (*pooledConn, error) {
 	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("pool closed")
+	}
 	np, ok := p.pools[node.ID]
 	p.mu.RUnlock()
 
@@ -48,6 +56,10 @@ func (p *ConnPool) get(node Node) (*pooledConn, error) {
 	}
 
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool closed")
+	}
 	np, ok = p.pools[node.ID]
 	if !ok {
 		np = &nodePool{}
@@ -61,6 +73,9 @@ func (p *ConnPool) get(node Node) (*pooledConn, error) {
 func (np *nodePool) get(p *ConnPool, node Node) (*pooledConn, error) {
 	np.mu.Lock()
 	defer np.mu.Unlock()
+	if np.closed {
+		return nil, fmt.Errorf("pool closed")
+	}
 
 	if len(np.conns) >= connsPerNode {
 		idx := np.next.Add(1) % uint64(len(np.conns))
@@ -95,10 +110,20 @@ func (p *ConnPool) dial(node Node) (*pooledConn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("auth challenge failed: %v", scanner.Err())
 	}
-	fmt.Fprintf(conn, "AUTH %s\n", p.apiKey)
+	if _, err := fmt.Fprintf(conn, "AUTH %s\n", p.apiKey); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	if !scanner.Scan() { // {"auth":"ok"}
 		conn.Close()
 		return nil, fmt.Errorf("auth response failed: %v", scanner.Err())
+	}
+	var response struct {
+		Auth string `json:"auth"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &response); err != nil || response.Auth != "ok" {
+		conn.Close()
+		return nil, fmt.Errorf("cluster authentication failed")
 	}
 	_ = conn.SetDeadline(time.Time{})
 
@@ -121,12 +146,16 @@ func (p *ConnPool) Send(node Node, query string) ([]byte, error) {
 	if err != nil {
 		// connection tot, neu aufbauen
 		p.evictConn(node.ID, pc)
-		return p.sendFresh(node, query)
+		return nil, fmt.Errorf("upstream write failed (outcome unknown): %w", err)
 	}
 
 	if !pc.scanner.Scan() {
 		p.evictConn(node.ID, pc)
-		return p.sendFresh(node, query)
+		err := pc.scanner.Err()
+		if err == nil {
+			err = io.EOF
+		}
+		return nil, fmt.Errorf("upstream response failed (outcome unknown): %w", err)
 	}
 
 	return append([]byte(nil), pc.scanner.Bytes()...), nil
@@ -151,29 +180,19 @@ func (p *ConnPool) evictConn(nodeID string, dead *pooledConn) {
 	}
 }
 
-func (p *ConnPool) sendFresh(node Node, query string) ([]byte, error) {
-	pc, err := p.get(node)
-	if err != nil {
-		return nil, err
-	}
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	_ = pc.conn.SetDeadline(time.Now().Add(poolRequestTimeout))
-	defer pc.conn.SetDeadline(time.Time{})
-	fmt.Fprintf(pc.conn, "%s\n", query)
-	if !pc.scanner.Scan() {
-		return nil, fmt.Errorf("connection failed after retry")
-	}
-	return append([]byte(nil), pc.scanner.Bytes()...), nil
-}
-
 func (p *ConnPool) CloseAll() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, np := range p.pools {
+	p.closed = true
+	pools := p.pools
+	p.pools = make(map[string]*nodePool)
+	p.mu.Unlock()
+	for _, np := range pools {
+		np.mu.Lock()
+		np.closed = true
 		for _, pc := range np.conns {
 			pc.conn.Close()
 		}
+		np.conns = nil
+		np.mu.Unlock()
 	}
-	p.pools = make(map[string]*nodePool)
 }

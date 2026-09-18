@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 type cardEntry struct {
@@ -16,6 +16,7 @@ type cardEntry struct {
 
 type cardFlushRequest struct {
 	sync bool
+	stop bool
 	done chan error
 }
 
@@ -70,7 +71,7 @@ func (u *cardUpdater) Add(metric string, tags map[string]string) {
 	}
 
 	if shouldFlush {
-		u.signalFlush(false)
+		_ = u.Flush(false)
 	}
 }
 
@@ -107,17 +108,30 @@ func (u *cardUpdater) run() {
 			if req.done != nil {
 				req.done <- err
 			}
+			if req.stop {
+				return
+			}
 		}
 	}
 }
 
-func (u *cardUpdater) flush(sync bool) error {
+func (u *cardUpdater) flush(sync bool) (resultErr error) {
 	entries := u.drain()
 	if len(entries) == 0 {
 		return nil
 	}
 
+	defer func() {
+		if resultErr != nil {
+			u.mu.Lock()
+			defer u.mu.Unlock()
+			for _, e := range entries {
+				u.pending[cardCacheKey(e.metric, e.tagKey, e.tagValue)] = e
+			}
+		}
+	}()
 	batch := u.db.NewBatch()
+	defer batch.Close()
 	countBase := make(map[string]uint64)
 	countDelta := make(map[string]uint64)
 
@@ -137,16 +151,10 @@ func (u *cardUpdater) flush(sync bool) error {
 			}
 			countDelta[countKeyStr]++
 			batch.Set(ck, []byte{1}, nil)
-			if u.cache != nil {
-				u.cache.add(ckey)
-			}
 			continue
 		}
 		if err == nil {
 			closer.Close()
-			if u.cache != nil {
-				u.cache.add(ckey)
-			}
 			continue
 		}
 		return err
@@ -163,7 +171,15 @@ func (u *cardUpdater) flush(sync bool) error {
 	if sync {
 		opts = pebble.Sync
 	}
-	return batch.Commit(opts)
+	if err := batch.Commit(opts); err != nil {
+		return err
+	}
+	if u.cache != nil {
+		for _, e := range entries {
+			u.cache.add(cardCacheKey(e.metric, e.tagKey, e.tagValue))
+		}
+	}
+	return nil
 }
 
 func (u *cardUpdater) drain() []cardEntry {
@@ -193,4 +209,10 @@ func getCardCountFromDB(db *pebble.DB, countKey []byte) uint64 {
 		return 0
 	}
 	return binary.BigEndian.Uint64(data)
+}
+
+func (u *cardUpdater) Close() error {
+	done := make(chan error, 1)
+	u.flushCh <- cardFlushRequest{sync: true, stop: true, done: done}
+	return <-done
 }

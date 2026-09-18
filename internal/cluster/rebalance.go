@@ -48,9 +48,10 @@ func newRebalanceConn(addr, apiKey string) (*rebalanceConn, error) {
 		return nil, err
 	}
 
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	// 64MB buffer für große export responses
 	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 64*1024*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	writer := bufio.NewWriter(conn)
 
 	rc := &rebalanceConn{conn: conn, scanner: scanner, writer: writer}
@@ -73,6 +74,7 @@ func newRebalanceConn(addr, apiKey string) (*rebalanceConn, error) {
 }
 
 func (rc *rebalanceConn) send(msg string) ([]byte, error) {
+	_ = rc.conn.SetDeadline(time.Now().Add(30 * time.Second))
 	fmt.Fprintf(rc.writer, "%s\n", msg)
 	rc.writer.Flush()
 	if !rc.scanner.Scan() {
@@ -88,7 +90,11 @@ func (rc *rebalanceConn) close() {
 }
 
 func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
-	time.Sleep(2 * time.Second)
+	select {
+	case <-c.done:
+		return
+	case <-time.After(2 * time.Second):
+	}
 
 	c.Ring.mu.RLock()
 	nodes := make(map[string]Node)
@@ -107,7 +113,7 @@ func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
 		if node.ID == c.Self.ID {
 			continue
 		}
-		go c.rebalanceFromNode(node, store, apiKey)
+		c.startWorker(func() { c.rebalanceFromNode(node, store, apiKey) })
 	}
 }
 

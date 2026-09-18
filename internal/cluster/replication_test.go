@@ -3,7 +3,7 @@ package cluster
 import (
 	"testing"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 func TestReplicationOutboxPutBatchDelete(t *testing.T) {

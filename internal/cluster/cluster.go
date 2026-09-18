@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -19,6 +20,11 @@ const (
 const defaultReadPolicy = ReadPolicyLocal
 
 type Cluster struct {
+	done              chan struct{}
+	recoveryDone      chan struct{}
+	workersMu         sync.Mutex
+	workers           sync.WaitGroup
+	closed            bool
 	Self              Node
 	Ring              *Ring
 	failures          sync.Map
@@ -46,6 +52,7 @@ type routeInfo struct {
 
 func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster {
 	c := &Cluster{
+		done:              make(chan struct{}),
 		Self:              self,
 		Ring:              NewRing(replicas),
 		pool:              NewConnPool(apiKey),
@@ -197,6 +204,10 @@ func (c *Cluster) ForwardWithFailover(metric, apiKey, query string) ([]byte, err
 		result, err := c.pool.Send(node, query+" __local")
 		if err != nil {
 			lastErr = err
+			command := strings.ToUpper(strings.Fields(query)[0])
+			if command == "WRITE" || command == "SET" || command == "DELETE" {
+				return nil, err
+			}
 			log.Printf("forward to %s failed, trying next replica: %v", node.ID, err)
 			continue
 		}
@@ -264,9 +275,6 @@ func (c *Cluster) Knows(nodeID string) bool {
 }
 
 func (c *Cluster) getRoute(metric string) routeInfo {
-	if cached, ok := c.routeCache.Load(metric); ok {
-		return cached.(routeInfo)
-	}
 
 	nodes := c.Ring.GetN(metric, c.GetReplicationFactor())
 	info := routeInfo{nodes: nodes}
@@ -283,13 +291,42 @@ func (c *Cluster) getRoute(metric string) routeInfo {
 		info.replicas = append(info.replicas, node)
 	}
 
-	actual, _ := c.routeCache.LoadOrStore(metric, info)
-	return actual.(routeInfo)
+	return info
 }
 
 func (c *Cluster) invalidateRoutes() {
 	c.routeCache.Range(func(key, _ any) bool {
 		c.routeCache.Delete(key)
 		return true
+	})
+}
+
+func (c *Cluster) startWorker(fn func()) bool {
+	c.workersMu.Lock()
+	defer c.workersMu.Unlock()
+	if c.closed {
+		return false
+	}
+	c.workers.Add(1)
+	go func() { defer c.workers.Done(); fn() }()
+	return true
+}
+func (c *Cluster) Close() {
+	c.workersMu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.done)
+	}
+	c.workersMu.Unlock()
+	c.workers.Wait()
+	c.pool.CloseAll()
+}
+func (c *Cluster) StartDiscovery(seeds []string, apiKey string, store RebalanceStore) {
+	c.startWorker(func() {
+		c.JoinSeeds(seeds, apiKey)
+		c.StartHeartbeat(apiKey)
+		if len(seeds) > 0 {
+			c.TriggerRebalance(store, apiKey)
+		}
 	})
 }

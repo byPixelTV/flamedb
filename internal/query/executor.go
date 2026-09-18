@@ -6,16 +6,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
 	"github.com/byPixelTV/flamedb/internal/types"
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 )
 
 type Executor struct {
+	clock atomic.Int64
 	store *storage.Storage
 	lb    *aggregates.Leaderboard
 	cache *storage.LeaderboardCache
@@ -51,81 +52,59 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 
 func (e *Executor) ExecuteBatch(queries []*Query) (*BatchResult, error) {
 	result := &BatchResult{OK: true}
-	if len(queries) == 0 {
-		return result, nil
+	var events []storage.Event
+	var receipts []string
+	var indices []int
+	fail := func(index int, err error) {
+		result.Failed++
+		result.Errors = append(result.Errors, BatchItemError{Index: index, Error: err.Error()})
 	}
-
-	type plainWrite struct {
-		index int
-		event storage.Event
-	}
-
-	var plain []plainWrite
-	plainSync := false
-	now := time.Now().UnixNano()
-	for i, q := range queries {
-		if q == nil {
-			result.Failed++
-			result.Errors = append(result.Errors, BatchItemError{Index: i, Error: "nil query"})
-			continue
+	flush := func() {
+		if len(events) == 0 {
+			return
 		}
-		if q.Type != QueryTypeWrite {
-			result.Failed++
-			result.Errors = append(result.Errors, BatchItemError{Index: i, Error: "batch only supports WRITE"})
-			continue
-		}
-
-		ts := q.Timestamp
-		if ts == 0 {
-			ts = now + int64(i)
-		}
-		event := storage.Event{
-			Timestamp: ts,
-			Metric:    q.Metric,
-			Value:     q.Value,
-			Tags:      q.Tags,
-		}
-
-		if q.UpdateLB {
-			if err := e.store.WriteEvent(event, q.Quorum); err != nil {
-				result.Failed++
-				result.Errors = append(result.Errors, BatchItemError{Index: i, Error: err.Error()})
-				continue
-			}
-			if err := e.lb.Increment(q.Metric, q.LBEntityID, q.Value); err != nil {
-				result.Failed++
-				result.Errors = append(result.Errors, BatchItemError{Index: i, Error: err.Error()})
-				continue
-			}
-			e.cache.Invalidate(q.Metric)
-			result.Accepted++
-			continue
-		}
-
-		if q.Quorum {
-			plainSync = true
-		}
-		plain = append(plain, plainWrite{index: i, event: event})
-	}
-
-	if len(plain) > 0 {
-		events := make([]storage.Event, 0, len(plain))
-		for _, item := range plain {
-			events = append(events, item.event)
-		}
-		if err := e.store.WriteEvents(events, plainSync); err != nil {
-			for _, item := range plain {
-				result.Failed++
-				result.Errors = append(result.Errors, BatchItemError{Index: item.index, Error: err.Error()})
+		if err := e.store.WriteEventsWithReceipts(events, receipts, true); err != nil {
+			for _, i := range indices {
+				fail(i, err)
 			}
 		} else {
-			result.Accepted += len(plain)
+			result.Accepted += len(events)
 		}
+		events = nil
+		receipts = nil
+		indices = nil
 	}
-
-	if result.Failed > 0 {
-		result.OK = false
+	for i, q := range queries {
+		if q == nil || q.Type != QueryTypeWrite {
+			fail(i, fmt.Errorf("batch only supports WRITE"))
+			continue
+		}
+		if math.IsNaN(q.Value) || math.IsInf(q.Value, 0) || q.Timestamp < 0 {
+			fail(i, fmt.Errorf("invalid write value or timestamp"))
+			continue
+		}
+		if q.Timestamp == 0 {
+			q.Timestamp = e.nextTimestamp()
+		}
+		if q.UpdateLB {
+			flush()
+			if _, err := e.executeMutation(q); err != nil {
+				fail(i, err)
+			} else {
+				result.Accepted++
+			}
+			continue
+		}
+		events = append(events, storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags})
+		receipt := ""
+		if q.IsReplica {
+			receipt = q.OperationID
+		}
+		receipts = append(receipts, receipt)
+		indices = append(indices, i)
 	}
+	flush()
+	result.OK = result.Failed == 0
 	return result, nil
 }
 
@@ -246,10 +225,17 @@ func (e *Executor) GetAllMetrics() []string {
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := string(iter.Key())
+		if strings.HasPrefix(key, "lb-entity:") {
+			parts := strings.SplitN(strings.TrimPrefix(key, "lb-entity:"), ":", 2)
+			if len(parts) == 2 && !seen[parts[0]] {
+				seen[parts[0]] = true
+				metrics = append(metrics, parts[0])
+			}
+		}
 		// skip index und leaderboard keys
 		if strings.HasPrefix(key, "idx:") ||
 			strings.HasPrefix(key, "lb:") ||
-			strings.HasPrefix(key, "card") {
+			strings.HasPrefix(key, "card:") || strings.HasPrefix(key, "card-count:") || strings.HasPrefix(key, "lb-entity:") || strings.HasPrefix(key, "repl-outbox:") || strings.HasPrefix(key, "repl-applied:") {
 			continue
 		}
 		// metric name ist alles vor dem ersten :
@@ -262,53 +248,78 @@ func (e *Executor) GetAllMetrics() []string {
 	return metrics
 }
 
-func (e *Executor) executeSet(q *Query) (*Result, error) {
-	if q.UpdateLB {
-		current, _ := e.lb.Get(q.Metric, q.LBEntityID)
-		delta := q.Value - current
-		if err := e.lb.Increment(q.Metric, q.LBEntityID, delta); err != nil {
-			return nil, err
+func (e *Executor) executeSet(q *Query) (*Result, error)    { return e.executeMutation(q) }
+func (e *Executor) executeDelete(q *Query) (*Result, error) { return e.executeMutation(q) }
+func (e *Executor) executeWrite(q *Query) (*Result, error)  { return e.executeMutation(q) }
+
+func (e *Executor) executeMutation(q *Query) (*Result, error) {
+	if q.Timestamp == 0 && q.Type == QueryTypeWrite {
+		q.Timestamp = e.nextTimestamp()
+	}
+	event := storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags}
+	applied := false
+	err := e.lb.AtomicMutation(q.Metric, q.LBEntityID, func(batch *pebble.Batch) error {
+		receipt := []byte("repl-applied:" + q.OperationID)
+		if q.IsReplica && q.OperationID != "" {
+			_, closer, err := e.store.DB().Get(receipt)
+			if err == nil {
+				closer.Close()
+				return nil
+			}
+			if err != pebble.ErrNotFound {
+				return err
+			}
 		}
-		e.cache.Invalidate(q.Metric) // ← neu
-	}
-	return &Result{}, nil
-}
-
-func (e *Executor) executeDelete(q *Query) (*Result, error) {
-	if q.UpdateLB && q.LBEntityID != "" {
-		if err := e.lb.Delete(q.Metric, q.LBEntityID); err != nil {
-			return nil, err
+		switch q.Type {
+		case QueryTypeWrite:
+			if err := e.store.StageEvent(batch, event); err != nil {
+				return err
+			}
+			if q.UpdateLB {
+				current, err := e.lb.Get(q.Metric, q.LBEntityID)
+				if err != nil {
+					return err
+				}
+				if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, current+q.Value, false); err != nil {
+					return err
+				}
+			}
+		case QueryTypeSet:
+			if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, q.Value, false); err != nil {
+				return err
+			}
+		case QueryTypeDelete:
+			if q.UpdateLB {
+				if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, 0, true); err != nil {
+					return err
+				}
+			} else {
+				to := q.To
+				if to == 0 {
+					to = math.MaxInt64
+				}
+				if err := e.store.StageDeleteRange(batch, q.Metric, q.From, to); err != nil {
+					return err
+				}
+			}
 		}
-		e.cache.Invalidate(q.Metric) // ← neu
-	}
-	return &Result{}, nil
-}
-
-func (e *Executor) executeWrite(q *Query) (*Result, error) {
-	ts := q.Timestamp
-	if ts == 0 {
-		ts = time.Now().UnixNano()
-	}
-
-	event := storage.Event{
-		Timestamp: ts,
-		Metric:    q.Metric,
-		Value:     q.Value,
-		Tags:      q.Tags,
-	}
-
-	// sync=true wenn QUORUM, sonst async batching
-	if err := e.store.WriteEvent(event, q.Quorum); err != nil {
+		if q.IsReplica && q.OperationID != "" {
+			if err := batch.Set(receipt, []byte{1}, nil); err != nil {
+				return err
+			}
+		}
+		applied = true
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	if q.UpdateLB {
-		if err := e.lb.Increment(q.Metric, q.LBEntityID, q.Value); err != nil {
-			return nil, err
+	if applied {
+		if q.Type == QueryTypeWrite {
+			e.store.RecordCommittedEvent(event)
 		}
 		e.cache.Invalidate(q.Metric)
 	}
-
 	return &Result{}, nil
 }
 
@@ -331,9 +342,6 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 	}
 
 	// All-time query: pre-aggregierter Index → cache
-	if cached, ok := e.cache.Get(q.Metric, q.Limit, q.Offset); ok {
-		return &Result{Leaderboard: cached}, nil
-	}
 
 	entries, err := e.lb.TopN(q.Metric, q.Limit, q.Offset)
 	if err != nil {
@@ -343,197 +351,74 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 		entries = []types.LeaderboardEntry{}
 	}
 
-	e.cache.Set(q.Metric, q.Limit, q.Offset, entries)
 	return &Result{Leaderboard: entries}, nil
 }
 
 func (e *Executor) executeGet(q *Query) (*Result, error) {
-	from := q.From
 	to := q.To
-	if from == 0 {
-		from = 0
-	}
 	if to == 0 {
 		to = math.MaxInt64
 	}
-
-	getEvents := func(metric string) ([]storage.Event, error) {
-		if len(q.Where) > 0 {
-			return e.store.ReadRangeWithTags(metric, from, to, q.Where)
-		}
-		return e.store.ReadRange(metric, from, to)
+	metrics := q.Metrics
+	if len(metrics) == 0 {
+		metrics = []string{q.Metric}
 	}
-
-	fastDesc := q.Order == "DESC" && q.Aggregate == "" && q.GroupBySpec == "" && (q.Limit > 0 || q.Offset > 0)
-	fastDescPlain := fastDesc && len(q.Where) == 0
-	fastDescTagged := fastDesc && len(q.Where) > 0
-
-	metricNames := q.Metrics
-	if len(metricNames) == 0 {
-		metricNames = []string{q.Metric}
+	result := &Result{}
+	if len(metrics) > 1 {
+		switch {
+		case q.GroupBySpec != "":
+			result.SeriesByMetric = make(map[string][]SeriesPoint)
+		case q.Aggregate != "":
+			result.Aggregates = make(map[string]*AggregateResult)
+		default:
+			result.Metrics = make(map[string][]storage.Event)
+		}
 	}
-
-	if len(metricNames) > 1 {
-		if q.GroupBySpec != "" {
-			out := make(map[string][]SeriesPoint, len(metricNames))
-			for _, m := range metricNames {
-				events, err := getEvents(m)
-				if err != nil {
-					return nil, err
-				}
-				out[m] = aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
-			}
-			return &Result{SeriesByMetric: out}, nil
+	for _, metric := range metrics {
+		limit, offset, desc := q.Limit, q.Offset, q.Order == "DESC"
+		if q.GroupBySpec != "" || q.Aggregate != "" {
+			limit = 0
+			offset = 0
+			desc = false
 		}
-
-		if q.Aggregate != "" {
-			out := make(map[string]*AggregateResult, len(metricNames))
-			for _, m := range metricNames {
-				events, err := getEvents(m)
-				if err != nil {
-					return nil, err
-				}
-				count := len(events)
-				var sum float64
-				for _, e := range events {
-					sum += e.Value
-				}
-
-				var value float64
-				switch q.Aggregate {
-				case AggCount:
-					value = float64(count)
-				case AggSum:
-					value = sum
-				case AggAvg:
-					if count > 0 {
-						value = sum / float64(count)
-					}
-				}
-
-				out[m] = &AggregateResult{
-					Type:  string(q.Aggregate),
-					Value: value,
-					Count: count,
-				}
-			}
-			return &Result{Aggregates: out}, nil
+		events, err := e.store.ReadPage(metric, q.From, to, q.Where, limit, offset, desc)
+		if err != nil {
+			return nil, err
 		}
-
-		out := make(map[string][]storage.Event, len(metricNames))
-		for _, m := range metricNames {
-			var events []storage.Event
-			var err error
-			if fastDescPlain {
-				events, err = e.store.ReadRangeDesc(m, from, to, q.Limit, q.Offset)
-			} else if fastDescTagged {
-				events, err = e.store.ReadRangeWithTagsDesc(m, from, to, q.Where, q.Limit, q.Offset)
+		switch {
+		case q.GroupBySpec != "":
+			series := aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
+			if len(metrics) == 1 {
+				result.Series = series
 			} else {
-				events, err = getEvents(m)
+				result.SeriesByMetric[metric] = series
 			}
-			if err != nil {
-				return nil, err
+		case q.Aggregate != "":
+			var sum float64
+			for _, event := range events {
+				sum += event.Value
 			}
-			if events == nil {
-				events = []storage.Event{}
+			value := sum
+			if q.Aggregate == AggCount {
+				value = float64(len(events))
+			} else if q.Aggregate == AggAvg && len(events) > 0 {
+				value = sum / float64(len(events))
 			}
-			if !fastDesc {
-				// ordering vor pagination
-				switch q.Order {
-				case "DESC":
-					for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-						events[i], events[j] = events[j], events[i]
-					}
-				case "ASC":
-				}
-
-				// pagination danach
-				if q.Offset >= len(events) {
-					out[m] = []storage.Event{}
-					continue
-				}
-				events = events[q.Offset:]
-				if q.Limit > 0 && len(events) > q.Limit {
-					events = events[:q.Limit]
-				}
+			agg := &AggregateResult{Type: string(q.Aggregate), Value: value, Count: len(events)}
+			if len(metrics) == 1 {
+				result.Aggregate = agg
+			} else {
+				result.Aggregates[metric] = agg
 			}
-
-			out[m] = events
-		}
-		return &Result{Metrics: out}, nil
-	}
-
-	// single metric flow
-	var events []storage.Event
-	var err error
-	if fastDescPlain {
-		events, err = e.store.ReadRangeDesc(q.Metric, from, to, q.Limit, q.Offset)
-	} else if fastDescTagged {
-		events, err = e.store.ReadRangeWithTagsDesc(q.Metric, from, to, q.Where, q.Limit, q.Offset)
-	} else {
-		events, err = getEvents(q.Metric)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if events == nil {
-		events = []storage.Event{}
-	}
-
-	if q.GroupBySpec != "" {
-		series := aggregateSeriesUTC(events, q.GroupBySpec, q.Aggregate)
-		return &Result{Series: series}, nil
-	}
-
-	if q.Aggregate != "" {
-		count := len(events)
-		var sum float64
-		for _, e := range events {
-			sum += e.Value
-		}
-
-		var value float64
-		switch q.Aggregate {
-		case AggCount:
-			value = float64(count)
-		case AggSum:
-			value = sum
-		case AggAvg:
-			if count > 0 {
-				value = sum / float64(count)
+		default:
+			if len(metrics) == 1 {
+				result.Events = events
+			} else {
+				result.Metrics[metric] = events
 			}
 		}
-
-		return &Result{
-			Aggregate: &AggregateResult{
-				Type:  string(q.Aggregate),
-				Value: value,
-				Count: count,
-			},
-		}, nil
 	}
-
-	if !fastDescPlain && !fastDescTagged {
-		// ordering vor pagination
-		switch q.Order {
-		case "DESC":
-			for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-				events[i], events[j] = events[j], events[i]
-			}
-		case "ASC":
-		}
-
-		// pagination danach
-		if q.Offset >= len(events) {
-			return &Result{Events: []storage.Event{}}, nil
-		}
-		events = events[q.Offset:]
-		if q.Limit > 0 && len(events) > q.Limit {
-			events = events[:q.Limit]
-		}
-	}
-
-	return &Result{Events: events}, nil
+	return result, nil
 }
 
 type durSpec struct {
@@ -544,68 +429,72 @@ type durSpec struct {
 
 func parseCalendarSpec(spec string) (durSpec, error) {
 	var out durSpec
-	if spec == "" {
-		return out, fmt.Errorf("invalid duration: empty")
-	}
-
-	// If spec contains years or explicit months, treat "m" as months.
 	hasCalendar := strings.Contains(spec, "y") || strings.Contains(spec, "mo")
-
-	i := 0
-	for i < len(spec) {
+	for i := 0; i < len(spec); {
 		j := i
-		for j < len(spec) && unicode.IsDigit(rune(spec[j])) {
+		for j < len(spec) && spec[j] >= '0' && spec[j] <= '9' {
 			j++
 		}
-		if j == i {
+		if j == i || j == len(spec) {
 			return out, fmt.Errorf("invalid duration: %s", spec)
 		}
-		num, err := strconv.Atoi(spec[i:j])
+		num, err := strconv.ParseInt(spec[i:j], 10, 64)
 		if err != nil {
 			return out, err
 		}
-
-		unit := ""
-		// check "mo" and "min" before single-char units
-		if j+2 < len(spec) && spec[j:j+3] == "min" {
+		unit := spec[j : j+1]
+		j++
+		if strings.HasPrefix(spec[j-1:], "min") {
 			unit = "min"
-			j += 3
-		} else if j+1 < len(spec) && spec[j:j+2] == "mo" {
-			unit = "mo"
 			j += 2
-		} else {
-			unit = spec[j : j+1]
+		} else if strings.HasPrefix(spec[j-1:], "mo") {
+			unit = "mo"
 			j++
 		}
-
+		var scale time.Duration
 		switch unit {
 		case "y":
-			out.years += num
-			hasCalendar = true
+			if num > 290 {
+				return out, fmt.Errorf("duration too large")
+			}
+			out.years += int(num)
 		case "mo":
-			out.months += num
-			hasCalendar = true
+			if num > 3480 {
+				return out, fmt.Errorf("duration too large")
+			}
+			out.months += int(num)
 		case "m":
 			if hasCalendar {
-				out.months += num
+				if num > 3480 {
+					return out, fmt.Errorf("duration too large")
+				}
+				out.months += int(num)
 			} else {
-				out.dur += time.Duration(num) * time.Minute
+				scale = time.Minute
 			}
 		case "min":
-			out.dur += time.Duration(num) * time.Minute
+			scale = time.Minute
 		case "w":
-			out.dur += time.Duration(num) * 7 * 24 * time.Hour
+			scale = 7 * 24 * time.Hour
 		case "d":
-			out.dur += time.Duration(num) * 24 * time.Hour
+			scale = 24 * time.Hour
 		case "h":
-			out.dur += time.Duration(num) * time.Hour
+			scale = time.Hour
 		case "s":
-			out.dur += time.Duration(num) * time.Second
+			scale = time.Second
 		default:
-			return out, fmt.Errorf("invalid unit: %s", unit)
+			return out, fmt.Errorf("invalid duration unit: %s", unit)
 		}
-
+		if scale > 0 {
+			if num > (math.MaxInt64-int64(out.dur))/int64(scale) {
+				return out, fmt.Errorf("duration overflow")
+			}
+			out.dur += time.Duration(num) * scale
+		}
 		i = j
+	}
+	if out.years == 0 && out.months == 0 && out.dur == 0 {
+		return out, fmt.Errorf("duration must be positive")
 	}
 	return out, nil
 }
@@ -638,7 +527,13 @@ func aggregateSeriesUTC(events []storage.Event, spec string, agg AggType) []Seri
 	i := 0
 
 	for i < len(events) {
-		// advance bucket until it contains event
+		// Jump directly to fixed-duration buckets instead of scanning from 1970.
+		if dur.years == 0 && dur.months == 0 {
+			ts := events[i].Timestamp
+			start = time.Unix(0, ts-ts%int64(dur.dur)).UTC()
+			end = start.Add(dur.dur)
+		}
+		// advance calendar bucket until it contains event
 		for end.Before(time.Unix(0, events[i].Timestamp).UTC()) || end.Equal(time.Unix(0, events[i].Timestamp).UTC()) {
 			start = end
 			end = addCalendar(start, dur)
@@ -681,4 +576,17 @@ func aggregateSeriesUTC(events []storage.Event, spec string, agg AggType) []Seri
 	}
 
 	return series
+}
+
+func (e *Executor) nextTimestamp() int64 {
+	for {
+		previous := e.clock.Load()
+		now := time.Now().UnixNano()
+		if now <= previous {
+			now = previous + 1
+		}
+		if e.clock.CompareAndSwap(previous, now) {
+			return now
+		}
+	}
 }

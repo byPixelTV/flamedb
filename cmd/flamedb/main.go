@@ -1,12 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/auth"
@@ -58,7 +59,7 @@ func printBanner(version string) {
 }
 
 func main() {
-	configPath := "config.yaml"
+	configPath := "config.yml"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]
 	}
@@ -86,7 +87,7 @@ func main() {
 		Addr: advertiseAddr,
 	}
 
-	internalKey := cfg.Auth.Keys[0].Key
+	internalKey := cfg.Auth.EffectiveInternalKey()
 
 	replicationFactor := cfg.Cluster.ReplicationFactor
 	if replicationFactor < 1 {
@@ -96,16 +97,7 @@ func main() {
 	c.SetQueueSizes(cfg.Cluster.ReplicationQueueSize, cfg.Cluster.FanoutQueueSize)
 	c.AttachReplicationOutbox(store.DB())
 
-	// seeds joinen, kein pre-loading von nodes aus config
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		c.JoinSeeds(cfg.Cluster.Seeds, internalKey)
-		c.StartHeartbeat(internalKey)
-		// rebalance nach join
-		if len(cfg.Cluster.Seeds) > 0 {
-			c.TriggerRebalance(store, internalKey)
-		}
-	}()
+	c.StartDiscovery(cfg.Cluster.Seeds, internalKey, store)
 
 	if cfg.Cluster.ReadPolicy != "" {
 		c.SetReadPolicy(cluster.ReadPolicy(cfg.Cluster.ReadPolicy))
@@ -116,13 +108,21 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
+	shutdown := make(chan struct{})
 	go func() {
 		<-quit
 		log.Println("FlameDB shutting down...")
-		store.Close()
-		os.Exit(0)
+		// Stop background I/O before closing Pebble. Pending replication stays in the outbox.
+		c.Close()
+		srv.Close()
+		if err := store.Close(); err != nil {
+			log.Printf("storage close: %v", err)
+		}
+		close(shutdown)
 	}()
-
-	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	log.Fatal(srv.Listen(addr))
+	addr := net.JoinHostPort(cfg.Server.Host, fmt.Sprint(cfg.Server.Port))
+	if err := srv.Listen(addr); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Fatal(err)
+	}
+	<-shutdown
 }
