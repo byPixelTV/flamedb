@@ -147,4 +147,7 @@ data class WriteBatchItem(
     val options: WriteOptions = WriteOptions(),
 )
 
-class FlameDBException(message: String) : RuntimeException(message)
+class FlameDBException : RuntimeException {
+    constructor(message: String) : super(message)
+    constructor(message: String, cause: Throwable) : super(message, cause)
+}

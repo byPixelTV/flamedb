@@ -189,3 +189,34 @@ amortize the round-trip cost.
 | `groupLeaderboard(metric, groups, opts?)` | GROUP_LEADERBOARD |
 | `stats(metric, vararg tags)` | STATS cardinality |
 | `close()` | Close TCP connection |
+
+## Connection failures
+
+The client serializes concurrent commands on one TCP connection. If sending or
+reading a response fails, it closes that connection and throws `FlameDBException`
+with the original cause. The next command reconnects and authenticates before
+sending. An explicit `close()` is permanent and disables reconnection.
+
+A failed command is **never replayed automatically**: a write may have committed
+before its response was lost. Do not blindly retry increments. A server error
+response does not close an otherwise healthy connection.
+
+Catch failures inside recurring update loops so a transient failure does not
+terminate the coroutine. Always rethrow coroutine cancellation:
+
+```kotlin
+while (isActive) {
+    try {
+        val top = db.leaderboard("smp:deaths", LeaderboardOptions(limit = 10))
+        // Reuse this result for holograms and placeholders.
+        // Apply game-state updates on the platform's appropriate scheduler.
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        logger.log(java.util.logging.Level.WARNING, "Leaderboard refresh failed", error)
+    }
+    delay(60_000)
+}
+```
+
+A top-10 response cannot provide a global rank for players outside those ten.

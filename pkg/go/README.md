@@ -89,3 +89,14 @@ Opens + authenticates a TCP connection. Returns an error if auth fails.
 ### `(*Client).GroupLeaderboard(ctx, metric, groups, opts) ([]GroupLeaderboardEntry, error)`
 ### `(*Client).Stats(ctx, metric, tags) (*StatsResult, error)`
 ### `(*Client).Close() error`
+
+## Connection recovery
+
+After a transport failure, timeout, or invalid JSON response, the client discards
+the connection. The next command reconnects and authenticates under the same
+mutex used for commands. Reconnection honors the caller's context and the configured
+timeout. `Close()` is permanent; subsequent commands do not reconnect.
+
+Failed commands are never replayed automatically. A write may already have been
+applied before its reply was lost, so do not blindly retry increments. Server
+error responses do not invalidate an otherwise healthy connection.

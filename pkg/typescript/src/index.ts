@@ -156,6 +156,8 @@ class FlameConnection {
 
   ready(): Promise<void> { return this.readyPromise; }
 
+  isFailed(): boolean { return this.failure !== null; }
+
   private recv(): Promise<string> {
     if (this.failure) return Promise.reject(this.failure);
     if (this.inbox.length) return Promise.resolve(this.inbox.shift()!);
@@ -215,7 +217,7 @@ export class FlameDB {
   }
 
   private getConn(): FlameConnection {
-    if (!this.conn) {
+    if (!this.conn || this.conn.isFailed()) {
       this.conn = new FlameConnection(this.config);
     }
     return this.conn;

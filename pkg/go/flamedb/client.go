@@ -172,6 +172,7 @@ type Client struct {
 	scanner *bufio.Scanner
 	writer  *bufio.Writer
 	authed  bool
+	closed  bool
 }
 
 // New creates a new Client and opens + authenticates a TCP connection.
@@ -180,7 +181,7 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("flamedb: invalid API key")
 	}
 	c := &Client{cfg: cfg}
-	if err := c.dial(); err != nil {
+	if err := c.dial(context.Background()); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -190,6 +191,7 @@ func New(cfg Config) (*Client, error) {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed = true
 	if c.conn != nil {
 		err := c.conn.Close()
 		c.conn = nil
@@ -200,12 +202,22 @@ func (c *Client) Close() error {
 
 // ─── Internal ─────────────────────────────────────────────────────────────────
 
-func (c *Client) dial() error {
-	conn, err := net.DialTimeout("tcp", c.cfg.addr(), c.cfg.timeout())
+func (c *Client) dial(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout())
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.cfg.addr())
 	if err != nil {
 		return fmt.Errorf("flamedb: connect: %w", err)
 	}
-	_ = conn.SetDeadline(time.Now().Add(c.cfg.timeout()))
+	deadline, _ := ctx.Deadline()
+	_ = conn.SetDeadline(deadline)
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()); close(done) })
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
 	c.conn = conn
 	c.scanner = bufio.NewScanner(conn)
 	c.scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
@@ -285,21 +297,30 @@ func (c *Client) command(ctx context.Context, line string) (map[string]json.RawM
 }
 
 func (c *Client) commandMulti(ctx context.Context, lines []string) (map[string]json.RawMessage, error) {
-	if c.conn == nil {
-		return nil, fmt.Errorf("flamedb: connection closed")
+	if c.closed {
+		return nil, fmt.Errorf("flamedb: client closed")
 	}
 	for _, line := range lines {
 		if strings.ContainsAny(line, "\r\n\x1f") {
 			return nil, fmt.Errorf("flamedb: invalid command framing")
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.conn == nil {
+		if err := c.dial(ctx); err != nil {
+			return nil, fmt.Errorf("flamedb: reconnect failed; command was not sent: %w", err)
+		}
+	}
+	conn := c.conn
 	deadline := time.Now().Add(c.cfg.timeout())
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
 	_ = c.conn.SetDeadline(deadline)
 	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetDeadline(time.Now()); close(done) })
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()); close(done) })
 	defer func() {
 		if !stop() {
 			<-done
@@ -310,18 +331,21 @@ func (c *Client) commandMulti(ctx context.Context, lines []string) (map[string]j
 		return nil, err
 	}
 	if err := c.sendLines(lines); err != nil {
-		c.conn.Close()
-		return nil, err
+		conn.Close()
+		c.conn = nil
+		return nil, fmt.Errorf("flamedb: command failed; outcome unknown; not retried: %w", err)
 	}
 	raw, err := c.readLine()
 	if err != nil {
-		c.conn.Close()
-		return nil, err
+		conn.Close()
+		c.conn = nil
+		return nil, fmt.Errorf("flamedb: command failed; outcome unknown; not retried: %w", err)
 	}
 	var result map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		c.conn.Close()
-		return nil, fmt.Errorf("flamedb: parse response: %w", err)
+		conn.Close()
+		c.conn = nil
+		return nil, fmt.Errorf("flamedb: parse response; outcome unknown; not retried: %w", err)
 	}
 	if errMsg, ok := result["error"]; ok {
 		var s string

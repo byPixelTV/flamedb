@@ -93,3 +93,14 @@ strings when serializing SDK results with `JSON.stringify`.
 A timeout closes the connection and rejects every pending command. A write may
 already have been applied; do not automatically retry increments. Call
 `disconnect()` before establishing a new connection.
+
+## Connection recovery
+
+After a connection error, timeout, or invalid JSON response, pending commands on
+that connection fail. The next call creates and authenticates a new connection;
+concurrent calls share that connection and its authentication handshake. Failed
+commands are never replayed automatically. Writes may already have been applied,
+so do not blindly retry increments or a failed pipeline.
+
+`disconnect()` closes the current connection. As before, a later `connect()` or
+command opens a new one. Server error responses do not invalidate a healthy connection.

@@ -11,7 +11,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.io.PrintWriter
+import java.io.BufferedWriter
+import java.io.OutputStreamWriter
 import java.net.Socket
 import java.net.InetSocketAddress
 import kotlinx.serialization.encodeToString
@@ -29,9 +30,11 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     private val json = Json { ignoreUnknownKeys = true }
     private val mutex = Mutex()
 
-    private lateinit var socket: Socket
+    private val lifecycleLock = Any()
+    @Volatile private var closed = false
+    @Volatile private lateinit var socket: Socket
     private lateinit var reader: BufferedReader
-    private lateinit var writer: PrintWriter
+    private lateinit var writer: BufferedWriter
 
     // ─── Factory ──────────────────────────────────────────────────────────────
 
@@ -52,14 +55,17 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     private fun dial() {
         require(cfg.timeoutMs > 0) { "timeoutMs must be positive" }
         require(!cfg.apiKey.contains('\n') && !cfg.apiKey.contains('\r')) { "invalid API key" }
-        socket = Socket()
+        synchronized(lifecycleLock) {
+            if (closed) throw FlameDBException("FlameDB client is closed")
+            socket = Socket()
+        }
         try {
             socket.connect(InetSocketAddress(cfg.host, cfg.port), cfg.timeoutMs)
             socket.soTimeout = cfg.timeoutMs
             reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-            writer = PrintWriter(socket.getOutputStream(), false, Charsets.UTF_8)
+            writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
             performAuth()
-        } catch (error: Exception) { socket.close(); throw error }
+        } catch (error: Exception) { runCatching { socket.close() }; throw error }
     }
 
     private fun performAuth() {
@@ -71,7 +77,6 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
         sendLine("AUTH ${cfg.apiKey}")
         writer.flush()
-        check(!writer.checkError()) { "FlameDB write failed" }
 
         val resp = readLine()
         val authResp = json.parseToJsonElement(resp).jsonObject
@@ -86,7 +91,8 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     private fun sendLine(line: String) {
         require(!line.contains('\n') && !line.contains('\r') && !line.contains('\u001f')) { "invalid command framing" }
-        writer.println(line)
+        writer.write(line)
+        writer.newLine()
     }
 
     /**
@@ -95,12 +101,23 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
      */
     private fun rawCommand(lines: List<String>): JsonObject {
         lines.forEach { require(!it.contains('\n') && !it.contains('\r') && !it.contains('\u001f')) { "invalid command framing" } }
+        if (closed) throw FlameDBException("FlameDB client is closed")
+        if (socket.isClosed) {
+            try { dial() } catch (error: Exception) {
+                throw FlameDBException("FlameDB reconnect failed; command was not sent", error)
+            }
+        }
         val obj = try {
             lines.forEach { sendLine(it) }
             writer.flush()
-            check(!writer.checkError()) { "FlameDB write failed" }
             json.parseToJsonElement(readLine()).jsonObject
-        } catch (error: Exception) { socket.close(); throw error }
+        } catch (error: Exception) {
+            runCatching { socket.close() }
+            throw FlameDBException(
+                "FlameDB command failed; outcome may be unknown. The command was not retried; the next call will reconnect.",
+                error,
+            )
+        }
         val err = obj["error"]?.jsonPrimitive?.content
         if (err != null) throw FlameDBException(err)
         return obj
@@ -117,7 +134,10 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     // ─── Close ────────────────────────────────────────────────────────────────
 
     override fun close() {
-        runCatching { socket.close() }
+        synchronized(lifecycleLock) {
+            closed = true
+            if (::socket.isInitialized) runCatching { socket.close() }
+        }
     }
 
     // ─── Write ────────────────────────────────────────────────────────────────

@@ -44,3 +44,37 @@ test('accepts namespaced metrics and tag keys', async t => {
  assert.ok(received.startsWith('WRITE smp: 1'));
  assert.ok(received.includes('player:id="p:1"'));
 });
+
+for (const mode of ['disconnect', 'timeout']) {
+ test(`reconnects after ${mode} without replaying writes`, async t => {
+  const sockets = new Set(); const commands = []; let connections = 0;
+  const server = net.createServer(socket => {
+   const generation = ++connections;
+   sockets.add(socket); socket.on('close', () => sockets.delete(socket));
+   socket.on('error', () => {}); socket.setEncoding('utf8');
+   socket.write('{"auth":"required"}\n'); let buffer = '';
+   socket.on('data', chunk => {
+    buffer += chunk; let end;
+    while ((end = buffer.indexOf('\n')) >= 0) {
+     const line = buffer.slice(0,end); buffer = buffer.slice(end+1);
+     if (line.startsWith('AUTH ')) { socket.write('{"auth":"ok"}\n'); continue; }
+     commands.push(line);
+     if (generation === 1) { if (mode === 'disconnect') socket.destroy(); }
+     else socket.write('{}\n');
+    }
+   });
+  });
+  server.listen(0,'127.0.0.1'); await once(server,'listening');
+  const db = new FlameDB({host:'127.0.0.1',port:server.address().port,apiKey:'test',timeout:150});
+  t.after(() => { db.disconnect(); for (const socket of sockets) socket.destroy(); server.close(); });
+  const failed = await Promise.allSettled([db.write('first',1), db.write('second',1)]);
+  assert.ok(failed.every(result => result.status === 'rejected'));
+  await Promise.all(Array.from({length:8}, (_,i) => db.write(`next${i}`,1)));
+  assert.equal(connections,2);
+  assert.equal(commands.filter(line => line.startsWith('WRITE first ')).length,1);
+  assert.ok(commands.filter(line => line.startsWith('WRITE second ')).length <= 1);
+  for (let i=0;i<8;i++) assert.equal(commands.filter(line => line.startsWith(`WRITE next${i} `)).length,1);
+  db.disconnect(); await db.connect(); await db.write('afterDisconnect',1);
+  assert.equal(connections,3);
+ });
+}
