@@ -77,6 +77,12 @@ func TestReplicaBatchOneReplyAndMixedMutations(t *testing.T) {
 }
 
 func TestTwoNodeQuorumAndForwardedBatch(t *testing.T) {
+	for _, metric := range []string{"kills", "smp:", "smp:kills"} {
+		t.Run(metric, func(t *testing.T) { testTwoNodeQuorum(t, metric) })
+	}
+}
+
+func testTwoNodeQuorum(t *testing.T, metric string) {
 	type instance struct {
 		srv   *Server
 		c     *cluster.Cluster
@@ -114,7 +120,7 @@ func TestTwoNodeQuorumAndForwardedBatch(t *testing.T) {
 			n.store.Close()
 		}
 	})
-	primary, _ := nodes[0].c.GetPrimaryNode("kills")
+	primary, _ := nodes[0].c.GetPrimaryNode(metric)
 	ingress := nodes[0]
 	if ingress.c.Self.ID == primary.ID {
 		ingress = nodes[1]
@@ -133,13 +139,13 @@ func TestTwoNodeQuorumAndForwardedBatch(t *testing.T) {
 	if !sc.Scan() {
 		t.Fatal(sc.Err())
 	}
-	v := frame(t, conn, sc, "WRITE_BATCH QUORUM\nWRITE kills 3 lb=\"p\"\nEND")
+	v := frame(t, conn, sc, fmt.Sprintf("WRITE_BATCH QUORUM\nWRITE %s 3 lb=\"p\"\nEND", metric))
 	if v["accepted"] != float64(1) || v["failed"] != float64(0) {
 		t.Fatal(v)
 	}
 	var stamp int64
 	for i, n := range nodes {
-		events, err := n.store.ReadRange("kills", 0, 1<<62)
+		events, err := n.store.ReadRange(metric, 0, 1<<62)
 		if err != nil || len(events) != 1 {
 			t.Fatalf("%v %v", events, err)
 		}
@@ -148,20 +154,20 @@ func TestTwoNodeQuorumAndForwardedBatch(t *testing.T) {
 		} else if events[0].Timestamp != stamp {
 			t.Fatal("replica timestamp differs")
 		}
-		score, err := aggregates.New(n.store.DB()).Get("kills", "p")
+		score, err := aggregates.New(n.store.DB()).Get(metric, "p")
 		if err != nil || score != 3 {
 			t.Fatalf("score=%v err=%v", score, err)
 		}
 	}
 
-	for _, line := range []string{`SET kills 5 lb="p"`, `WRITE kills 1 lb="p" QUORUM`} {
+	for _, line := range []string{fmt.Sprintf(`SET %s 5 lb="p"`, metric), fmt.Sprintf(`WRITE %s 1 lb="p" QUORUM`, metric)} {
 		result := frame(t, conn, sc, line)
 		if result["error"] != nil {
 			t.Fatal(result)
 		}
 	}
 	for _, n := range nodes {
-		score, err := aggregates.New(n.store.DB()).Get("kills", "p")
+		score, err := aggregates.New(n.store.DB()).Get(metric, "p")
 		if err != nil || score != 6 {
 			t.Fatalf("async SET / quorum WRITE reordered: %v %v", score, err)
 		}

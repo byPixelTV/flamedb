@@ -331,7 +331,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     }
 
     private fun identifier(value: String): String {
-        require(value.isNotEmpty() && value.none { it.isWhitespace() || it in ":=\"," }) { "invalid identifier" }; return value
+        require(value.isNotEmpty() && value.none { it.isWhitespace() || it == '\u0000' || it == '\u001f' || it in "=\"," }) { "invalid identifier" }; return value
     }
 }
 

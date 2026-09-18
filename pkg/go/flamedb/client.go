@@ -603,7 +603,7 @@ func validateIdentifiers(names []string, tags map[string]string) error {
 		names = append(names, k)
 	}
 	for _, name := range names {
-		if name == "" || strings.ContainsAny(name, ":=\", \t\r\n\x00\x1f") {
+		if name == "" || strings.ContainsAny(name, "=\", \t\r\n\x00\x1f") {
 			return fmt.Errorf("flamedb: invalid identifier")
 		}
 	}

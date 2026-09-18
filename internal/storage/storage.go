@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/cluster"
+	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/cockroachdb/pebble/v2/sstable"
@@ -119,6 +120,7 @@ func appendUint64(dst []byte, v uint64) []byte {
 }
 
 func eventKey(metric string, timestamp int64) []byte {
+	metric = keyspace.Component(metric)
 	key := make([]byte, 0, len(metric)+1+8)
 	key = append(key, metric...)
 	key = append(key, ':')
@@ -191,6 +193,7 @@ func (s *Storage) WriteEventsWithReceipts(events []Event, receipts []string, syn
 }
 
 func indexKey(metric, tagKey, tagValue string, timestamp int64) []byte {
+	metric, tagKey = keyspace.Component(metric), keyspace.Component(tagKey)
 	// format: idx:metric:tagkey:tagvalue:timestamp
 	key := make([]byte, 0, len("idx:")+len(metric)+1+len(tagKey)+1+len(tagValue)+1+8)
 	key = append(key, 'i', 'd', 'x', ':')
@@ -321,6 +324,7 @@ func (s *Storage) ReadPage(metric string, from, to int64, tags map[string]string
 
 // ExportMetric returns all raw Pebble keys for a metric.
 func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
+	metric = keyspace.Component(metric)
 	lower := []byte(metric + ":")
 	upper := []byte(metric + ";") // ';' immediately follows ':' in ASCII.
 
@@ -346,6 +350,7 @@ func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
 
 // ExportLeaderboard returns all leaderboard entries for a metric.
 func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
+	metric = keyspace.Component(metric)
 	var kvs []RawKV
 
 	prefixes := [][]byte{
@@ -397,6 +402,7 @@ type RawKV struct {
 }
 
 func (s *Storage) HasMetric(metric string) bool {
+	metric = keyspace.Component(metric)
 	lower := []byte(metric + ":")
 	upper := []byte(metric + ";")
 	iter, err := s.db.NewIter(&pebble.IterOptions{

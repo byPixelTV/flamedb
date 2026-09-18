@@ -91,3 +91,16 @@ func TestQuotedValuesAndInjection(t *testing.T) {
 		t.Fatal("invalid metric accepted")
 	}
 }
+
+func TestNamespacedIdentifiers(t *testing.T) {
+	received := make(chan string, 1)
+	c := fakeServer(t, func(line string) string { received <- line; return `{}` })
+	err := c.Write(context.Background(), "smp:", 1, WriteOpts{Tags: map[string]string{"player:id": "p:1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := <-received
+	if !strings.HasPrefix(line, "WRITE smp: 1") || !strings.Contains(line, `player:id="p:1"`) {
+		t.Fatal(line)
+	}
+}

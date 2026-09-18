@@ -196,7 +196,7 @@ function validateLine(line: string): void {
 }
 
 function identifier(value: string): string {
-  if (!value || /[\s:=",]/.test(value)) throw new Error("Invalid identifier");
+  if (!value || /[\s=",\x00\x1f]/.test(value)) throw new Error("Invalid identifier");
   return value;
 }
 

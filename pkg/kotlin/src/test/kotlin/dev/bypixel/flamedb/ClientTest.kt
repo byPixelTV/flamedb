@@ -28,6 +28,9 @@ class ClientTest {
     assertEquals(2,db.stats("m","p").tagStats.single().cardinality)
     db.write("m",1.0,WriteOptions(tags=mapOf("p" to "a\"\nb")))
     assertTrue(received.get().contains("p=\"a\\\"\\nb\""))
+    db.write("smp:", 1.0, WriteOptions(tags=mapOf("player:id" to "p:1")))
+    assertTrue(received.get().startsWith("WRITE smp: "))
+    assertTrue(received.get().contains("player:id=\"p:1\""))
     assertFailsWith<IllegalArgumentException>{db.write("m 1 lb=",1.0)}
    }
    worker.join(1000)

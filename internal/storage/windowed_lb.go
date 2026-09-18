@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"sort"
 
+	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/byPixelTV/flamedb/internal/types"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -160,6 +161,7 @@ func (s *Storage) WindowedEntitySums(
 // indexTagPrefix builds the idx:metric:tagKey: prefix without an entity ID.
 // Used by WindowedLeaderboard when entity IDs are not known in advance.
 func indexTagPrefix(metric, tagKey string) []byte {
+	metric, tagKey = keyspace.Component(metric), keyspace.Component(tagKey)
 	buf := make([]byte, 0, 4+len(metric)+1+len(tagKey)+1)
 	buf = append(buf, 'i', 'd', 'x', ':')
 	buf = append(buf, metric...)

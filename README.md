@@ -138,5 +138,21 @@ WRITE kills 1 lb="pixel" tag="region:eu"
 LEADERBOARD kills LIMIT 10
 ```
 
+### Namespaced identifiers
+
+Metric names and tag keys accept colons, including trailing colons such as `smp:`.
+The server and all SDKs preserve the name exactly; `smp`, `smp:`, and `smp:kills`
+are distinct metrics. For example:
+
+```text
+WRITE smp: 1 player:id="player-1"
+GET smp: WHERE player:id="player-1"
+WRITE smp:kills 1 lb="player-1"
+LEADERBOARD smp:kills
+```
+
+Existing names without colons retain their storage format and need no migration.
+Namespaced identifiers require the updated server and SDKs on all participating nodes.
+
 ## Contact
-If you find bugs/exploits that have to be disclosed privately, please write me an email: contact@bypixel.dev or open a ticket on my Discord server: https://discord.gg/yVp7Qvhj9k   
+If you find bugs/exploits that have to be disclosed privately, please write me an email: contact@bypixel.dev or open a ticket on my Discord server: https://discord.gg/yVp7Qvhj9k

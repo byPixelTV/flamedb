@@ -5,17 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/cockroachdb/pebble/v2"
 )
 
 // key format: card:metric:tagkey:tagvalue → count
 func cardKey(metric, tagKey, tagValue string) []byte {
-	return []byte(fmt.Sprintf("card:%s:%s:%s", metric, tagKey, tagValue))
+	return []byte(fmt.Sprintf("card:%s:%s:%s", keyspace.Component(metric), keyspace.Component(tagKey), tagValue))
 }
 
 // key format: card-count:metric:tagkey → unique value count
 func cardCountKey(metric, tagKey string) []byte {
-	return []byte(fmt.Sprintf("card-count:%s:%s", metric, tagKey))
+	return []byte(fmt.Sprintf("card-count:%s:%s", keyspace.Component(metric), keyspace.Component(tagKey)))
 }
 
 func cardCacheKey(metric, tagKey, tagValue string) string {

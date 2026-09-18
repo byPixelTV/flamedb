@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
+	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/byPixelTV/flamedb/internal/storage"
 	"github.com/byPixelTV/flamedb/internal/types"
 	"github.com/cockroachdb/pebble/v2"
@@ -227,9 +228,12 @@ func (e *Executor) GetAllMetrics() []string {
 		key := string(iter.Key())
 		if strings.HasPrefix(key, "lb-entity:") {
 			parts := strings.SplitN(strings.TrimPrefix(key, "lb-entity:"), ":", 2)
-			if len(parts) == 2 && !seen[parts[0]] {
-				seen[parts[0]] = true
-				metrics = append(metrics, parts[0])
+			if len(parts) == 2 {
+				parts[0] = keyspace.DecodeComponent(parts[0])
+				if !seen[parts[0]] {
+					seen[parts[0]] = true
+					metrics = append(metrics, parts[0])
+				}
 			}
 		}
 		// Skip index and leaderboard keys.
@@ -240,6 +244,7 @@ func (e *Executor) GetAllMetrics() []string {
 		}
 		// The metric name precedes the first colon.
 		parts := strings.SplitN(key, ":", 2)
+		parts[0] = keyspace.DecodeComponent(parts[0])
 		if len(parts) > 0 && !seen[parts[0]] {
 			seen[parts[0]] = true
 			metrics = append(metrics, parts[0])

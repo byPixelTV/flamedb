@@ -595,18 +595,18 @@ func validateQuery(q *Query) error {
 		return fmt.Errorf("invalid time range")
 	}
 	for _, m := range append([]string{q.Metric}, q.Metrics...) {
-		if m == "" || strings.ContainsAny(m, ":,=\" \t\r\n") || m == "idx" || m == "lb" || m == "lb-entity" || m == "card" || m == "card-count" || m == "repl-applied" || m == "repl-outbox" {
+		if m == "" || strings.ContainsAny(m, ",=\" \t\r\n") || m == "idx" || m == "lb" || m == "lb-entity" || m == "card" || m == "card-count" || m == "repl-applied" || m == "repl-outbox" {
 			return fmt.Errorf("invalid or reserved metric: %s", m)
 		}
 	}
 	for _, tags := range []map[string]string{q.Tags, q.Where} {
 		for k := range tags {
-			if k == "" || strings.ContainsAny(k, ":=\" \t") {
+			if k == "" || strings.ContainsAny(k, "=\" \t") {
 				return fmt.Errorf("invalid tag key")
 			}
 		}
 	}
-	if q.EntityTag != "" && strings.ContainsAny(q.EntityTag, ":=\" \t") {
+	if q.EntityTag != "" && strings.ContainsAny(q.EntityTag, "=\" \t") {
 		return fmt.Errorf("invalid entity tag")
 	}
 	if q.Type == QueryTypeDelete && len(q.Tags) > 0 {

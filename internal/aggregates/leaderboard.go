@@ -9,6 +9,7 @@ import (
 	"math"
 	"sync"
 
+	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/byPixelTV/flamedb/internal/types"
 	"github.com/cockroachdb/pebble/v2"
 )
@@ -31,11 +32,11 @@ func lbKey(metric, entityID string, value float64) []byte {
 	inverted := math.MaxUint64 - math.Float64bits(value)
 	score := make([]byte, 8)
 	binary.BigEndian.PutUint64(score, inverted)
-	return []byte("lb:" + metric + ":" + string(score) + ":" + entityID)
+	return []byte("lb:" + keyspace.Component(metric) + ":" + string(score) + ":" + entityID)
 }
 
 func lbEntityKey(metric, entityID string) []byte {
-	return []byte("lb-entity:" + metric + ":" + entityID)
+	return []byte("lb-entity:" + keyspace.Component(metric) + ":" + entityID)
 }
 
 func encodeFloat64(v float64) []byte {
@@ -118,10 +119,10 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 	}
 
 	// Fallback: scan legacy data without an entity index.
-	prefix := []byte("lb:" + metric + ":")
+	prefix := []byte("lb:" + keyspace.Component(metric) + ":")
 	iter, err := l.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
-		UpperBound: []byte("lb:" + metric + ";"),
+		UpperBound: []byte("lb:" + keyspace.Component(metric) + ";"),
 	})
 	if err != nil {
 		return 0, err
@@ -159,13 +160,13 @@ func (l *Leaderboard) TopN(metric string, limit, offset int) ([]LeaderboardEntry
 	if limit < 0 || offset < 0 {
 		return nil, fmt.Errorf("invalid pagination")
 	}
-	prefix := []byte("lb:" + metric + ":")
+	prefix := []byte("lb:" + keyspace.Component(metric) + ":")
 	split := append(append([]byte(nil), prefix...), 0x80)
 	results := []LeaderboardEntry{}
 	// Preserve the on-disk format: nonnegative scores scan forward, negative
 	// scores backward. This fixes signed ordering without a data migration.
 	for pass := 0; pass < 2; pass++ {
-		lower, upper := split, []byte("lb:"+metric+";")
+		lower, upper := split, []byte("lb:"+keyspace.Component(metric)+";")
 		if pass == 1 {
 			lower, upper = prefix, split
 		}

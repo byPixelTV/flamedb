@@ -36,3 +36,11 @@ test('preserves nanosecond precision in exact bigint companion fields',async t=>
  server.listen(0,'127.0.0.1');await once(server,'listening');const db=new FlameDB({host:'127.0.0.1',port:server.address().port,apiKey:'test'});t.after(()=>{db.disconnect();server.close();});
  const result=await db.get('m');assert.equal(result.events[0].timestampNs,1790000000123456789n);assert.equal(result.series[0].tsNs,1790000000123456789n);
 });
+
+test('accepts namespaced metrics and tag keys', async t => {
+ let received = '';
+ const db = await fixture(t, line => { received = line; return {}; });
+ await db.write('smp:', 1, {tags: {'player:id': 'p:1'}});
+ assert.ok(received.startsWith('WRITE smp: 1'));
+ assert.ok(received.includes('player:id="p:1"'));
+});
