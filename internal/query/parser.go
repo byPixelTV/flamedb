@@ -56,7 +56,7 @@ func Parse(input string) (result *Query, err error) {
 			return nil, fmt.Errorf("STATS requires metric")
 		}
 		q.Metric = tokens[1]
-		// rest sind tag keys
+		// The remaining arguments are tag keys.
 		if len(tokens) > 2 && strings.ToUpper(tokens[2]) == "TAGS" {
 			for _, token := range tokens[3:] {
 				if strings.ToUpper(token) == "__LOCAL" {
@@ -165,7 +165,7 @@ func Parse(input string) (result *Query, err error) {
 		for i < len(tokens) {
 			key := tokens[i]
 
-			// standalone flags zuerst checken (kein = nötig)
+			// Check standalone flags first (no equals sign required).
 			switch strings.ToUpper(key) {
 			case "QUORUM":
 				q.Quorum = true
@@ -328,7 +328,7 @@ func Parse(input string) (result *Query, err error) {
 		return nil, fmt.Errorf("multiple metrics only supported for GET")
 	}
 
-	// keyword loop nur für GET und LEADERBOARD
+	// Process keywords only for GET and LEADERBOARD.
 	i := 2
 	for i < len(tokens) {
 		switch strings.ToUpper(tokens[i]) {
@@ -367,11 +367,11 @@ func Parse(input string) (result *Query, err error) {
 				q.Where[key] = value
 				i += 3
 
-				// check ob AND folgt
+				// Check whether AND follows.
 				if i < len(tokens) && strings.ToUpper(tokens[i]) == "AND" {
-					i++ // AND überspringen, nächste iteration macht nächstes key=value
+					i++ // Skip AND; the next iteration handles the next key=value pair.
 				} else {
-					break // kein AND, WHERE clause fertig
+					break // No AND; the WHERE clause is complete.
 				}
 			}
 		case "FROM":

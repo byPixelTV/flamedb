@@ -113,7 +113,7 @@ func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 		return &Result{Leaderboard: []types.LeaderboardEntry{}}, nil
 	}
 
-	// Windowed query: FROM oder TO gesetzt → Entity-Summen aus dem Index
+	// Windowed query: FROM or TO is set; read entity sums from the index.
 	if q.From != 0 || q.To != 0 {
 		entityTag := q.EntityTag
 		if entityTag == "" {
@@ -124,7 +124,7 @@ func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 			to = math.MaxInt64
 		}
 
-		// Alle Member-IDs aus allen Gruppen sammeln (dedupliziert)
+		// Collect and deduplicate member IDs across all groups.
 		allMembers := make([]string, 0)
 		seen := make(map[string]struct{})
 		for _, g := range q.Groups {
@@ -136,7 +136,7 @@ func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 			}
 		}
 
-		// Einzelne gezielte Index-Scans pro Member (effizient: kennen die IDs)
+		// Targeted index scans per member using the known IDs.
 		memberSums, err := e.store.WindowedEntitySums(q.Metric, entityTag, allMembers, q.From, to)
 		if err != nil {
 			return nil, err
@@ -213,7 +213,7 @@ func (e *Executor) executeStats(q *Query) (*Result, error) {
 }
 
 func (e *Executor) GetAllMetrics() []string {
-	// scan über alle keys, metric names extrahieren
+	// Scan all keys and extract metric names.
 	iter, err := e.store.DB().NewIter(&pebble.IterOptions{})
 	if err != nil {
 		return nil
@@ -232,13 +232,13 @@ func (e *Executor) GetAllMetrics() []string {
 				metrics = append(metrics, parts[0])
 			}
 		}
-		// skip index und leaderboard keys
+		// Skip index and leaderboard keys.
 		if strings.HasPrefix(key, "idx:") ||
 			strings.HasPrefix(key, "lb:") ||
 			strings.HasPrefix(key, "card:") || strings.HasPrefix(key, "card-count:") || strings.HasPrefix(key, "lb-entity:") || strings.HasPrefix(key, "repl-outbox:") || strings.HasPrefix(key, "repl-applied:") {
 			continue
 		}
-		// metric name ist alles vor dem ersten :
+		// The metric name precedes the first colon.
 		parts := strings.SplitN(key, ":", 2)
 		if len(parts) > 0 && !seen[parts[0]] {
 			seen[parts[0]] = true
@@ -324,7 +324,7 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 }
 
 func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
-	// Windowed query: FROM oder TO gesetzt → on-the-fly aus dem Sekundärindex
+	// Windowed query: FROM or TO is set; compute from the secondary index.
 	if q.From != 0 || q.To != 0 {
 		entityTag := q.EntityTag
 		if entityTag == "" {

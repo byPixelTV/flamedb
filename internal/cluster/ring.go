@@ -17,7 +17,7 @@ type Ring struct {
 	mu       sync.RWMutex
 	nodes    map[uint64]Node // hash → node
 	keys     []uint64        // sorted hashes
-	replicas int             // virtual nodes pro physical node
+	replicas int             // Virtual nodes per physical node.
 }
 
 func NewRing(replicas int) *Ring {
@@ -37,10 +37,10 @@ func (r *Ring) Add(node Node) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// check ob node bereits im ring ist
+	// Check whether the node is already in the ring.
 	for _, existing := range r.nodes {
 		if existing.ID == node.ID {
-			return // bereits drin, nichts tun
+			return // Already present; nothing to do.
 		}
 	}
 
@@ -92,7 +92,7 @@ func (r *Ring) GetN(metric string, n int) []Node {
 	seen := make(map[string]bool)
 	var nodes []Node
 
-	// iterate über alle keys, nicht nur n keys
+	// Iterate over all keys, not just n keys.
 	for i := 0; i < len(r.keys); i++ {
 		pos := (idx + i) % len(r.keys)
 		node := r.nodes[r.keys[pos]]
@@ -118,7 +118,7 @@ func (r *Ring) Get(metric string) (Node, bool) {
 
 	hash := hashKey(metric)
 
-	// binary search für nächsten node im ring
+	// Binary search for the next node in the ring.
 	idx := sort.Search(len(r.keys), func(i int) bool {
 		return r.keys[i] >= hash
 	})

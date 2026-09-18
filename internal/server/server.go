@@ -272,7 +272,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, s.cluster.ReplicationStats())
 				continue
 			case "CLUSTER_METRICS":
-				// alle metrics die dieser node hat zurückschicken
+				// Return all metrics stored on this node.
 				metrics := s.exec.GetAllMetrics()
 				data, _ := json.Marshal(metrics)
 				conn.Write(append(data, '\n'))
@@ -289,7 +289,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				// persist lokale config
 				s.persistConfig(msg)
 
-				// propagate an alle nodes (nur wenn Admin das will)
+				// Propagate to all nodes only when requested by the administrator.
 				if msg.Propagate {
 					s.cluster.BroadcastConfig(msg)
 				}
@@ -318,7 +318,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				if isNew {
 					go s.cluster.PropagateJoin(newNode, s.apiKey)
 				}
-				// alle bekannten nodes zurückschicken
+				// Return all known nodes.
 				peers := s.cluster.GetAllNodes()
 				writeJSON(conn, map[string]interface{}{
 					"cluster": "ok",
@@ -455,7 +455,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		// forwarden wenn nicht lokal
+		// Forward if not local.
 		if !q.ForceLocal && !s.cluster.IsLocal(q.Metric) {
 			result, err := s.cluster.ForwardWithFailover(q.Metric, s.apiKey, line)
 			if err != nil {
@@ -466,7 +466,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 
-		// für reads: round-robin über replicas
+		// For reads, select replicas in round-robin order.
 		switch q.Type {
 		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
 			readNode := s.cluster.GetReadNode(q.Metric)
@@ -498,7 +498,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		// nur loggen wenn nicht einfach connection closed
+		// Log errors unless the connection was simply closed.
 		if !isConnectionClosed(err) {
 			log.Printf("scanner error: %v", err)
 		}

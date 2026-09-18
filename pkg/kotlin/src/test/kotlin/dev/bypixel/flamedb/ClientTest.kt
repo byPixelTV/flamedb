@@ -17,7 +17,7 @@ class ClientTest {
      while(true){val line=reader.readLine()?:break;received.set(line)
       when {
        line.startsWith("STATS") -> reply("""{"stats":{"metric":"m","tag_stats":[{"tag_key":"p","cardinality":2}]}}""")
-       line.startsWith("LEADERBOARD") -> reply("""{"leaderboard":[{"entity_id":"Grüße 🔥","value":42}]}""")
+       line.startsWith("LEADERBOARD") -> reply("""{"leaderboard":[{"entity_id":"Hello 🌍🔥","value":42}]}""")
        else -> reply("{}")
       }
      }

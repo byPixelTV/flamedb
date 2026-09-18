@@ -1,4 +1,4 @@
-> **Upgrade-Hinweis:** Diese Version migriert alte Pebble-Datenbanken beim Start automatisch und behält vorher einen lokalen Checkpoint unter `<data_path>.pre-v2-*/db`. Der Datenpfad bleibt unverändert. Für Cluster wird weiterhin ein getrennter interner Schlüssel benötigt. Vor dem Wechsel einer bestehenden Installation bitte [Audit und Upgrade-Anleitung](AUDIT_2026-09-18.md) lesen.
+> **Upgrade notice:** This version automatically migrates legacy Pebble databases at startup after creating a local checkpoint under `<data_path>.pre-v2-*/db`. The data path remains unchanged. Clusters still require a separate internal key. Before upgrading an existing installation, read the [audit and upgrade guide](AUDIT_2026-09-18.md).
 
 <div align="center">
   <h1>FlameDB</h1>

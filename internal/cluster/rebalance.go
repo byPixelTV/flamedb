@@ -49,7 +49,7 @@ func newRebalanceConn(addr, apiKey string) (*rebalanceConn, error) {
 	}
 
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-	// 64MB buffer für große export responses
+	// 64 MB buffer for large export responses.
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	writer := bufio.NewWriter(conn)
@@ -118,7 +118,7 @@ func (c *Cluster) TriggerRebalance(store RebalanceStore, apiKey string) {
 }
 
 func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey string) {
-	// eigene fresh connection — nicht pool, vermeidet race conditions
+	// Use a dedicated fresh connection to avoid races with pooled connections.
 	rc, err := newRebalanceConn(node.Addr, apiKey)
 	if err != nil {
 		log.Printf("rebalance: could not connect to %s: %v", node.ID, err)
@@ -150,7 +150,7 @@ func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey stri
 			continue
 		}
 
-		// NEU: verhindert dass mehrere goroutines die gleiche metric importieren
+		// Prevent multiple goroutines from importing the same metric.
 		if _, loaded := c.rebalancing.LoadOrStore(metric, true); loaded {
 			continue
 		}
@@ -164,7 +164,7 @@ func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey stri
 		result, err = rc.send("CLUSTER " + string(exportPayload))
 		if err != nil {
 			log.Printf("rebalance: export request failed for %s: %v", metric, err)
-			c.rebalancing.Delete(metric) // lock freigeben bei fehler
+			c.rebalancing.Delete(metric) // Release the lock on error.
 			continue
 		}
 
@@ -183,7 +183,7 @@ func (c *Cluster) rebalanceFromNode(node Node, store RebalanceStore, apiKey stri
 
 		log.Printf("rebalance: imported metric %s (%d events, %d lb entries)",
 			metric, len(data.Events), len(data.Leaderboard))
-		c.rebalancing.Delete(metric) // nach erfolgreichem import freigeben
-		// (HasMetric gibt jetzt true zurück)
+		c.rebalancing.Delete(metric) // Release after a successful import.
+		// HasMetric now returns true.
 	}
 }

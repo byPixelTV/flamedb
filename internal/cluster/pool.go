@@ -95,7 +95,7 @@ func (np *nodePool) get(p *ConnPool, node Node) (*pooledConn, error) {
 }
 
 func (p *ConnPool) dial(node Node) (*pooledConn, error) {
-	// neue connection aufbauen
+	// Establish a new connection.
 	conn, err := net.DialTimeout("tcp", node.Addr, 3*time.Second)
 	if err != nil {
 		return nil, err

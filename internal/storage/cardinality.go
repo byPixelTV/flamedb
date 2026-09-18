@@ -31,10 +31,10 @@ func (s *Storage) updateCardinality(batch *pebble.Batch, metric string, tags map
 
 		ck := cardKey(metric, tagKey, tagValue)
 
-		// check ob dieser tagvalue bereits bekannt ist
+		// Check whether this tag value is already known.
 		_, closer, err := s.db.Get(ck)
 		if err == pebble.ErrNotFound {
-			// neuer unique value — cardinality count erhöhen
+			// New unique value: increment the cardinality count.
 			closer = nil
 			countKey := cardCountKey(metric, tagKey)
 			count := s.getCardCount(countKey)
@@ -43,7 +43,7 @@ func (s *Storage) updateCardinality(batch *pebble.Batch, metric string, tags map
 			binary.BigEndian.PutUint64(buf, uint64(count))
 			batch.Set(countKey, buf, nil)
 
-			// tagvalue als bekannt markieren
+			// Mark the tag value as known.
 			batch.Set(ck, []byte{1}, nil)
 			if s.cardCache != nil {
 				s.cardCache.add(ckey)
@@ -53,7 +53,7 @@ func (s *Storage) updateCardinality(batch *pebble.Batch, metric string, tags map
 			if s.cardCache != nil {
 				s.cardCache.add(ckey)
 			}
-			// bereits bekannt, nichts tun
+			// Already known; nothing to do.
 		} else {
 			return err
 		}
@@ -73,7 +73,7 @@ func (s *Storage) getCardCount(countKey []byte) uint64 {
 	return binary.BigEndian.Uint64(data)
 }
 
-// GetCardinality gibt die anzahl unique values für einen tag zurück
+// GetCardinality returns the number of unique values for a tag.
 func (s *Storage) GetCardinality(metric, tagKey string) uint64 {
 	return s.getCardCount(cardCountKey(metric, tagKey))
 }
@@ -93,7 +93,7 @@ func (s *Storage) BestIndexTag(metric string, tags map[string]string) (string, s
 		}
 	}
 
-	// fallback falls cardinality noch 0 ist (keine daten yet)
+	// Fallback when cardinality is still zero (no data yet).
 	if bestKey == "" {
 		for k, v := range tags {
 			bestKey = k
@@ -105,7 +105,7 @@ func (s *Storage) BestIndexTag(metric string, tags map[string]string) (string, s
 	return bestKey, bestVal
 }
 
-// TagStats für debugging / introspection
+// TagStats provides debugging and introspection data.
 type TagStats struct {
 	TagKey      string `json:"tag_key"`
 	Cardinality uint64 `json:"cardinality"`
@@ -122,5 +122,5 @@ func (s *Storage) GetTagStats(metric string, tagKeys []string) []TagStats {
 	return stats
 }
 
-// für json marshal in introspection queries
+// For JSON marshaling in introspection queries.
 var _ = json.Marshal

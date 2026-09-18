@@ -319,10 +319,10 @@ func (s *Storage) ReadPage(metric string, from, to int64, tags map[string]string
 	return events, iter.Error()
 }
 
-// ExportMetric gibt alle raw pebble keys für eine metric zurück
+// ExportMetric returns all raw Pebble keys for a metric.
 func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
 	lower := []byte(metric + ":")
-	upper := []byte(metric + ";") // ; ist ein zeichen nach : in ASCII
+	upper := []byte(metric + ";") // ';' immediately follows ':' in ASCII.
 
 	iter, err := s.db.NewIter(&pebble.IterOptions{
 		LowerBound: lower,
@@ -344,7 +344,7 @@ func (s *Storage) ExportMetric(metric string) ([]RawKV, error) {
 	return kvs, iter.Error()
 }
 
-// ExportLeaderboard gibt alle leaderboard entries für eine metric zurück
+// ExportLeaderboard returns all leaderboard entries for a metric.
 func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
 	var kvs []RawKV
 
@@ -379,7 +379,7 @@ func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
 	return kvs, nil
 }
 
-// ImportRawKVs schreibt raw keys direkt in pebble
+// ImportRawKVs writes raw keys directly to Pebble.
 func (s *Storage) ImportRawKVs(kvs []RawKV) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()

@@ -13,7 +13,7 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-// LeaderboardEntry ist ein Alias auf types.LeaderboardEntry für Rückwärtskompatibilität.
+// LeaderboardEntry aliases types.LeaderboardEntry for backward compatibility.
 type LeaderboardEntry = types.LeaderboardEntry
 
 type Leaderboard struct {
@@ -26,7 +26,7 @@ func New(db *pebble.DB) *Leaderboard {
 }
 
 // key format: lb:metric:inverted_score:entity
-// inverted score damit pebble range scan automatisch descending sorted ist
+// Invert scores so Pebble range scans return descending score order.
 func lbKey(metric, entityID string, value float64) []byte {
 	inverted := math.MaxUint64 - math.Float64bits(value)
 	score := make([]byte, 8)
@@ -117,7 +117,7 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 		return 0, err
 	}
 
-	// fallback: scan (für alte Daten ohne entity-index)
+	// Fallback: scan legacy data without an entity index.
 	prefix := []byte("lb:" + metric + ":")
 	iter, err := l.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,

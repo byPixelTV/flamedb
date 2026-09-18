@@ -13,8 +13,8 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
-// LeaderboardCache ist ein TTL-basierter In-Memory Cache für all-time
-// Leaderboard-Abfragen. Windowed Queries (FROM/TO) werden nicht gecacht.
+// LeaderboardCache is an in-memory TTL cache for all-time
+// leaderboard queries. Windowed queries (FROM/TO) are not cached.
 type LeaderboardCache struct {
 	mu      sync.RWMutex
 	ttl     time.Duration

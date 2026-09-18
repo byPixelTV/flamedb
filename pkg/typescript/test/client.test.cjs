@@ -14,11 +14,11 @@ async function fixture(t, respond, timeout=1000) {
  t.after(()=>{db.disconnect();for(const s of sockets)s.destroy();server.close();});return db;
 }
 test('concurrent lazy handshake, Unicode and response mappings',async t=>{
- const db=await fixture(t,line=>line.startsWith('STATS')?{stats:{metric:'m',tag_stats:[{tag_key:'p',cardinality:2}]}}:{leaderboard:[{entity_id:'Grüße 🔥',value:42}]});
+ const db=await fixture(t,line=>line.startsWith('STATS')?{stats:{metric:'m',tag_stats:[{tag_key:'p',cardinality:2}]}}:{leaderboard:[{entity_id:'Hello 🌍🔥',value:42}]});
  const results=await Promise.all(Array.from({length:20},()=>db.leaderboard('m')));
- for(const rows of results)assert.deepEqual(rows,[{entity_id:'Grüße 🔥',score:42}]);
+ for(const rows of results)assert.deepEqual(rows,[{entity_id:'Hello 🌍🔥',score:42}]);
  assert.equal((await db.stats('m',['p'])).tag_stats[0].cardinality,2);
- assert.deepEqual(await db.groupLeaderboard('m',[{name:'g',members:['p']}]),[{group:'Grüße 🔥',score:42}]);
+ assert.deepEqual(await db.groupLeaderboard('m',[{name:'g',members:['p']}]),[{group:'Hello 🌍🔥',score:42}]);
 });
 test('timeout rejects whole pipeline and prevents response reuse',async t=>{
  const db=await fixture(t,()=>null,30);

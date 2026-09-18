@@ -30,7 +30,7 @@ type Cluster struct {
 	failures          sync.Map
 	pool              *ConnPool
 	ReplicationFactor int
-	readCounter       atomic.Uint64 // für round-robin
+	readCounter       atomic.Uint64 // For round-robin selection.
 	replicationFactor atomic.Int32
 	readPolicy        atomic.Value
 	rebalancing       sync.Map
@@ -60,7 +60,7 @@ func New(self Node, replicas int, apiKey string, replicationFactor int) *Cluster
 		replicationQSize:  asyncReplicationQueueSize,
 		fanoutQSize:       asyncFanoutQueueSize,
 	}
-	c.Ring.Add(self) // self immer zuerst adden
+	c.Ring.Add(self) // Always add this node first.
 	c.replicationFactor.Store(int32(replicationFactor))
 	c.readPolicy.Store(defaultReadPolicy)
 	return c
@@ -239,7 +239,7 @@ func (c *Cluster) IsPrimaryFor(metric string) bool {
 	return c.getRoute(metric).isPrimary
 }
 
-// IsLocal jetzt: bin ich primary ODER replica für diese metric?
+// IsLocal reports whether this node is a primary or replica for the metric.
 func (c *Cluster) IsLocal(metric string) bool {
 	return c.getRoute(metric).isLocal
 }

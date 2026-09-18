@@ -204,7 +204,7 @@ func (c *Cluster) recoverReplicationOutbox() {
 	}
 }
 
-// ReplicateAsync — fire and forget, client wartet nicht
+// ReplicateAsync queues replication without making the client wait.
 func (c *Cluster) ReplicateAsync(metric, query string) error {
 	return c.ReplicateBatch([]ReplicationItem{{Metric: metric, Query: query}})
 }
@@ -539,7 +539,7 @@ func (c *Cluster) ReplicateQuorum(metric, query string) error {
 	return nil
 }
 
-// ReplicateWrite — entscheidet ob async oder quorum
+// ReplicateWrite selects async or quorum replication.
 func (c *Cluster) ReplicateWrite(metric, query string, quorum bool) error {
 	if quorum {
 		return c.ReplicateQuorum(metric, query)

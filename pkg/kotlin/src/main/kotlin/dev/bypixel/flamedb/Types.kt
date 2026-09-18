@@ -12,7 +12,7 @@ import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.double
 import kotlinx.serialization.json.jsonPrimitive
 
-// ─── Custom Serializer für unsaubere API-Numbers ──────────────────────────────
+// ─── Custom serializer for inconsistent API number formats ──────────────────────────────
 
 object FlexibleDoubleSerializer : KSerializer<Double> {
     override val descriptor: SerialDescriptor =

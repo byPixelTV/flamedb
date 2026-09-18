@@ -8,15 +8,15 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-// WindowedLeaderboard berechnet einen Leaderboard on-the-fly direkt aus dem
-// Sekundärindex (idx:metric:entityTag:entityID:ts → primaryKey).
+// WindowedLeaderboard computes a leaderboard directly from the
+// secondary index (idx:metric:entityTag:entityID:ts -> primaryKey).
 //
-// Strategie für Billionen Rows:
-//   - Direkter Pebble-Iterator über idx:metric:entityTag:* — kein ReadRange,
-//     keine Event-Slice im Heap.
-//   - Timestamp wird aus den letzten 8 Bytes des Indexkeys extrahiert (zero-copy).
-//   - db.Get pro Match holt nur den Wert der relevanten Events.
-//   - Aggregation direkt in eine Map — O(Events im Fenster) Zeit, O(Entities) Speicher.
+// Strategy for large datasets:
+//   - Iterate directly over idx:metric:entityTag:* without ReadRange
+//     or a heap-allocated event slice.
+//   - Extract the timestamp from the last 8 bytes of the index key (zero-copy).
+//   - Use db.Get for each match to load only relevant event values.
+//   - Aggregate directly into a map: O(events in the window) time, O(entities) space.
 func (s *Storage) WindowedLeaderboard(
 	metric string,
 	entityTag string,
@@ -43,12 +43,12 @@ func (s *Storage) WindowedLeaderboard(
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
-		// Mindestlänge: prefix + mindestens 1 Byte entityID + ':' + 8 Byte ts
+		// Minimum length: prefix + at least 1 entityID byte + colon + 8 timestamp bytes.
 		if len(key) < prefixLen+1+1+8 {
 			continue
 		}
 
-		// Timestamp: letzte 8 Bytes
+		// Timestamp: last 8 bytes.
 		ts := int64(binary.BigEndian.Uint64(key[len(key)-8:]))
 		if from > 0 && ts < from {
 			continue
@@ -57,18 +57,18 @@ func (s *Storage) WindowedLeaderboard(
 			continue
 		}
 
-		// entityID: zwischen prefix und letztem ':' vor dem timestamp
-		entityEnd := len(key) - 1 - 8 // -1 für ':', -8 für timestamp
+		// entityID: between the prefix and the last colon before the timestamp.
+		entityEnd := len(key) - 1 - 8 // -1 for ':', -8 for the timestamp.
 		if entityEnd <= prefixLen {
 			continue
 		}
 		entityID := string(key[prefixLen:entityEnd])
 
-		// Wert aus primärem Event laden
+		// Load the value from the primary event.
 		primaryKey := iter.Value()
 		data, closer, err := s.db.Get(primaryKey)
 		if err != nil {
-			continue // Event gelöscht oder noch nicht geflusht
+			continue // Event deleted or not yet flushed.
 		}
 		e, err := decodeEventValue(data, metric)
 		closer.Close()
@@ -106,10 +106,10 @@ func (s *Storage) WindowedLeaderboard(
 	return entries, nil
 }
 
-// WindowedEntitySums summiert Events im Zeitfenster pro bekannter entity-ID.
-// Genutzt von GROUP_LEADERBOARD mit FROM/TO.
-// Da die Member-IDs bekannt sind, nutzt jeder einen exakt gebundenen Index-Scan —
-// kein manuelles Timestamp-Filtering nötig.
+// WindowedEntitySums sums events within a time window for each known entity ID.
+// Used by GROUP_LEADERBOARD with FROM/TO.
+// Known member IDs allow an exactly bounded index scan for each member,
+// so no manual timestamp filtering is needed.
 func (s *Storage) WindowedEntitySums(
 	metric string,
 	entityTag string,
@@ -157,8 +157,8 @@ func (s *Storage) WindowedEntitySums(
 	return sums, nil
 }
 
-// indexTagPrefix baut das Prefix idx:metric:tagKey: ohne entityID.
-// Genutzt für WindowedLeaderboard wenn alle entityIDs unbekannt sind.
+// indexTagPrefix builds the idx:metric:tagKey: prefix without an entity ID.
+// Used by WindowedLeaderboard when entity IDs are not known in advance.
 func indexTagPrefix(metric, tagKey string) []byte {
 	buf := make([]byte, 0, 4+len(metric)+1+len(tagKey)+1)
 	buf = append(buf, 'i', 'd', 'x', ':')

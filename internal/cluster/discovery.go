@@ -38,7 +38,7 @@ type TopologyInfo struct {
 	ReadPolicy        string     `json:"read_policy"`
 }
 
-// propagiert einen neuen node an alle bekannten nodes
+// Propagate a new node to all known nodes.
 func (c *Cluster) propagateJoin(newNode Node, apiKey string) {
 	c.Ring.mu.RLock()
 	nodes := make(map[string]Node)
@@ -48,7 +48,7 @@ func (c *Cluster) propagateJoin(newNode Node, apiKey string) {
 	c.Ring.mu.RUnlock()
 
 	for _, node := range nodes {
-		// nicht an sich selbst oder den neuen node senden
+		// Do not send to this node or the new node.
 		if node.ID == c.Self.ID || node.ID == newNode.ID {
 			continue
 		}
@@ -62,7 +62,7 @@ func (c *Cluster) propagateJoin(newNode Node, apiKey string) {
 	}
 }
 
-// announced einen spezifischen node an eine adresse
+// Announce a specific node to an address.
 func (c *Cluster) announceNodeToAddr(addr string, node Node, apiKey string) error {
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
@@ -136,7 +136,7 @@ func (c *Cluster) announceToAddr(addr, apiKey string) error {
 	data, _ := json.Marshal(msg)
 	fmt.Fprintf(conn, "CLUSTER %s\n", string(data))
 
-	// response lesen — enthält peers
+	// Read the response containing peers.
 	if scanner.Scan() {
 		var resp struct {
 			Cluster string     `json:"cluster"`
@@ -154,7 +154,7 @@ func (c *Cluster) announceToAddr(addr, apiKey string) error {
 	return nil
 }
 
-// heartbeat — nur nodes die bereits im ring sind
+// Heartbeat: only nodes already in the ring.
 func (c *Cluster) StartHeartbeat(apiKey string) {
 	c.startWorker(func() {
 		ticker := time.NewTicker(5 * time.Second)

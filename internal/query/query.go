@@ -58,8 +58,8 @@ type Query struct {
 	GroupBy     time.Duration
 	GroupBySpec string
 
-	// EntityTag ist der Tag-Key für die entityID bei windowed Leaderboards.
-	// Pflichtfeld wenn FROM oder TO gesetzt ist.
+	// EntityTag is the tag key identifying entities in windowed leaderboards.
+	// Required when FROM or TO is set.
 	// Beispiel: LEADERBOARD kills FROM now-7d TO now ENTITY player
 	EntityTag string
 }
