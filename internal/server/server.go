@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -275,7 +276,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				// Return all metrics stored on this node.
 				metrics := s.exec.GetAllMetrics()
 				data, _ := json.Marshal(metrics)
-				conn.Write(append(data, '\n'))
+				writeResponse(conn, append(data, '\n'))
 				continue
 			case "SET_CONFIG":
 				if msg.ReplicationFactor > 0 {
@@ -308,7 +309,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					continue
 				}
 				encoded, _ := json.Marshal(data)
-				conn.Write(append(encoded, '\n'))
+				writeResponse(conn, append(encoded, '\n'))
 				continue
 			case "JOIN":
 				newNode := cluster.Node{ID: msg.NodeID, Addr: msg.Addr}
@@ -451,7 +452,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": err.Error()})
 				continue
 			}
-			conn.Write(append(result, '\n'))
+			writeResponse(conn, append(result, '\n'))
 			continue
 		}
 
@@ -462,7 +463,7 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": err.Error()})
 				continue
 			}
-			conn.Write(append(result, '\n'))
+			writeResponse(conn, append(result, '\n'))
 			continue
 		}
 
@@ -476,7 +477,7 @@ func (s *Server) handleConn(conn net.Conn) {
 					// fallback: lokal handlen
 					break
 				}
-				conn.Write(append(result, '\n'))
+				writeResponse(conn, append(result, '\n'))
 				continue
 			}
 		}
@@ -744,12 +745,11 @@ func writeJSON(conn net.Conn, v any) {
 	if err != nil {
 		data = []byte(`{"error":"response serialization failed"}`)
 	}
-	_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	conn.Write(append(data, '\n'))
+	writeResponse(conn, append(data, '\n'))
 }
 
 func writeEmptyResult(conn net.Conn) {
-	_, _ = conn.Write([]byte("{}\n"))
+	writeResponse(conn, []byte("{}\n"))
 }
 
 func replicaLine(line string, q *query.Query) string {
@@ -825,4 +825,25 @@ func (s *Server) executeLocal(line string, q *query.Query) (*query.Result, error
 		}
 	}
 	return result, nil
+}
+
+// writeResponse gives each response a fresh deadline. A previous response must
+// not leave an expired deadline that silently drops later acknowledgments.
+func writeResponse(conn net.Conn, data []byte) {
+	err := conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if err == nil {
+		var n int
+		n, err = conn.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
+	}
+	if err == nil {
+		err = conn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		// Do not log payloads: they may contain credentials or application data.
+		log.Printf("response write failed remote=%s: %v", conn.RemoteAddr(), err)
+		_ = conn.Close()
+	}
 }
