@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -346,11 +347,21 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
 				continue
 			}
-		case query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
+		case query.QueryTypeMetrics, query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
 			if !session.Can(auth.PermRead) {
 				writeJSON(conn, map[string]string{"error": "permission denied: read required"})
 				continue
 			}
+		}
+
+		if q.Type == query.QueryTypeMetrics {
+			keys, err := s.listMetrics(q, line)
+			if err != nil {
+				writeJSON(conn, map[string]string{"error": err.Error()})
+			} else {
+				writeJSON(conn, map[string]interface{}{"metric_keys": keys})
+			}
+			continue
 		}
 
 		// multi-metric GET: scatter/gather across nodes
@@ -490,7 +501,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			writeJSON(conn, map[string]string{"error": err.Error()})
 			continue
 		}
-		if q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete {
+		if q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet {
 			writeEmptyResult(conn)
 			continue
 		}
@@ -819,7 +830,7 @@ func (s *Server) executeLocal(line string, q *query.Query) (*query.Result, error
 	if err != nil {
 		return nil, err
 	}
-	if !q.IsReplica && (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) {
+	if !q.DryRun && !q.IsReplica && (q.Type == query.QueryTypeWrite || q.Type == query.QueryTypeSet || q.Type == query.QueryTypeDelete) {
 		if err := s.cluster.ReplicateWrite(q.Metric, replicaLine(line, q), q.Quorum); err != nil {
 			return nil, fmt.Errorf("replication failed (local write applied): %w", err)
 		}
@@ -846,4 +857,48 @@ func writeResponse(conn net.Conn, data []byte) {
 		log.Printf("response write failed remote=%s: %v", conn.RemoteAddr(), err)
 		_ = conn.Close()
 	}
+}
+
+// listMetrics gathers every node once; replicas are deduplicated and failures are explicit.
+func (s *Server) listMetrics(q *query.Query, line string) ([]string, error) {
+	keys, err := s.exec.ListMetrics(q.Where)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for _, key := range keys {
+		seen[key] = true
+	}
+	if !q.ForceLocal {
+		for _, node := range s.cluster.GetAllNodes() {
+			if node.ID == s.cluster.Self.ID {
+				continue
+			}
+			data, err := s.cluster.SendToNodeLocal(cluster.Node{ID: node.ID, Addr: node.Addr}, line)
+			if err != nil {
+				return nil, err
+			}
+			if err := upstreamError(data); err != nil {
+				return nil, err
+			}
+			var result struct {
+				Keys []string `json:"metric_keys"`
+			}
+			if err := json.Unmarshal(data, &result); err != nil {
+				return nil, err
+			}
+			if result.Keys == nil {
+				return nil, fmt.Errorf("node %s returned no metric_keys", node.ID)
+			}
+			for _, key := range result.Keys {
+				seen[key] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for key := range seen {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out, nil
 }

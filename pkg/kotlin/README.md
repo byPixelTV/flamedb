@@ -220,3 +220,74 @@ while (isActive) {
 ```
 
 A top-10 response cannot provide a global rank for players outside those ten.
+
+## Metric discovery and player UUIDs
+
+Requires a server supporting `METRICS` and read permission. Returns sorted, unique names across all known cluster nodes (an unavailable node causes an error, not a partial list). Empty results are `[]`.
+
+```kotlin
+val id = player.uniqueId.toString()
+val allKeys = db.listMetrics()
+val playerKeys = db.listMetrics(mapOf("uuid" to id))
+val events = db.get("kills", options = GetOptions(where = mapOf("uuid" to id)))
+// Reset the all-time leaderboard entry for this player:
+for (metric in allKeys) db.delete(metric, leaderboardEntity = id)
+```
+
+Store the UUID explicitly as an event tag, e.g. `WRITE kills 1 lb="<uuid>" uuid="<uuid>"`. The `lb` entity alone does not create a UUID tag. Multiple filters use AND and must match the same event. Filtered discovery includes only metrics with matching stored events; unfiltered discovery also includes leaderboard-only metrics. Discovery scans stored keys and is intended for administrative operations, not per-tick calls.
+
+Deleting `lb="<uuid>"` resets only that all-time leaderboard entry. It does not delete historical events or reset windowed aggregates. Use tag-filtered deletion below to remove one player's historical events.
+
+## Delete events by tag
+
+Requires the updated server. `DELETE kills WHERE player="abc"` deletes only events with that exact tag value. Tag names are arbitrary, multiple conditions use AND, and optional FROM/TO bounds use an inclusive start and exclusive end. All secondary indexes are removed with the events, so GET, aggregates and windowed leaderboards reflect the deletion. Explicitly empty SDK filters are rejected; omit the filter only for the existing unfiltered deletion behavior.
+
+```kotlin
+val filter = mapOf("player" to player.uniqueId.toString())
+
+// Delete one metric's matching events:
+db.delete("kills", where = filter)
+
+// Delete matching events across all discovered metrics:
+for (metric in db.listMetrics(filter)) {
+    db.delete(metric, where = filter)
+}
+
+// Full player reset when the UUID is also the leaderboard entity ID.
+// Use all keys so leaderboard-only entries are included too.
+for (metric in db.listMetrics()) {
+    db.delete(metric, where = filter, leaderboardEntity = player.uniqueId.toString())
+}
+```
+
+A tag filter alone does not change all-time leaderboard scores: stored events do not record the `lb` entity, and SET can independently override its score. To reset a known entity, combine the filter with `leaderboardEntity`; this removes that **entire** all-time entry regardless of the event filter/time range, atomically with the matching events for this metric. It does not subtract event values or infer entity IDs from tag values.
+
+The loop across metrics is not an atomic cluster-wide operation. Stop concurrent writes for the player during a complete reset; new events may otherwise arrive during or after it. Errors propagate, and completed metric deletions are not rolled back. The server uses the existing primary routing and replication path; default replication remains asynchronous. Protocol callers can request `QUORUM`.
+
+## Generic bulk deletion and preview
+
+`deleteByTags` (`DeleteByTags` in Go) requires a non-empty tag filter and processes discovered metrics sequentially. Optional time bounds and an explicit leaderboard entity have the same semantics as single-metric deletion. With an explicit leaderboard entity, discovery includes all metrics so leaderboard-only entries are handled too.
+
+```kotlin
+val filter = mapOf("account" to accountId)
+val preview = db.deleteByTags(filter, dryRun = true)
+println("${preview.events} events, ${preview.leaderboardEntries} leaderboard entries")
+
+val deleted = db.deleteByTags(filter)
+for (item in deleted.metrics) {
+    if (item.error != null) println("${item.metric}: ${item.error}")
+    else println("${item.metric}: ${item.result?.events} deleted events")
+}
+// Optional: remove this explicit all-time entity across all metrics as well.
+val reset = db.deleteByTags(filter, leaderboardEntity = accountId)
+// Single-metric preview/result:
+val one = db.delete("requests", where = filter, dryRun = true)
+```
+
+Results contain the dry-run flag, total event/leaderboard-entry counts, and a per-metric list with either a result or an error. In preview mode counts mean **would be deleted**; otherwise they mean **confirmed deleted**. A missing entity and an existing zero-score entity are distinguished. Zero matches succeed with zero counts.
+
+Discovery failures abort the call. Per-metric failures are collected while remaining metrics are attempted. Totals exclude failed/unknown outcomes: a transport or replication error may occur after the primary already applied a deletion. The helper does not retry failed mutations automatically. Go returns a partial report plus an error on context cancellation; Kotlin propagates coroutine cancellation.
+
+Preview and execution are separate calls, not a reserved snapshot or a transaction across metrics. Concurrent writes can change the counts. Inspect `metrics` for errors before treating a preview or deletion as complete. Both require write permission; discovery additionally requires read permission.
+
+Update servers before using these SDK methods. The preview sends `PREVIEW_DELETE <metric> [WHERE ...] [lb="..."] [FROM ...] [TO ...]`, which performs no replication or data changes. Actual `DELETE` now returns `{"delete":{"dry_run":false,"events":42,"leaderboard_entries":1}}`; preview returns the same shape with `dry_run:true`. Missing/inconsistent counters are reported as errors instead of being presented as a successful zero count.

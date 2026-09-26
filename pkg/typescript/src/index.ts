@@ -43,6 +43,27 @@ export interface AggregateResult {
   count: number;
 }
 
+export interface DeleteResult {
+  dry_run: boolean;
+  events: number;
+  leaderboard_entries: number;
+}
+export interface DeleteOptions {
+  leaderboardEntity?: string;
+  from?: Date;
+  to?: Date;
+  where?: Record<string, string>;
+  dryRun?: boolean;
+}
+export interface MetricDeleteResult {
+  metric: string;
+  result?: DeleteResult;
+  error?: string;
+}
+export interface DeleteByTagsResult extends DeleteResult {
+  metrics: MetricDeleteResult[];
+}
+
 export interface StatsResult {
   metric: string;
   tag_stats: TagStats[];
@@ -301,15 +322,45 @@ export class FlameDB {
 
   async delete(
     metric: string,
-    options: { leaderboardEntity?: string; from?: Date; to?: Date } = {},
-  ): Promise<void> {
+    options: DeleteOptions = {},
+  ): Promise<DeleteResult> {
     const parts = [`DELETE ${identifier(metric)}`];
+    if (options.dryRun) parts[0] = `PREVIEW_DELETE ${identifier(metric)}`;
+    if (options.where !== undefined) {
+      const clauses = Object.entries(options.where).map(([k, v]) => `${identifier(k)}=${JSON.stringify(v)}`).join(" AND ");
+      if (!clauses) throw new Error("delete filter must not be empty");
+      parts.push(`WHERE ${clauses}`);
+    }
     if (options.leaderboardEntity !== undefined) {
       parts.push(`lb=${JSON.stringify(options.leaderboardEntity)}`);
     }
     if (options.from) parts.push(`FROM ${fmtDate(options.from)}`);
     if (options.to) parts.push(`TO ${fmtDate(options.to)}`);
-    await this.getConn().command(parts.join(" "));
+    const response = await this.getConn().command(parts.join(" ")) as {delete?: DeleteResult};
+    if (!response.delete || response.delete.dry_run !== (options.dryRun ?? false) ||
+        !Number.isSafeInteger(response.delete.events) || response.delete.events < 0 ||
+        !Number.isSafeInteger(response.delete.leaderboard_entries) || response.delete.leaderboard_entries < 0)
+      throw new Error("missing or inconsistent delete result (updated server required)");
+    return response.delete;
+  }
+
+  /** Totals include confirmed results only; errors may have applied remotely. */
+  async deleteByTags(where: Record<string, string>, options: Omit<DeleteOptions, "where"> = {}): Promise<DeleteByTagsResult> {
+    if (!Object.keys(where).length) throw new Error("delete filter must not be empty");
+    Object.keys(where).forEach(identifier);
+    const keys = await this.listMetrics(options.leaderboardEntity !== undefined ? {} : where);
+    const report: DeleteByTagsResult = {dry_run: options.dryRun ?? false, events: 0, leaderboard_entries: 0, metrics: []};
+    for (const metric of keys) {
+      try {
+        const result = await this.delete(metric, {...options, where});
+        report.metrics.push({metric, result});
+        report.events += result.events;
+        report.leaderboard_entries += result.leaderboard_entries;
+      } catch (error) {
+        report.metrics.push({metric, error: error instanceof Error ? error.message : String(error)});
+      }
+    }
+    return report;
   }
 
   // ─── Get ────────────────────────────────────────────────────────────────────
@@ -371,6 +422,13 @@ export class FlameDB {
   }
 
   // ─── Stats ───────────────────────────────────────────────────────────────────
+
+  /** Lists cluster-wide metric names, optionally filtered by event tags. */
+  async listMetrics(where: Record<string, string> = {}): Promise<string[]> {
+    const clauses = Object.entries(where).map(([k, v]) => `${identifier(k)}=${JSON.stringify(v)}`).join(" AND ");
+    const result = await this.getConn().command("METRICS" + (clauses ? ` WHERE ${clauses}` : "")) as { metric_keys: string[] };
+    return result.metric_keys;
+  }
 
   async stats(metric: string, tags: string[]): Promise<StatsResult> {
     const cmd = `STATS ${identifier(metric)} TAGS ${tags.map(identifier).join(" ")}`;

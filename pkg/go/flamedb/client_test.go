@@ -266,3 +266,61 @@ func TestReconnectHandshakeHonorsContext(t *testing.T) {
 		t.Fatal("reconnect socket not closed")
 	}
 }
+
+func TestListMetrics(t *testing.T) {
+	c := fakeServer(t, func(line string) string {
+		if line == "METRICS" {
+			return `{"metric_keys":[]}`
+		}
+		if line != `METRICS WHERE uuid="player-id"` {
+			t.Errorf("unexpected command: %s", line)
+		}
+		return `{"metric_keys":["smp:kills"]}`
+	})
+	keys, err := c.ListMetrics(context.Background(), nil)
+	if err != nil || len(keys) != 0 {
+		t.Fatal(keys, err)
+	}
+	keys, err = c.ListMetrics(context.Background(), map[string]string{"uuid": "player-id"})
+	if err != nil || len(keys) != 1 || keys[0] != "smp:kills" {
+		t.Fatal(keys, err)
+	}
+}
+
+func TestDeleteWhere(t *testing.T) {
+	var received string
+	c := fakeServer(t, func(line string) string {
+		received = line
+		return `{"delete":{"dry_run":false,"events":2,"leaderboard_entries":1}}`
+	})
+	err := c.Delete(context.Background(), "kills", DeleteOpts{Where: map[string]string{"player": "a\"b"}, LeaderboardEntity: "a"})
+	if err != nil || received != `DELETE kills WHERE player="a\"b" lb="a"` {
+		t.Fatal(received, err)
+	}
+	if err := c.Delete(context.Background(), "kills", DeleteOpts{Where: map[string]string{}}); err == nil {
+		t.Fatal("empty filter accepted")
+	}
+}
+
+func TestDeleteByTagsReport(t *testing.T) {
+	c := fakeServer(t, func(line string) string {
+		switch {
+		case line == "METRICS":
+			return `{"metric_keys":["a","b","c"]}`
+		case strings.HasPrefix(line, "PREVIEW_DELETE b"):
+			return `{"error":"unavailable"}`
+		default:
+			if !strings.Contains(line, `WHERE player="id"`) || !strings.HasPrefix(line, "PREVIEW_DELETE ") {
+				t.Errorf("unexpected: %s", line)
+			}
+			return `{"delete":{"dry_run":true,"events":3,"leaderboard_entries":1}}`
+		}
+	})
+	report, err := c.DeleteByTags(context.Background(), map[string]string{"player": "id"}, DeleteOpts{DryRun: true, LeaderboardEntity: "id"})
+	if err != nil || report.Events != 6 || report.LeaderboardEntries != 2 || len(report.Metrics) != 3 || report.Metrics[1].Error == "" {
+		t.Fatal(report, err)
+	}
+	if _, err := c.DeleteByTags(context.Background(), nil, DeleteOpts{}); err == nil {
+		t.Fatal("empty filter accepted")
+	}
+}

@@ -16,6 +16,8 @@ class ClientTest {
      reply("""{"auth":"required"}""");reader.readLine();reply("""{"auth":"ok"}""")
      while(true){val line=reader.readLine()?:break;received.set(line)
       when {
+       line.startsWith("METRICS") -> reply("""{"metric_keys":["smp:kills"]}""")
+       line.startsWith("DELETE") || line.startsWith("PREVIEW_DELETE") -> reply("""{"delete":{"dry_run":${line.startsWith("PREVIEW_DELETE")},"events":2,"leaderboard_entries":1}}""")
        line.startsWith("STATS") -> reply("""{"stats":{"metric":"m","tag_stats":[{"tag_key":"p","cardinality":2}]}}""")
        line.startsWith("LEADERBOARD") -> reply("""{"leaderboard":[{"entity_id":"Hello 🌍🔥","value":42}]}""")
        else -> reply("{}")
@@ -24,6 +26,18 @@ class ClientTest {
     }
    }
    FlameDB.connect(FlameDBConfig("127.0.0.1",server.localPort,"test")).use { db ->
+    assertEquals(listOf("smp:kills"), db.listMetrics())
+    assertEquals("METRICS", received.get())
+    assertEquals(listOf("smp:kills"), db.listMetrics(mapOf("uuid" to "player-id")))
+    assertEquals("METRICS WHERE uuid=\"player-id\"", received.get())
+    db.delete("kills", where=mapOf("player" to "a"), leaderboardEntity="a")
+    assertEquals("DELETE kills WHERE player=\"a\" lb=\"a\"", received.get())
+    assertFailsWith<IllegalArgumentException>{db.delete("kills", where=emptyMap())}
+    val preview = db.deleteByTags(mapOf("player" to "a"), dryRun=true)
+    assertEquals(2L, preview.events)
+    assertTrue(preview.dryRun)
+    assertEquals(1, preview.metrics.size)
+    assertEquals("PREVIEW_DELETE smp:kills WHERE player=\"a\"", received.get())
     assertEquals(42.0,db.leaderboard("m").single().score)
     assertEquals(2,db.stats("m","p").tagStats.single().cardinality)
     db.write("m",1.0,WriteOptions(tags=mapOf("p" to "a\"\nb")))

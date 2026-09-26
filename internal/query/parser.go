@@ -50,6 +50,31 @@ func Parse(input string) (result *Query, err error) {
 	}
 
 	switch strings.ToUpper(tokens[0]) {
+	case "METRICS":
+		q.Type = QueryTypeMetrics
+		i := 1
+		if i < len(tokens) && strings.EqualFold(tokens[i], "WHERE") {
+			i++
+			for {
+				if i+2 >= len(tokens) || tokens[i+1] != "=" {
+					return nil, fmt.Errorf("invalid METRICS WHERE clause")
+				}
+				q.Where[tokens[i]] = tokenValue(tokens[i+2])
+				i += 3
+				if i >= len(tokens) || !strings.EqualFold(tokens[i], "AND") {
+					break
+				}
+				i++
+			}
+		}
+		if i < len(tokens) && strings.EqualFold(tokens[i], "__LOCAL") {
+			q.ForceLocal = true
+			i++
+		}
+		if i != len(tokens) {
+			return nil, fmt.Errorf("unexpected METRICS argument")
+		}
+		return q, nil
 	case "STATS":
 		q.Type = QueryTypeStats
 		if len(tokens) < 2 {
@@ -249,8 +274,9 @@ func Parse(input string) (result *Query, err error) {
 		}
 		return q, nil
 
-	case "DELETE":
+	case "DELETE", "PREVIEW_DELETE":
 		q.Type = QueryTypeDelete
+		q.DryRun = strings.EqualFold(tokens[0], "PREVIEW_DELETE")
 		if len(tokens) < 2 {
 			return nil, fmt.Errorf("DELETE requires metric")
 		}
@@ -260,6 +286,25 @@ func Parse(input string) (result *Query, err error) {
 		i := 2
 		for i < len(tokens) {
 			switch strings.ToUpper(tokens[i]) {
+			case "WHERE":
+				i++
+				for {
+					if i+2 >= len(tokens) || tokens[i+1] != "=" {
+						return nil, fmt.Errorf("invalid DELETE WHERE clause")
+					}
+					q.Where[tokens[i]] = tokenValue(tokens[i+2])
+					i += 3
+					if i >= len(tokens) || !strings.EqualFold(tokens[i], "AND") {
+						break
+					}
+					i++
+				}
+			case "DRY_RUN":
+				q.DryRun = true
+				i++
+			case "QUORUM":
+				q.Quorum = true
+				i++
 			case "__REPLICA":
 				q.IsReplica = true
 				i++
@@ -299,7 +344,7 @@ func Parse(input string) (result *Query, err error) {
 					}
 					i += 3
 				} else {
-					i++
+					return nil, fmt.Errorf("unexpected DELETE argument: %s", tokens[i])
 				}
 			}
 		}
@@ -352,9 +397,9 @@ func Parse(input string) (result *Query, err error) {
 			q.GroupBy = dur
 			i += 3
 		case "WHERE":
-			// WHERE key = "value" AND key2 = "value2" AND ...
+			// Require at least one complete clause, also after AND.
 			i++
-			for i < len(tokens) {
+			for {
 				if i+2 >= len(tokens) {
 					return nil, fmt.Errorf("invalid WHERE clause")
 				}
@@ -582,6 +627,9 @@ func parseDurationSpec(spec string) (time.Duration, error) {
 }
 
 func validateQuery(q *Query) error {
+	if q.DryRun && (q.IsReplica || q.Quorum) {
+		return fmt.Errorf("DRY_RUN cannot be combined with replication flags or QUORUM")
+	}
 	if q.Limit < 0 || q.Offset < 0 || q.Limit > 1000000 {
 		return fmt.Errorf("invalid pagination (LIMIT must be between 0 and 1000000)")
 	}
@@ -595,6 +643,9 @@ func validateQuery(q *Query) error {
 		return fmt.Errorf("invalid time range")
 	}
 	for _, m := range append([]string{q.Metric}, q.Metrics...) {
+		if q.Type == QueryTypeMetrics {
+			break
+		}
 		if m == "" || strings.ContainsAny(m, ",=\" \t\r\n") || m == "idx" || m == "lb" || m == "lb-entity" || m == "card" || m == "card-count" || m == "repl-applied" || m == "repl-outbox" {
 			return fmt.Errorf("invalid or reserved metric: %s", m)
 		}
@@ -610,7 +661,7 @@ func validateQuery(q *Query) error {
 		return fmt.Errorf("invalid entity tag")
 	}
 	if q.Type == QueryTypeDelete && len(q.Tags) > 0 {
-		return fmt.Errorf("DELETE supports lb and time ranges only")
+		return fmt.Errorf("DELETE supports WHERE, lb and time ranges only")
 	}
 	if q.Type == QueryTypeSet && (!q.UpdateLB || q.LBEntityID == "") {
 		return fmt.Errorf("SET requires lb")

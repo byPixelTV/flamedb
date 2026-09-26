@@ -151,3 +151,18 @@ class FlameDBException : RuntimeException {
     constructor(message: String) : super(message)
     constructor(message: String, cause: Throwable) : super(message, cause)
 }
+
+/** Counts are a preview when dryRun is true, otherwise confirmed deletions. */
+@Serializable
+data class DeleteResult(
+ @SerialName("dry_run") val dryRun: Boolean,
+ val events: Long,
+ @SerialName("leaderboard_entries") val leaderboardEntries: Long,
+)
+data class MetricDeleteResult(val metric: String, val result: DeleteResult? = null, val error: String? = null)
+data class DeleteByTagsResult(
+ val dryRun: Boolean,
+ val events: Long,
+ val leaderboardEntries: Long,
+ val metrics: List<MetricDeleteResult>,
+)

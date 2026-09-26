@@ -143,6 +143,22 @@ func testTwoNodeQuorum(t *testing.T, metric string) {
 	if v["accepted"] != float64(1) || v["failed"] != float64(0) {
 		t.Fatal(v)
 	}
+	// Each replica reports the same key, but discovery must return it once.
+	if result := frame(t, conn, sc, "METRICS"); fmt.Sprint(result["metric_keys"]) != "["+metric+"]" {
+		t.Fatal(result)
+	}
+	// Add a metric only on the other node to verify cluster-wide gathering.
+	for _, n := range nodes {
+		if n.c.Self.ID == ingress.c.Self.ID {
+			continue
+		}
+		if err := n.store.WriteEvent(storage.Event{Metric: "remote-only", Timestamp: 123, Value: 1, Tags: map[string]string{"uuid": "remote-player"}}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if result := frame(t, conn, sc, `METRICS WHERE uuid="remote-player"`); fmt.Sprint(result["metric_keys"]) != "[remote-only]" {
+		t.Fatal(result)
+	}
 	var stamp int64
 	for i, n := range nodes {
 		events, err := n.store.ReadRange(metric, 0, 1<<62)
@@ -170,6 +186,68 @@ func testTwoNodeQuorum(t *testing.T, metric string) {
 		score, err := aggregates.New(n.store.DB()).Get(metric, "p")
 		if err != nil || score != 6 {
 			t.Fatalf("async SET / quorum WRITE reordered: %v %v", score, err)
+		}
+	}
+	// Filtered deletion is forwarded to the primary and applied on both replicas.
+	for _, line := range []string{
+		fmt.Sprintf(`WRITE %s 2 player="a" lb="a" QUORUM`, metric),
+		fmt.Sprintf(`WRITE %s 4 player="b" lb="b" QUORUM`, metric),
+		fmt.Sprintf(`PREVIEW_DELETE %s WHERE player="a" lb="a"`, metric),
+		fmt.Sprintf(`DELETE %s WHERE player="a" lb="a" QUORUM`, metric),
+	} {
+		result := frame(t, conn, sc, line)
+		if result["error"] != nil {
+			t.Fatal(result)
+		}
+		if strings.HasPrefix(line, "DELETE") || strings.HasPrefix(line, "PREVIEW_DELETE") {
+			deletion := result["delete"].(map[string]any)
+			if deletion["events"] != float64(1) || deletion["leaderboard_entries"] != float64(1) {
+				t.Fatal(result)
+			}
+			if deletion["dry_run"] != strings.HasPrefix(line, "PREVIEW_DELETE") {
+				t.Fatal(result)
+			}
+		}
+	}
+	for _, n := range nodes {
+		rows, err := n.store.ReadRangeWithTags(metric, 0, 1<<62, map[string]string{"player": "a"})
+		if err != nil || len(rows) != 0 {
+			t.Fatal(rows, err)
+		}
+		rows, err = n.store.ReadRangeWithTags(metric, 0, 1<<62, map[string]string{"player": "b"})
+		if err != nil || len(rows) != 1 {
+			t.Fatal(rows, err)
+		}
+		score, err := aggregates.New(n.store.DB()).Get(metric, "a")
+		if err != nil || score != 0 {
+			t.Fatal(score, err)
+		}
+	}
+
+}
+
+func TestMetricDiscovery(t *testing.T) {
+	c, sc := testConnection(t, "user")
+	if got := frame(t, c, sc, "METRICS")["metric_keys"].([]any); len(got) != 0 {
+		t.Fatal(got)
+	}
+	for _, line := range []string{`WRITE smp:kills 1 uuid="a" region="eu"`, `WRITE deaths 1 uuid="b"`, `SET balance 4 lb="a"`} {
+		if v := frame(t, c, sc, line); v["error"] != nil {
+			t.Fatal(v)
+		}
+	}
+	for line, want := range map[string]string{
+		"METRICS":                                "[balance deaths smp:kills]",
+		`METRICS WHERE uuid="a"`:                 "[smp:kills]",
+		`METRICS WHERE uuid="a" AND region="us"`: "[]",
+	} {
+		if v := frame(t, c, sc, line); fmt.Sprint(v["metric_keys"]) != want {
+			t.Fatalf("%s: %v", line, v)
+		}
+	}
+	for _, line := range []string{"METRICS WHERE", `METRICS WHERE uuid="a" AND`, "METRICS LIMIT 1", "METRICS __local"} {
+		if v := frame(t, c, sc, line); v["error"] == nil {
+			t.Fatal(line, v)
 		}
 	}
 }

@@ -496,24 +496,74 @@ func (s *Storage) RecordCommittedEvent(e Event) {
 }
 
 func (s *Storage) StageDeleteRange(batch *pebble.Batch, metric string, from, to int64) error {
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: eventKey(metric, from), UpperBound: eventKey(metric, to)})
+	return s.StageDeleteWhere(batch, metric, from, to, nil)
+}
+
+// StageDeleteWhere stages matching events and all their secondary indexes atomically.
+// Tags use exact AND matching. The interval is [from, to).
+func (s *Storage) StageDeleteWhere(batch *pebble.Batch, metric string, from, to int64, where map[string]string) error {
+	_, err := s.ScanDeleteWhere(batch, metric, from, to, where)
+	return err
+}
+
+// ScanDeleteWhere counts matching events, staging deletions only when batch is non-nil.
+func (s *Storage) ScanDeleteWhere(batch *pebble.Batch, metric string, from, to int64, where map[string]string) (int64, error) {
+	var count int64
+	lower, upper := eventKey(metric, from), eventKey(metric, to)
+	indexed := len(where) > 0
+	if indexed {
+		k, v := s.BestIndexTag(metric, where)
+		lower, upper = indexKey(metric, k, v, from), indexKey(metric, k, v, to)
+	}
+	snapshot := s.db.NewSnapshot()
+	defer snapshot.Close()
+	iter, err := snapshot.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer iter.Close()
 	for iter.First(); iter.Valid(); iter.Next() {
-		e, err := decodeEventValue(iter.Value(), metric)
+		primaryKey := iter.Key()
+		var e Event
+		if indexed {
+			primaryKey = iter.Value()
+			data, closer, getErr := snapshot.Get(primaryKey)
+			if getErr == pebble.ErrNotFound {
+				continue
+			}
+			if getErr != nil {
+				return 0, getErr
+			}
+			e, err = decodeEventValue(data, metric)
+			closer.Close()
+		} else {
+			e, err = decodeEventValue(iter.Value(), metric)
+		}
 		if err != nil {
-			return err
+			return 0, err
+		}
+		matches := true
+		for k, v := range where {
+			if actual, exists := e.Tags[k]; !exists || actual != v {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		count++
+		if batch == nil {
+			continue
 		}
 		for k, v := range e.Tags {
 			if err := batch.Delete(indexKey(metric, k, v, e.Timestamp), nil); err != nil {
-				return err
+				return 0, err
 			}
 		}
-		if err := batch.Delete(iter.Key(), nil); err != nil {
-			return err
+		if err := batch.Delete(primaryKey, nil); err != nil {
+			return 0, err
 		}
 	}
-	return iter.Error()
+	return count, iter.Error()
 }

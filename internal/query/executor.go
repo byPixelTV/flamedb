@@ -33,6 +33,9 @@ func NewExecutor(store *storage.Storage, lb *aggregates.Leaderboard) *Executor {
 
 func (e *Executor) Execute(q *Query) (*Result, error) {
 	switch q.Type {
+	case QueryTypeMetrics:
+		keys, err := e.ListMetrics(q.Where)
+		return &Result{MetricKeys: keys}, err
 	case QueryTypeWrite:
 		return e.executeWrite(q)
 	case QueryTypeSet:
@@ -214,10 +217,38 @@ func (e *Executor) executeStats(q *Query) (*Result, error) {
 }
 
 func (e *Executor) GetAllMetrics() []string {
+	metrics, _ := e.listAllMetrics()
+	return metrics
+}
+
+// ListMetrics returns sorted metric names with at least one matching event when filtered.
+func (e *Executor) ListMetrics(where map[string]string) ([]string, error) {
+	metrics, err := e.listAllMetrics()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(metrics))
+	for _, metric := range metrics {
+		if len(where) > 0 {
+			result, err := e.executeGet(&Query{Metric: metric, Where: where, Limit: 1, Order: "DESC"})
+			if err != nil {
+				return nil, err
+			}
+			if len(result.Events) == 0 {
+				continue
+			}
+		}
+		out = append(out, metric)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (e *Executor) listAllMetrics() ([]string, error) {
 	// Scan all keys and extract metric names.
 	iter, err := e.store.DB().NewIter(&pebble.IterOptions{})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer iter.Close()
 
@@ -250,7 +281,7 @@ func (e *Executor) GetAllMetrics() []string {
 			metrics = append(metrics, parts[0])
 		}
 	}
-	return metrics
+	return metrics, iter.Error()
 }
 
 func (e *Executor) executeSet(q *Query) (*Result, error)    { return e.executeMutation(q) }
@@ -262,6 +293,7 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 		q.Timestamp = e.nextTimestamp()
 	}
 	event := storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags}
+	deleted := &DeleteResult{DryRun: q.DryRun}
 	applied := false
 	err := e.lb.AtomicMutation(q.Metric, q.LBEntityID, func(batch *pebble.Batch) error {
 		receipt := []byte("repl-applied:" + q.OperationID)
@@ -295,17 +327,33 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 			}
 		case QueryTypeDelete:
 			if q.UpdateLB {
-				if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, 0, true); err != nil {
+				exists, err := e.lb.Exists(q.Metric, q.LBEntityID)
+				if err != nil {
 					return err
 				}
-			} else {
+				if exists {
+					deleted.LeaderboardEntries = 1
+				}
+				if !q.DryRun {
+					if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, 0, true); err != nil {
+						return err
+					}
+				}
+			}
+			if !q.UpdateLB || len(q.Where) > 0 {
 				to := q.To
 				if to == 0 {
 					to = math.MaxInt64
 				}
-				if err := e.store.StageDeleteRange(batch, q.Metric, q.From, to); err != nil {
+				target := batch
+				if q.DryRun {
+					target = nil
+				}
+				count, err := e.store.ScanDeleteWhere(target, q.Metric, q.From, to, q.Where)
+				if err != nil {
 					return err
 				}
+				deleted.Events = count
 			}
 		}
 		if q.IsReplica && q.OperationID != "" {
@@ -319,11 +367,14 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if applied {
+	if applied && !q.DryRun {
 		if q.Type == QueryTypeWrite {
 			e.store.RecordCommittedEvent(event)
 		}
 		e.cache.Invalidate(q.Metric)
+	}
+	if q.Type == QueryTypeDelete {
+		return &Result{Delete: deleted}, nil
 	}
 	return &Result{}, nil
 }

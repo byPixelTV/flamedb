@@ -435,19 +435,43 @@ func (c *Client) Set(ctx context.Context, metric string, value float64, leaderbo
 
 // DeleteOpts configures a DELETE command.
 type DeleteOpts struct {
+	DryRun bool
+	// Where matches event tags with AND. When combined with LeaderboardEntity,
+	// deletes matching events and that entire all-time leaderboard entry.
+	Where             map[string]string
 	LeaderboardEntity string
 	From              time.Time
 	To                time.Time
 }
 
 // Delete sends a DELETE command.
+// Delete preserves the existing error-only API.
 func (c *Client) Delete(ctx context.Context, metric string, opts DeleteOpts) error {
-	if err := validateIdentifiers([]string{metric}, nil); err != nil {
-		return err
+	_, err := c.DeleteWithResult(ctx, metric, opts)
+	return err
+}
+
+func (c *Client) DeleteWithResult(ctx context.Context, metric string, opts DeleteOpts) (*DeleteResult, error) {
+	if opts.Where != nil && len(opts.Where) == 0 {
+		return nil, fmt.Errorf("flamedb: delete filter must not be empty")
+	}
+	if err := validateIdentifiers([]string{metric}, opts.Where); err != nil {
+		return nil, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	parts := []string{"DELETE " + metric}
+	if opts.DryRun {
+		parts[0] = "PREVIEW_DELETE " + metric
+	}
+	if len(opts.Where) > 0 {
+		clauses := make([]string, 0, len(opts.Where))
+		for k, v := range opts.Where {
+			value, _ := json.Marshal(v)
+			clauses = append(clauses, k+"="+string(value))
+		}
+		parts = append(parts, "WHERE "+strings.Join(clauses, " AND "))
+	}
 	if opts.LeaderboardEntity != "" {
 		parts = append(parts, fmt.Sprintf(`lb=%q`, opts.LeaderboardEntity))
 	}
@@ -457,8 +481,22 @@ func (c *Client) Delete(ctx context.Context, metric string, opts DeleteOpts) err
 	if !opts.To.IsZero() {
 		parts = append(parts, "TO "+fmtDate(opts.To))
 	}
-	_, err := c.command(ctx, strings.Join(parts, " "))
-	return err
+	response, err := c.command(ctx, strings.Join(parts, " "))
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		DryRun             *bool  `json:"dry_run"`
+		Events             *int64 `json:"events"`
+		LeaderboardEntries *int64 `json:"leaderboard_entries"`
+	}
+	if err := json.Unmarshal(response["delete"], &result); err != nil {
+		return nil, fmt.Errorf("flamedb: invalid delete result (updated server required): %w", err)
+	}
+	if result.DryRun == nil || result.Events == nil || result.LeaderboardEntries == nil || *result.Events < 0 || *result.LeaderboardEntries < 0 || *result.DryRun != opts.DryRun {
+		return nil, fmt.Errorf("flamedb: missing or inconsistent delete result")
+	}
+	return &DeleteResult{DryRun: *result.DryRun, Events: *result.Events, LeaderboardEntries: *result.LeaderboardEntries}, nil
 }
 
 // ─── Get ──────────────────────────────────────────────────────────────────────
@@ -632,4 +670,88 @@ func validateIdentifiers(names []string, tags map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// ListMetrics lists cluster-wide metric names, optionally filtered by event tags.
+// Pass nil to list all metrics, including metrics with only leaderboard entries.
+func (c *Client) ListMetrics(ctx context.Context, where map[string]string) ([]string, error) {
+	if err := validateIdentifiers(nil, where); err != nil {
+		return nil, err
+	}
+	cmd := "METRICS"
+	clauses := make([]string, 0, len(where))
+	for k, v := range where {
+		value, _ := json.Marshal(v)
+		clauses = append(clauses, k+"="+string(value))
+	}
+	if len(clauses) > 0 {
+		cmd += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result, err := c.command(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+	keys := []string{}
+	if err := json.Unmarshal(result["metric_keys"], &keys); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+// DeleteResult counts affected events and entire leaderboard entries.
+// With DryRun, counts describe a preview, not completed deletions.
+type DeleteResult struct {
+	DryRun             bool  `json:"dry_run"`
+	Events             int64 `json:"events"`
+	LeaderboardEntries int64 `json:"leaderboard_entries"`
+}
+type MetricDeleteResult struct {
+	Metric string
+	Result *DeleteResult
+	Error  string
+}
+type DeleteByTagsResult struct {
+	DryRun             bool
+	Events             int64
+	LeaderboardEntries int64
+	Metrics            []MetricDeleteResult
+}
+
+// DeleteByTags discovers metrics and processes them sequentially. Per-metric
+// failures are reported and are never automatically retried. Totals include only
+// confirmed results; an error can mean the server applied the operation.
+func (c *Client) DeleteByTags(ctx context.Context, where map[string]string, opts DeleteOpts) (*DeleteByTagsResult, error) {
+	if len(where) == 0 {
+		return nil, fmt.Errorf("flamedb: delete filter must not be empty")
+	}
+	if err := validateIdentifiers(nil, where); err != nil {
+		return nil, err
+	}
+	opts.Where = where
+	discovery := where
+	if opts.LeaderboardEntity != "" {
+		discovery = nil
+	}
+	keys, err := c.ListMetrics(ctx, discovery)
+	if err != nil {
+		return nil, err
+	}
+	report := &DeleteByTagsResult{DryRun: opts.DryRun, Metrics: make([]MetricDeleteResult, 0, len(keys))}
+	for _, metric := range keys {
+		if err := ctx.Err(); err != nil {
+			return report, err
+		}
+		result, err := c.DeleteWithResult(ctx, metric, opts)
+		item := MetricDeleteResult{Metric: metric, Result: result}
+		if err != nil {
+			item.Error = err.Error()
+		} else {
+			report.Events += result.Events
+			report.LeaderboardEntries += result.LeaderboardEntries
+		}
+		report.Metrics = append(report.Metrics, item)
+	}
+	return report, nil
 }

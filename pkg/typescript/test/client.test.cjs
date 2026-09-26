@@ -78,3 +78,36 @@ for (const mode of ['disconnect', 'timeout']) {
   assert.equal(connections,3);
  });
 }
+
+test('lists all metrics and filters by UUID', async t => {
+ const db=await fixture(t,line=>{
+  if(line==='METRICS')return {metric_keys:[]};
+  assert.equal(line,'METRICS WHERE uuid="player-id"');
+  return {metric_keys:['smp:kills']};
+ });
+ assert.deepEqual(await db.listMetrics(),[]);
+ assert.deepEqual(await db.listMetrics({uuid:'player-id'}),['smp:kills']);
+});
+
+test('deletes by arbitrary tags and rejects empty filters', async t => {
+ let received;
+ const db=await fixture(t,line=>{received=line;return {delete:{dry_run:false,events:2,leaderboard_entries:1}};});
+ await db.delete('kills',{where:{player:'a"b'},leaderboardEntity:'a'});
+ assert.equal(received,`DELETE kills WHERE player=${JSON.stringify('a"b')} lb="a"`);
+ await assert.rejects(db.delete('kills',{where:{}}));
+ await assert.rejects(db.delete('kills',{where:{'bad key':'a'}}));
+});
+
+test('deleteByTags previews and reports partial failures', async t => {
+ const db=await fixture(t,line=>{
+  if(line==='METRICS')return {metric_keys:['a','b','c']};
+  assert.ok(line.startsWith('PREVIEW_DELETE '));
+  assert.ok(line.includes('WHERE player="id"'));
+  if(line.startsWith('PREVIEW_DELETE b '))return {error:'unavailable'};
+  return {delete:{dry_run:true,events:3,leaderboard_entries:1}};
+ });
+ const report=await db.deleteByTags({player:'id'},{dryRun:true,leaderboardEntity:'id'});
+ assert.equal(report.events,6);assert.equal(report.leaderboard_entries,2);
+ assert.equal(report.metrics.length,3);assert.ok(report.metrics[1].error);
+ await assert.rejects(db.deleteByTags({}));
+});

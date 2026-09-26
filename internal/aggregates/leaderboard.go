@@ -249,3 +249,16 @@ func (l *Leaderboard) StageValue(batch *pebble.Batch, metric, entity string, val
 	}
 	return batch.Set(lbEntityKey(metric, entity), encodeFloat64(value), nil)
 }
+
+// Exists distinguishes missing entries from entries with a score of zero.
+func (l *Leaderboard) Exists(metric, entity string) (bool, error) {
+	_, closer, err := l.db.Get(lbEntityKey(metric, entity))
+	if err == pebble.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	closer.Close()
+	return true, nil
+}

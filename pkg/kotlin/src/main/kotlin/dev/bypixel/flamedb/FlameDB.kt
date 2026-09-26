@@ -189,22 +189,58 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     // ─── Delete ───────────────────────────────────────────────────────────────
 
     /**
-     * Sends a DELETE command. Can delete a leaderboard entry or a time range
-     * of raw events.
+     * Deletes raw events matching all tags in [where], optionally within a time range.
+     * With [leaderboardEntity], also removes that entire all-time leaderboard entry.
+     * Without [where], existing leaderboard-only / metric-range deletion is preserved.
      */
     suspend fun delete(
         metric: String,
         leaderboardEntity: String? = null,
         from: LocalDate? = null,
         to: LocalDate? = null,
-    ) {
+        where: Map<String, String>? = null,
+        dryRun: Boolean = false,
+    ): DeleteResult {
+        require(where == null || where.isNotEmpty()) { "delete filter must not be empty" }
         val cmd = buildString {
-            append("DELETE ${identifier(metric)}")
+            append(if (dryRun) "PREVIEW_DELETE ${identifier(metric)}" else "DELETE ${identifier(metric)}")
+            where?.let {
+                val clauses = it.entries.joinToString(" AND ") { (k, v) -> "${identifier(k)}=${json.encodeToString(v)}" }
+                append(" WHERE $clauses")
+            }
             leaderboardEntity?.let { append(" lb=${json.encodeToString(it)}") }
             from?.let { append(" FROM $it") }
             to?.let { append(" TO $it") }
         }
-        command(cmd)
+        val resp = command(cmd)
+        val result = json.decodeFromJsonElement<DeleteResult>(resp["delete"] ?: throw FlameDBException("missing delete result (updated server required)"))
+        if (result.dryRun != dryRun || result.events < 0 || result.leaderboardEntries < 0) throw FlameDBException("inconsistent delete result")
+        return result
+    }
+
+    /** Per-metric errors may have applied remotely; totals include confirmed results only. */
+    suspend fun deleteByTags(
+        where: Map<String, String>,
+        leaderboardEntity: String? = null,
+        from: LocalDate? = null,
+        to: LocalDate? = null,
+        dryRun: Boolean = false,
+    ): DeleteByTagsResult {
+        require(where.isNotEmpty()) { "delete filter must not be empty" }
+        where.keys.forEach { identifier(it) }
+        val keys = listMetrics(if (leaderboardEntity != null) emptyMap() else where)
+        val results = mutableListOf<MetricDeleteResult>()
+        for (metric in keys) {
+            try {
+                results += MetricDeleteResult(metric, delete(metric, leaderboardEntity, from, to, where, dryRun))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                results += MetricDeleteResult(metric, error = e.message ?: e.toString())
+            }
+        }
+        return DeleteByTagsResult(dryRun, results.sumOf { it.result?.events ?: 0L },
+            results.sumOf { it.result?.leaderboardEntries ?: 0L }, results)
     }
 
     // ─── Get ──────────────────────────────────────────────────────────────────
@@ -344,6 +380,13 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     /**
      * Sends a STATS command.
      */
+    /** Lists cluster-wide metric names, optionally filtered by event tags. */
+    suspend fun listMetrics(where: Map<String, String> = emptyMap()): List<String> {
+        val clauses = where.entries.joinToString(" AND ") { (k, v) -> "${identifier(k)}=${json.encodeToString(v)}" }
+        val resp = command("METRICS" + if (clauses.isEmpty()) "" else " WHERE $clauses")
+        return json.decodeFromJsonElement(resp["metric_keys"] ?: throw FlameDBException("missing metric_keys"))
+    }
+
     suspend fun stats(metric: String, vararg tags: String): StatsResult {
         val cmd = "STATS ${identifier(metric)} TAGS ${tags.joinToString(" ") { identifier(it) }}"
         val resp = command(cmd)

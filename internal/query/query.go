@@ -23,6 +23,7 @@ const (
 )
 
 const (
+	QueryTypeMetrics          QueryType = "METRICS"
 	QueryTypeGet              QueryType = "GET"
 	QueryTypeLeaderboard      QueryType = "LEADERBOARD"
 	QueryTypeWrite            QueryType = "WRITE"
@@ -33,6 +34,7 @@ const (
 )
 
 type Query struct {
+	DryRun      bool
 	OperationID string
 	Type        QueryType
 	Metric      string
@@ -64,7 +66,15 @@ type Query struct {
 	EntityTag string
 }
 
+type DeleteResult struct {
+	DryRun             bool  `json:"dry_run"`
+	Events             int64 `json:"events"`
+	LeaderboardEntries int64 `json:"leaderboard_entries"`
+}
+
 type Result struct {
+	Delete         *DeleteResult               `json:"delete,omitempty"`
+	MetricKeys     []string                    `json:"metric_keys,omitempty"`
 	Events         []storage.Event             `json:"events,omitempty"`
 	Metrics        map[string][]storage.Event  `json:"metrics,omitempty"`
 	Leaderboard    []types.LeaderboardEntry    `json:"leaderboard,omitempty"`
