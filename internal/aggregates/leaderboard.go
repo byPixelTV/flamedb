@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math"
+	"sort"
 	"sync"
 
 	"github.com/byPixelTV/flamedb/internal/keyspace"
@@ -24,6 +25,15 @@ type Leaderboard struct {
 
 func New(db *pebble.DB) *Leaderboard {
 	return &Leaderboard{db: db}
+}
+
+// BoardMetric isolates a named board while retaining the legacy default keys.
+// The separator cannot occur in a protocol metric name.
+func BoardMetric(metric, board string) string {
+	if board == "" {
+		return metric
+	}
+	return metric + "\x1f" + board
 }
 
 // key format: lb:metric:inverted_score:entity
@@ -212,9 +222,30 @@ func (l *Leaderboard) TopN(metric string, limit, offset int) ([]LeaderboardEntry
 
 // AtomicMutation holds the entity lock until events, scores and receipts commit.
 func (l *Leaderboard) AtomicMutation(metric, entity string, fn func(*pebble.Batch) error) error {
-	mu := l.lockFor(metric, entity)
-	mu.Lock()
-	defer mu.Unlock()
+	return l.AtomicMutationMany([]string{metric + ":" + entity}, fn)
+}
+
+// AtomicMutationMany locks all affected entities in stable order for one batch.
+func (l *Leaderboard) AtomicMutationMany(keys []string, fn func(*pebble.Batch) error) error {
+	indices := make(map[uint32]struct{}, len(keys))
+	for _, key := range keys {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(key))
+		indices[h.Sum32()%uint32(len(l.mu))] = struct{}{}
+	}
+	ordered := make([]int, 0, len(indices))
+	for index := range indices {
+		ordered = append(ordered, int(index))
+	}
+	sort.Ints(ordered)
+	for _, index := range ordered {
+		l.mu[index].Lock()
+	}
+	defer func() {
+		for i := len(ordered) - 1; i >= 0; i-- {
+			l.mu[ordered[i]].Unlock()
+		}
+	}()
 	batch := l.db.NewBatch()
 	defer batch.Close()
 	if err := fn(batch); err != nil {

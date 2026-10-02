@@ -90,7 +90,7 @@ func (e *Executor) ExecuteBatch(queries []*Query) (*BatchResult, error) {
 		if q.Timestamp == 0 {
 			q.Timestamp = e.nextTimestamp()
 		}
-		if q.UpdateLB {
+		if q.UpdateLB || len(q.LBEntities) > 0 {
 			flush()
 			if _, err := e.executeMutation(q); err != nil {
 				fail(i, err)
@@ -180,7 +180,7 @@ func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
 	for _, g := range q.Groups {
 		var sum float64
 		for _, member := range g.Members {
-			v, _ := e.lb.Get(q.Metric, member)
+			v, _ := e.lb.Get(aggregates.BoardMetric(q.Metric, q.Board), member)
 			sum += v
 		}
 		entries = append(entries, types.LeaderboardEntry{
@@ -261,6 +261,7 @@ func (e *Executor) listAllMetrics() ([]string, error) {
 			parts := strings.SplitN(strings.TrimPrefix(key, "lb-entity:"), ":", 2)
 			if len(parts) == 2 {
 				parts[0] = keyspace.DecodeComponent(parts[0])
+				parts[0] = strings.SplitN(parts[0], "\x1f", 2)[0]
 				if !seen[parts[0]] {
 					seen[parts[0]] = true
 					metrics = append(metrics, parts[0])
@@ -295,7 +296,21 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 	event := storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags}
 	deleted := &DeleteResult{DryRun: q.DryRun}
 	applied := false
-	err := e.lb.AtomicMutation(q.Metric, q.LBEntityID, func(batch *pebble.Batch) error {
+	boards := make(map[string]string, len(q.LBEntities)+1)
+	if q.UpdateLB {
+		boards[""] = q.LBEntityID
+	}
+	for board, entity := range q.LBEntities {
+		boards[board] = entity
+	}
+	locks := make([]string, 0, len(boards))
+	for board, entity := range boards {
+		locks = append(locks, aggregates.BoardMetric(q.Metric, board)+":"+entity)
+	}
+	if len(locks) == 0 {
+		locks = append(locks, q.Metric+":")
+	}
+	err := e.lb.AtomicMutationMany(locks, func(batch *pebble.Batch) error {
 		receipt := []byte("repl-applied:" + q.OperationID)
 		if q.IsReplica && q.OperationID != "" {
 			_, closer, err := e.store.DB().Get(receipt)
@@ -312,35 +327,39 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 			if err := e.store.StageEvent(batch, event); err != nil {
 				return err
 			}
-			if q.UpdateLB {
-				current, err := e.lb.Get(q.Metric, q.LBEntityID)
+			for board, entity := range boards {
+				metric := aggregates.BoardMetric(q.Metric, board)
+				current, err := e.lb.Get(metric, entity)
 				if err != nil {
 					return err
 				}
-				if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, current+q.Value, false); err != nil {
+				if err := e.lb.StageValue(batch, metric, entity, current+q.Value, false); err != nil {
 					return err
 				}
 			}
 		case QueryTypeSet:
-			if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, q.Value, false); err != nil {
-				return err
+			for board, entity := range boards {
+				if err := e.lb.StageValue(batch, aggregates.BoardMetric(q.Metric, board), entity, q.Value, false); err != nil {
+					return err
+				}
 			}
 		case QueryTypeDelete:
-			if q.UpdateLB {
-				exists, err := e.lb.Exists(q.Metric, q.LBEntityID)
+			for board, entity := range boards {
+				metric := aggregates.BoardMetric(q.Metric, board)
+				exists, err := e.lb.Exists(metric, entity)
 				if err != nil {
 					return err
 				}
 				if exists {
-					deleted.LeaderboardEntries = 1
+					deleted.LeaderboardEntries++
 				}
 				if !q.DryRun {
-					if err := e.lb.StageValue(batch, q.Metric, q.LBEntityID, 0, true); err != nil {
+					if err := e.lb.StageValue(batch, metric, entity, 0, true); err != nil {
 						return err
 					}
 				}
 			}
-			if !q.UpdateLB || len(q.Where) > 0 {
+			if len(boards) == 0 || len(q.Where) > 0 {
 				to := q.To
 				if to == 0 {
 					to = math.MaxInt64
@@ -399,7 +418,7 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 
 	// All-time query: pre-aggregierter Index → cache
 
-	entries, err := e.lb.TopN(q.Metric, q.Limit, q.Offset)
+	entries, err := e.lb.TopN(aggregates.BoardMetric(q.Metric, q.Board), q.Limit, q.Offset)
 	if err != nil {
 		return nil, err
 	}

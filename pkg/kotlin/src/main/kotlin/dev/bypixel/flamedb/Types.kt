@@ -113,6 +113,7 @@ data class WriteOptions(
     val tags: Map<String, String> = emptyMap(),
     val timestampNs: Long? = null,
     val quorum: Boolean = false,
+    val leaderboardEntities: Map<String, String> = emptyMap(),
 )
 
 data class GetOptions(
@@ -134,6 +135,7 @@ data class LeaderboardOptions(
     val from: String? = null,
     val to: String? = null,
     val entityTag: String? = null,
+    val board: String? = null,
 )
 
 data class GroupDef(

@@ -47,10 +47,13 @@ type Query struct {
 	Offset      int
 	Order       string
 	// write specific
-	Value       float64
-	Tags        map[string]string
-	UpdateLB    bool
-	LBEntityID  string
+	Value      float64
+	Tags       map[string]string
+	UpdateLB   bool
+	LBEntityID string
+	// LBEntities updates named leaderboards in the same metric mutation.
+	LBEntities  map[string]string
+	Board       string
 	TagKeys     []string
 	Quorum      bool
 	IsReplica   bool

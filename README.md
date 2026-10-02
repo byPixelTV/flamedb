@@ -138,6 +138,27 @@ WRITE kills 1 lb="pixel" tag="region:eu"
 LEADERBOARD kills LIMIT 10
 ```
 
+### Multiple leaderboards for one metric
+
+Add one `lb.<board>="<entity>"` argument per named leaderboard. A single
+`WRITE` stores one event and increments each specified leaderboard by its value.
+The existing `lb=` argument remains the default leaderboard.
+
+```text
+WRITE deaths 1 lb="player-uuid" lb.reason="fall" player="player-uuid" reason="fall"
+WRITE deaths 1 lb="other-uuid" lb.reason="fall" player="other-uuid" reason="fall"
+LEADERBOARD deaths LIMIT 10
+LEADERBOARD deaths BOARD reason LIMIT 10
+```
+
+The first leaderboard ranks players; the second ranks reasons (`fall` has score
+2). `GROUP_LEADERBOARD deaths BOARD reason ...` also reads the named board.
+`SET deaths 5 lb.reason="fall"` sets a named score, and
+`DELETE deaths lb.reason="fall"` removes that score. Board names are distinct
+from event tags, so include `reason="fall"` if you also need event filtering or
+windowed leaderboards. Named boards are all-time aggregates; time ranges use
+`LEADERBOARD deaths FROM ... TO ... ENTITY reason` over event tags.
+
 ### Namespaced identifiers
 
 Metric names and tag keys accept colons, including trailing colons such as `smp:`.

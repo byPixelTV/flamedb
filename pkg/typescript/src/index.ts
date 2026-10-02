@@ -83,6 +83,7 @@ export interface BatchResult {
 
 export interface WriteOptions {
   leaderboardEntity?: string;
+  leaderboardEntities?: Record<string, string>;
   tags?: Record<string, string>;
   timestampNs?: number | bigint;
   quorum?: boolean;
@@ -109,6 +110,7 @@ export interface GetResult {
 export interface LeaderboardOptions {
   limit?: number;
   offset?: number;
+  board?: string;
 }
 
 export interface GroupDef {
@@ -267,6 +269,9 @@ export class FlameDB {
     if (options.leaderboardEntity !== undefined) {
       parts.push(`lb=${JSON.stringify(options.leaderboardEntity)}`);
     }
+    for (const [board, entity] of Object.entries(options.leaderboardEntities ?? {})) {
+      parts.push(`lb.${identifier(board)}=${JSON.stringify(entity)}`);
+    }
     if (options.tags) {
       for (const [k, v] of Object.entries(options.tags)) {
         parts.push(`${identifier(k)}=${JSON.stringify(v)}`);
@@ -290,6 +295,9 @@ export class FlameDB {
       const opts = item.options ?? {};
       if (opts.leaderboardEntity !== undefined) {
         parts.push(`lb=${JSON.stringify(opts.leaderboardEntity)}`);
+      }
+      for (const [board, entity] of Object.entries(opts.leaderboardEntities ?? {})) {
+        parts.push(`lb.${identifier(board)}=${JSON.stringify(entity)}`);
       }
       if (opts.tags) {
         for (const [k, v] of Object.entries(opts.tags)) {
@@ -394,6 +402,7 @@ export class FlameDB {
     options: LeaderboardOptions = {},
   ): Promise<LeaderboardEntry[]> {
     const parts = [`LEADERBOARD ${identifier(metric)}`];
+    if (options.board !== undefined) parts.push(`BOARD ${identifier(options.board)}`);
     if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`);
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
     const result = (await this.getConn().command(parts.join(" "))) as {
@@ -410,6 +419,7 @@ export class FlameDB {
     options: LeaderboardOptions = {},
   ): Promise<GroupLeaderboardEntry[]> {
     const parts = [`GROUP_LEADERBOARD ${identifier(metric)}`];
+    if (options.board !== undefined) parts.push(`BOARD ${identifier(options.board)}`);
     for (const g of groups) {
       parts.push(`GROUP ${JSON.stringify(`${g.name}:${g.members.join(",")}`)}`);
     }

@@ -125,7 +125,9 @@ type BatchItemError struct {
 type WriteOpts struct {
 	// LeaderboardEntity sets the lb= tag; enables leaderboard increment.
 	LeaderboardEntity string
-	Tags              map[string]string
+	// LeaderboardEntities maps board names to entity IDs (for example, reason to fall).
+	LeaderboardEntities map[string]string
+	Tags                map[string]string
 	// TimestampNs overrides the server-side timestamp (unix nanoseconds).
 	TimestampNs int64
 	// Quorum waits for a majority of replicas to confirm before returning.
@@ -146,6 +148,7 @@ type GetOpts struct {
 type LeaderboardOpts struct {
 	Limit  int
 	Offset int
+	Board  string
 }
 
 // GroupDef defines a group for GROUP_LEADERBOARD.
@@ -362,6 +365,9 @@ func (c *Client) Write(ctx context.Context, metric string, value float64, opts W
 	if err := validateIdentifiers([]string{metric}, opts.Tags); err != nil {
 		return err
 	}
+	if err := validateBoards(opts.LeaderboardEntities); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_, err := c.command(ctx, buildWrite(metric, value, opts))
@@ -372,6 +378,9 @@ func buildWrite(metric string, value float64, opts WriteOpts) string {
 	parts := []string{fmt.Sprintf("WRITE %s %g", metric, value)}
 	if opts.LeaderboardEntity != "" {
 		parts = append(parts, fmt.Sprintf(`lb=%q`, opts.LeaderboardEntity))
+	}
+	for board, entity := range opts.LeaderboardEntities {
+		parts = append(parts, fmt.Sprintf(`lb.%s=%q`, board, entity))
 	}
 	for k, v := range opts.Tags {
 		parts = append(parts, fmt.Sprintf(`%s=%q`, k, v))
@@ -389,6 +398,9 @@ func buildWrite(metric string, value float64, opts WriteOpts) string {
 func (c *Client) WriteBatch(ctx context.Context, items []WriteBatchItem) (*BatchResult, error) {
 	for _, item := range items {
 		if err := validateIdentifiers([]string{item.Metric}, item.Opts.Tags); err != nil {
+			return nil, err
+		}
+		if err := validateBoards(item.Opts.LeaderboardEntities); err != nil {
 			return nil, err
 		}
 	}
@@ -560,10 +572,18 @@ func (c *Client) Leaderboard(ctx context.Context, metric string, opts Leaderboar
 	if err := validateIdentifiers([]string{metric}, nil); err != nil {
 		return nil, err
 	}
+	if opts.Board != "" {
+		if err := validateBoards(map[string]string{opts.Board: "entity"}); err != nil {
+			return nil, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	parts := []string{"LEADERBOARD " + metric}
+	if opts.Board != "" {
+		parts = append(parts, "BOARD "+opts.Board)
+	}
 	if opts.Limit > 0 {
 		parts = append(parts, fmt.Sprintf("LIMIT %d", opts.Limit))
 	}
@@ -599,10 +619,18 @@ func (c *Client) GroupLeaderboard(ctx context.Context, metric string, groups []G
 	if err := validateIdentifiers([]string{metric}, nil); err != nil {
 		return nil, err
 	}
+	if opts.Board != "" {
+		if err := validateBoards(map[string]string{opts.Board: "entity"}); err != nil {
+			return nil, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	parts := []string{"GROUP_LEADERBOARD " + metric}
+	if opts.Board != "" {
+		parts = append(parts, "BOARD "+opts.Board)
+	}
 	for _, g := range groups {
 		parts = append(parts, fmt.Sprintf("GROUP %q", g.Name+":"+strings.Join(g.Members, ",")))
 	}
@@ -667,6 +695,15 @@ func validateIdentifiers(names []string, tags map[string]string) error {
 	for _, name := range names {
 		if name == "" || strings.ContainsAny(name, "=\", \t\r\n\x00\x1f") {
 			return fmt.Errorf("flamedb: invalid identifier")
+		}
+	}
+	return nil
+}
+
+func validateBoards(boards map[string]string) error {
+	for board, entity := range boards {
+		if board == "" || strings.ContainsAny(board, ":=\", \t\r\n\x00\x1f") || entity == "" {
+			return fmt.Errorf("flamedb: invalid leaderboard board or entity")
 		}
 	}
 	return nil

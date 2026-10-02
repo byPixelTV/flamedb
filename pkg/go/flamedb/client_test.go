@@ -67,6 +67,31 @@ func TestResultMappingsAndClosedClient(t *testing.T) {
 		t.Fatal("write after close")
 	}
 }
+
+func TestNamedLeaderboardCommands(t *testing.T) {
+	var lines []string
+	var mu sync.Mutex
+	c := fakeServer(t, func(line string) string {
+		mu.Lock()
+		lines = append(lines, line)
+		mu.Unlock()
+		if strings.HasPrefix(line, "LEADERBOARD") {
+			return `{"leaderboard":[]}`
+		}
+		return `{}`
+	})
+	if err := c.Write(context.Background(), "deaths", 1, WriteOpts{LeaderboardEntity: "alice", LeaderboardEntities: map[string]string{"reason": "fall"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Leaderboard(context.Background(), "deaths", LeaderboardOpts{Board: "reason"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(lines) != 2 || lines[0] != `WRITE deaths 1 lb="alice" lb.reason="fall"` || lines[1] != "LEADERBOARD deaths BOARD reason" {
+		t.Fatalf("commands: %v", lines)
+	}
+}
 func TestCancellationClosesAmbiguousConnection(t *testing.T) {
 	c := fakeServer(t, func(string) string { return "" })
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)

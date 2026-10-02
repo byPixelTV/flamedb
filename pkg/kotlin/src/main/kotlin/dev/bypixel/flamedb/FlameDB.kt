@@ -167,6 +167,9 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             require(value.isFinite()) { "value must be finite" }
             append("WRITE ${identifier(metric)} $value")
             opts.leaderboardEntity?.let { append(" lb=${json.encodeToString(it)}") }
+            opts.leaderboardEntities.forEach { (board, entity) ->
+                append(" lb.${identifier(board)}=${json.encodeToString(entity)}")
+            }
             opts.tags.forEach { (k, v) -> append(" ${identifier(k)}=${json.encodeToString(v)}") }
             opts.timestampNs?.let { append(" ts=$it") }
             if (opts.quorum) append(" QUORUM")
@@ -331,6 +334,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
         val cmd = buildString {
             append("LEADERBOARD ${identifier(metric)}")
+            options.board?.let { append(" BOARD ${identifier(it)}") }
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
             if (windowed) options.entityTag?.let { append(" ENTITY ${identifier(it)}") }
@@ -361,6 +365,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
         val cmd = buildString {
             append("GROUP_LEADERBOARD ${identifier(metric)}")
+            options.board?.let { append(" BOARD ${identifier(it)}") }
             options.from?.let { append(" FROM $it") }
             options.to?.let { append(" TO $it") }
             if (windowed) options.entityTag?.let { append(" ENTITY ${identifier(it)}") }

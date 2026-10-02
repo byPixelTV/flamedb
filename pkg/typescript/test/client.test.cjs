@@ -20,6 +20,14 @@ test('concurrent lazy handshake, Unicode and response mappings',async t=>{
  assert.equal((await db.stats('m',['p'])).tag_stats[0].cardinality,2);
  assert.deepEqual(await db.groupLeaderboard('m',[{name:'g',members:['p']}]),[{group:'Hello 🌍🔥',score:42}]);
 });
+test('named leaderboard options use distinct protocol fields',async t=>{
+ const seen=[];
+ const db=await fixture(t,line=>{seen.push(line);return line.startsWith('LEADERBOARD')?{leaderboard:[]}:{};});
+ await db.write('deaths',1,{leaderboardEntity:'alice',leaderboardEntities:{reason:'fall'},tags:{reason:'fall'}});
+ await db.leaderboard('deaths',{board:'reason'});
+ assert.equal(seen[0],'WRITE deaths 1 lb="alice" lb.reason="fall" reason="fall"');
+ assert.equal(seen[1],'LEADERBOARD deaths BOARD reason');
+});
 test('timeout rejects whole pipeline and prevents response reuse',async t=>{
  const db=await fixture(t,()=>null,30);
  const results=await Promise.allSettled([db.get('m'),db.get('n')]);assert.ok(results.every(r=>r.status==='rejected'));

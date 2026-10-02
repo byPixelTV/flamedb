@@ -694,7 +694,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 				if failedLocal[item.index] || item.q.IsReplica {
 					continue
 				}
-				replicateFromThisNode := s.cluster.IsPrimaryFor(item.q.Metric) || !item.q.UpdateLB
+				replicateFromThisNode := s.cluster.IsPrimaryFor(item.q.Metric) || (!item.q.UpdateLB && len(item.q.LBEntities) == 0)
 				if !replicateFromThisNode {
 					continue
 				}

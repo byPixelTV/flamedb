@@ -380,6 +380,27 @@ func (s *Storage) ExportLeaderboard(metric string) ([]RawKV, error) {
 		}
 		iter.Close()
 	}
+	// Named boards use an escaped metric component. Include them when moving
+	// the owning metric to another cluster node.
+	for _, kind := range []string{"lb:", "lb-entity:"} {
+		prefix := []byte(kind + "\x1f")
+		iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: append(append([]byte{}, prefix...), 0xFF)})
+		if err != nil {
+			return nil, err
+		}
+		for iter.First(); iter.Valid(); iter.Next() {
+			component := strings.SplitN(strings.TrimPrefix(string(iter.Key()), kind), ":", 2)[0]
+			if !strings.HasPrefix(keyspace.DecodeComponent(component), keyspace.DecodeComponent(metric)+"\x1f") {
+				continue
+			}
+			kvs = append(kvs, RawKV{Key: append([]byte(nil), iter.Key()...), Value: append([]byte(nil), iter.Value()...)})
+		}
+		if err := iter.Error(); err != nil {
+			iter.Close()
+			return nil, err
+		}
+		iter.Close()
+	}
 
 	return kvs, nil
 }

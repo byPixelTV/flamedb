@@ -168,6 +168,15 @@ func Parse(input string) (result *Query, err error) {
 				}
 				q.EntityTag = tokenValue(tokens[i+1])
 				i += 2
+			case "BOARD":
+				if i+1 >= len(tokens) {
+					return nil, fmt.Errorf("missing BOARD value")
+				}
+				q.Board = tokenValue(tokens[i+1])
+				if q.Board == "" {
+					return nil, fmt.Errorf("BOARD requires a name")
+				}
+				i += 2
 			default:
 				return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
 			}
@@ -226,7 +235,14 @@ func Parse(input string) (result *Query, err error) {
 				}
 				q.Timestamp = ts
 			default:
-				q.Tags[key] = value
+				if strings.HasPrefix(key, "lb.") {
+					if q.LBEntities == nil {
+						q.LBEntities = make(map[string]string)
+					}
+					q.LBEntities[strings.TrimPrefix(key, "lb.")] = value
+				} else {
+					q.Tags[key] = value
+				}
 			}
 			i += 3
 		}
@@ -267,6 +283,11 @@ func Parse(input string) (result *Query, err error) {
 			if key == "lb" {
 				q.UpdateLB = true
 				q.LBEntityID = value
+			} else if strings.HasPrefix(key, "lb.") {
+				if q.LBEntities == nil {
+					q.LBEntities = make(map[string]string)
+				}
+				q.LBEntities[strings.TrimPrefix(key, "lb.")] = value
 			} else {
 				q.Tags[key] = value
 			}
@@ -339,6 +360,11 @@ func Parse(input string) (result *Query, err error) {
 					if key == "lb" {
 						q.UpdateLB = true
 						q.LBEntityID = value
+					} else if strings.HasPrefix(key, "lb.") {
+						if q.LBEntities == nil {
+							q.LBEntities = make(map[string]string)
+						}
+						q.LBEntities[strings.TrimPrefix(key, "lb.")] = value
 					} else {
 						q.Tags[key] = value
 					}
@@ -479,6 +505,18 @@ func Parse(input string) (result *Query, err error) {
 				return nil, fmt.Errorf("missing ENTITY value")
 			}
 			q.EntityTag = tokenValue(tokens[i+1])
+			i += 2
+		case "BOARD":
+			if q.Type != QueryTypeLeaderboard {
+				return nil, fmt.Errorf("BOARD is only valid for LEADERBOARD")
+			}
+			if i+1 >= len(tokens) {
+				return nil, fmt.Errorf("missing BOARD value")
+			}
+			q.Board = tokenValue(tokens[i+1])
+			if q.Board == "" {
+				return nil, fmt.Errorf("BOARD requires a name")
+			}
 			i += 2
 		default:
 			return nil, fmt.Errorf("unknown keyword: %s", tokens[i])
@@ -663,7 +701,21 @@ func validateQuery(q *Query) error {
 	if q.Type == QueryTypeDelete && len(q.Tags) > 0 {
 		return fmt.Errorf("DELETE supports WHERE, lb and time ranges only")
 	}
-	if q.Type == QueryTypeSet && (!q.UpdateLB || q.LBEntityID == "") {
+	for board, entity := range q.LBEntities {
+		if board == "" || strings.ContainsAny(board, ":=\" \t\x1f") || entity == "" {
+			return fmt.Errorf("invalid leaderboard board or entity")
+		}
+	}
+	if q.Board != "" && strings.ContainsAny(q.Board, ":=\" \t\x1f") {
+		return fmt.Errorf("invalid leaderboard board")
+	}
+	if q.Board != "" && (q.From != 0 || q.To != 0) {
+		return fmt.Errorf("BOARD cannot be combined with FROM or TO")
+	}
+	if q.UpdateLB && q.LBEntityID == "" {
+		return fmt.Errorf("lb requires an entity")
+	}
+	if q.Type == QueryTypeSet && !q.UpdateLB && len(q.LBEntities) == 0 {
 		return fmt.Errorf("SET requires lb")
 	}
 	return nil
