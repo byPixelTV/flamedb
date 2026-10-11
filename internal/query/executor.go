@@ -20,14 +20,12 @@ type Executor struct {
 	clock atomic.Int64
 	store *storage.Storage
 	lb    *aggregates.Leaderboard
-	cache *storage.LeaderboardCache
 }
 
 func NewExecutor(store *storage.Storage, lb *aggregates.Leaderboard) *Executor {
 	return &Executor{
 		store: store,
 		lb:    lb,
-		cache: storage.NewLeaderboardCache(1 * time.Second),
 	}
 }
 
@@ -390,7 +388,6 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 		if q.Type == QueryTypeWrite {
 			e.store.RecordCommittedEvent(event)
 		}
-		e.cache.Invalidate(q.Metric)
 	}
 	if q.Type == QueryTypeDelete {
 		return &Result{Delete: deleted}, nil
@@ -399,7 +396,7 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 }
 
 func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
-	// Windowed query: FROM or TO is set; compute from the secondary index.
+	// Windowed query: FROM or TO is set; scan only this primary time range.
 	if q.From != 0 || q.To != 0 {
 		entityTag := q.EntityTag
 		if entityTag == "" {
@@ -416,7 +413,7 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 		return &Result{Leaderboard: entries}, nil
 	}
 
-	// All-time query: pre-aggregierter Index → cache
+	// All-time query: use the pre-aggregated score index.
 
 	entries, err := e.lb.TopN(aggregates.BoardMetric(q.Metric, q.Board), q.Limit, q.Offset)
 	if err != nil {

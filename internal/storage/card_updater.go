@@ -25,6 +25,7 @@ type cardUpdater struct {
 	cache      *cardCache
 	mu         sync.Mutex
 	pending    map[string]cardEntry
+	spare      map[string]cardEntry // Reused between flushes; never preallocated to maxPending.
 	flushCh    chan cardFlushRequest
 	interval   time.Duration
 	maxPending int
@@ -38,7 +39,7 @@ func newCardUpdater(db *pebble.DB, cache *cardCache, interval time.Duration, max
 	u := &cardUpdater{
 		db:         db,
 		cache:      cache,
-		pending:    make(map[string]cardEntry, maxPending),
+		pending:    make(map[string]cardEntry),
 		flushCh:    make(chan cardFlushRequest, 1),
 		interval:   interval,
 		maxPending: maxPending,
@@ -52,14 +53,13 @@ func (u *cardUpdater) Add(metric string, tags map[string]string) {
 		return
 	}
 
-	shouldFlush := false
-
 	for tagKey, tagValue := range tags {
 		ckey := cardCacheKey(metric, tagKey, tagValue)
 		if u.cache != nil && u.cache.seen(ckey) {
 			continue
 		}
 
+		shouldFlush := false
 		u.mu.Lock()
 		if _, ok := u.pending[ckey]; !ok {
 			u.pending[ckey] = cardEntry{metric: metric, tagKey: tagKey, tagValue: tagValue}
@@ -68,10 +68,9 @@ func (u *cardUpdater) Add(metric string, tags map[string]string) {
 			}
 		}
 		u.mu.Unlock()
-	}
-
-	if shouldFlush {
-		_ = u.Flush(false)
+		if shouldFlush {
+			_ = u.Flush(false)
+		}
 	}
 }
 
@@ -103,6 +102,7 @@ func (u *cardUpdater) run() {
 		select {
 		case <-ticker.C:
 			_ = u.flush(false)
+			u.cache.expire(time.Now())
 		case req := <-u.flushCh:
 			err := u.flush(req.sync)
 			if req.done != nil {
@@ -122,12 +122,17 @@ func (u *cardUpdater) flush(sync bool) (resultErr error) {
 	}
 
 	defer func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
 		if resultErr != nil {
-			u.mu.Lock()
-			defer u.mu.Unlock()
-			for _, e := range entries {
-				u.pending[cardCacheKey(e.metric, e.tagKey, e.tagValue)] = e
+			for key, e := range entries {
+				u.pending[key] = e
 			}
+		}
+		// Keep small maps for steady ingestion, release burst-sized tables.
+		if len(entries) <= 4096 {
+			clear(entries)
+			u.spare = entries
 		}
 	}()
 	batch := u.db.NewBatch()
@@ -135,8 +140,7 @@ func (u *cardUpdater) flush(sync bool) (resultErr error) {
 	countBase := make(map[string]uint64)
 	countDelta := make(map[string]uint64)
 
-	for _, e := range entries {
-		ckey := cardCacheKey(e.metric, e.tagKey, e.tagValue)
+	for ckey, e := range entries {
 		if u.cache != nil && u.cache.seen(ckey) {
 			continue
 		}
@@ -175,25 +179,26 @@ func (u *cardUpdater) flush(sync bool) (resultErr error) {
 		return err
 	}
 	if u.cache != nil {
-		for _, e := range entries {
-			u.cache.add(cardCacheKey(e.metric, e.tagKey, e.tagValue))
+		for key := range entries {
+			u.cache.add(key)
 		}
 	}
 	return nil
 }
 
-func (u *cardUpdater) drain() []cardEntry {
+func (u *cardUpdater) drain() map[string]cardEntry {
 	u.mu.Lock()
 	if len(u.pending) == 0 {
 		u.mu.Unlock()
 		return nil
 	}
 
-	entries := make([]cardEntry, 0, len(u.pending))
-	for _, e := range u.pending {
-		entries = append(entries, e)
+	entries := u.pending
+	u.pending = u.spare
+	u.spare = nil
+	if u.pending == nil {
+		u.pending = make(map[string]cardEntry)
 	}
-	u.pending = make(map[string]cardEntry, u.maxPending)
 	u.mu.Unlock()
 
 	return entries

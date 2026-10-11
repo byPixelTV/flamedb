@@ -159,6 +159,45 @@ from event tags, so include `reason="fall"` if you also need event filtering or
 windowed leaderboards. Named boards are all-time aggregates; time ranges use
 `LEADERBOARD deaths FROM ... TO ... ENTITY reason` over event tags.
 
+### Time-window leaderboard performance
+
+```text
+LEADERBOARD craftattack:clans:joins FROM now-7d ENTITY clan
+```
+
+Time-window leaderboards scan primary events only in the requested interval
+(`FROM` inclusive, `TO` exclusive). They do not walk the entire historical tag
+index or perform a separate primary lookup for every event. Binary event values
+are aggregated without building per-event tag maps; small pages use a bounded
+candidate heap. Scores are exact, including negative values and deterministic
+entity-ID ordering for ties. No result cache or time rounding is used, and this
+optimization works with existing data without an additional index migration.
+Legacy JSON event values remain supported, with their normal decoding cost.
+
+Query time still scales with events **inside** the selected window, and aggregation
+memory scales with distinct entities in that window. `LIMIT` reduces sorting and
+response memory; it cannot skip events needed to calculate the scores. Named
+`GROUP_LEADERBOARD` members retain selective index scans with a consistent snapshot.
+
+Cardinality bookkeeping allocates maps on demand, reuses small flush buffers and
+releases large buffers after bursts. Its cache has an estimated 16 MiB key/entry
+budget plus the existing 250,000-entry cap; idle entries expire and map capacity
+shrinks. This is not a whole-process RAM limit: Pebble's block cache (256 MiB),
+memtables (64 MiB each, write-stop threshold 4), active queries and replication
+also consume memory.
+
+Run the reproducible comparisons against the previous query algorithm with:
+
+```bash
+go test ./internal/storage -run '^$' -bench 'Benchmark(WindowedLeaderboard|CardinalityChurn)' -benchmem -benchtime=3x -count=3
+go test ./internal/storage -run 'Test(CardinalityMemory|WindowedAllocations|WindowedSteadyStateMemory)' -count=1 -v
+```
+
+The query benchmark uses 200,000 events, 1,000 clans and both a seven-day window
+and full-history scan. Measurements exclude fixture ingestion. Memory checks
+measure allocations and live Go heap across repeated queries, not process RSS.
+See the [measured results and limitations](PERFORMANCE_2026-10-11.md).
+
 ### Namespaced identifiers
 
 Metric names and tag keys accept colons, including trailing colons such as `smp:`.

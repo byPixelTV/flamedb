@@ -9,6 +9,49 @@ import (
 
 const eventBinaryVersion byte = 1
 
+// eventEntityValue reads only the score and requested tag. Binary events do not
+// allocate a tag map or copy strings; the returned ID borrows data until the
+// caller advances/closes its iterator or releases its Get value. Legacy JSON
+// values remain readable without a migration.
+func eventEntityValue(data []byte, tag string) (id []byte, value float64, found bool, err error) {
+	if len(data) == 0 || data[0] != eventBinaryVersion {
+		e, err := decodeEventValue(data, "")
+		if err != nil {
+			return nil, 0, false, err
+		}
+		entity, ok := e.Tags[tag]
+		return []byte(entity), e.Value, ok, nil
+	}
+	if len(data) < 19 {
+		return nil, 0, false, errors.New("invalid event encoding")
+	}
+	value = math.Float64frombits(binary.BigEndian.Uint64(data[9:17]))
+	count := int(binary.BigEndian.Uint16(data[17:19]))
+	off := 19
+	for i := 0; i < count; i++ {
+		if len(data)-off < 2 {
+			return nil, 0, false, errors.New("invalid event encoding")
+		}
+		klen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		if len(data)-off < klen+2 {
+			return nil, 0, false, errors.New("invalid event encoding")
+		}
+		key := data[off : off+klen]
+		off += klen
+		vlen := int(binary.BigEndian.Uint16(data[off:]))
+		off += 2
+		if len(data)-off < vlen {
+			return nil, 0, false, errors.New("invalid event encoding")
+		}
+		if string(key) == tag {
+			id, found = data[off:off+vlen], true
+		}
+		off += vlen
+	}
+	return id, value, found, nil
+}
+
 func encodeEventValue(e Event) ([]byte, error) {
 	if len(e.Tags) > math.MaxUint16 {
 		return json.Marshal(e)
