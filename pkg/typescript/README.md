@@ -1,6 +1,28 @@
 # FlameDB — TypeScript SDK
 
-Node.js SDK for FlameDB. Uses a persistent TCP connection with lazy auth.
+Node.js SDK for FlameDB. Uses a bounded TCP pool with lazy auth and FIFO pipelining per connection.
+
+## Concurrency, deadlines and timings
+
+The default pool has **two read connections and one write connection**. Connections open lazily; `connect()` authenticates one write connection. GET, LEADERBOARD, GROUP_LEADERBOARD, STATS, METRICS and PREVIEW_DELETE use reserved reads; mutations use writes. A blocked write cannot occupy read capacity. `pipelineSize` defaults to 64 pending requests per connection; further callers wait for admission. Responses remain FIFO on each socket.
+
+```typescript
+const db = new FlameDB({
+  host: "127.0.0.1", port: 7777, apiKey,
+  timeout: 5000, readConnections: 2, writeConnections: 1,
+  pipelineSize: 64,
+  onCommandTiming: timing => {
+    // queueWaitMs and requestMs are milliseconds.
+    // Forward to a bounded, non-blocking metrics sink.
+  },
+});
+```
+
+`timeout` is a total deadline per protocol command, including pool wait, lazy connect/auth, socket I/O and response JSON parsing. Multi-command helpers such as `deleteByTags` apply it per command. `queueWaitMs` measures admission; `requestMs` measures transport work after admission (including lazy authentication). A call that never acquires capacity has zero request time. `success` reports the transport result, before public result conversion. Observers run after admission capacity is released; keep them quick and non-blocking. Observer exceptions do not fail commands. As with any Node timer, a blocked event loop can delay timeout delivery.
+
+Concurrent operations have **no ordering guarantee across connections**. Await a write before issuing a dependent read; do not depend on launch order. Increasing write capacity can reorder concurrent SET/DELETE/increment operations. Replication consistency is unchanged. For one shared connection, set `readConnections: 0, writeConnections: 1`.
+
+A queued deadline expires without sending the command or interrupting another caller's socket. An active timeout closes its affected connection and rejects its entire pipeline; ambiguous writes are **not retried**. `disconnect()` rejects queued calls and closes all active sockets; a later command can reconnect. Pool sizes are fixed, failed sockets are replaced on demand, and no timing history is retained by the SDK. Timers and failed response buffers are released on settlement.
 
 ## Install
 
@@ -65,14 +87,18 @@ db.disconnect();
 | `host` | `string` | — | FlameDB host |
 | `port` | `number` | — | FlameDB port |
 | `apiKey` | `string` | — | API key |
-| `timeout` | `number` | `5000` | Command timeout (ms) |
+| `timeout` | `number` | `5000` | Total command deadline including pool wait (ms) |
+| `readConnections` | `number` | `2` | Reserved reads; zero shares the write pool |
+| `writeConnections` | `number` | `1` | Write pool size |
+| `pipelineSize` | `number` | `64` | Pending commands per connection |
+| `onCommandTiming` | `(timing: CommandTiming) => void` | — | Queue/request timing observer |
 
 ### Methods
 
 | method | description |
 |---|---|
 | `connect()` | Explicitly connect (lazy otherwise) |
-| `disconnect()` | Close connection |
+| `disconnect()` | Close all connections and reject active/queued calls |
 | `write(metric, value, opts?)` | Write a single event |
 | `writeBatch(items)` | Write multiple events in one command |
 | `set(metric, value, entity?)` | Set absolute leaderboard value |
@@ -90,9 +116,9 @@ Read exact values from `event.timestampNs` and `point.tsNs`. Existing `timestamp
 number fields remain available but may round nanoseconds. Convert bigint fields to
 strings when serializing SDK results with `JSON.stringify`.
 
-A timeout closes the connection and rejects every pending command. A write may
-already have been applied; do not automatically retry increments. Call
-`disconnect()` before establishing a new connection.
+An active timeout closes the affected connection and rejects its pending commands.
+A write may already have been applied; do not automatically retry increments.
+The next call replaces the failed connection automatically.
 
 ## Connection recovery
 
@@ -102,7 +128,7 @@ concurrent calls share that connection and its authentication handshake. Failed
 commands are never replayed automatically. Writes may already have been applied,
 so do not blindly retry increments or a failed pipeline.
 
-`disconnect()` closes the current connection. As before, a later `connect()` or
+`disconnect()` closes all pool connections. As before, a later `connect()` or
 command opens a new one. Server error responses do not invalidate a healthy connection.
 
 ## Metric discovery and player UUIDs

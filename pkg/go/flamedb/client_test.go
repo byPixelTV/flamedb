@@ -40,7 +40,7 @@ func fakeServer(t *testing.T, respond func(string) string) *Client {
 	}()
 	host, port, _ := net.SplitHostPort(ln.Addr().String())
 	n, _ := strconv.Atoi(port)
-	client, err := New(Config{Host: host, Port: n, APIKey: "test", Timeout: time.Second})
+	client, err := New(Config{Host: host, Port: n, APIKey: "test", Timeout: time.Second, WriteConnections: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

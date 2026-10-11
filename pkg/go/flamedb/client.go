@@ -21,14 +21,12 @@
 package flamedb
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -40,8 +38,15 @@ type Config struct {
 	Port int
 	// APIKey is the FlameDB API key used for authentication.
 	APIKey string
-	// Timeout for individual commands. Defaults to 5 seconds.
+	// Total command deadline including pool wait, connect/auth and socket I/O.
+	// Defaults to 5 seconds.
 	Timeout time.Duration
+	// Both omitted: two reserved read connections and one write connection.
+	// Set WriteConnections=1, ReadConnections=0 for a single shared connection.
+	ReadConnections  int
+	WriteConnections int
+	// Called after returning the connection. Keep callbacks non-blocking.
+	OnCommandTiming func(CommandTiming)
 }
 
 func (c *Config) addr() string {
@@ -166,198 +171,6 @@ type WriteBatchItem struct {
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
-// Client is a thread-safe FlameDB client. It uses a single persistent
-// TCP connection; concurrent callers are serialized by an internal mutex.
-type Client struct {
-	cfg     Config
-	mu      sync.Mutex
-	conn    net.Conn
-	scanner *bufio.Scanner
-	writer  *bufio.Writer
-	authed  bool
-	closed  bool
-}
-
-// New creates a new Client and opens + authenticates a TCP connection.
-func New(cfg Config) (*Client, error) {
-	if strings.ContainsAny(cfg.APIKey, "\r\n") {
-		return nil, fmt.Errorf("flamedb: invalid API key")
-	}
-	c := &Client{cfg: cfg}
-	if err := c.dial(context.Background()); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
-
-// Close closes the underlying TCP connection.
-func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.closed = true
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil
-		return err
-	}
-	return nil
-}
-
-// ─── Internal ─────────────────────────────────────────────────────────────────
-
-func (c *Client) dial(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.timeout())
-	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.cfg.addr())
-	if err != nil {
-		return fmt.Errorf("flamedb: connect: %w", err)
-	}
-	deadline, _ := ctx.Deadline()
-	_ = conn.SetDeadline(deadline)
-	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()); close(done) })
-	defer func() {
-		if !stop() {
-			<-done
-		}
-	}()
-	c.conn = conn
-	c.scanner = bufio.NewScanner(conn)
-	c.scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	c.writer = bufio.NewWriter(conn)
-	c.authed = false
-	if err := c.auth(); err != nil {
-		conn.Close()
-		c.conn = nil
-		return err
-	}
-	return nil
-}
-
-func (c *Client) auth() error {
-	// read {"auth":"required"}
-	line, err := c.readLine()
-	if err != nil {
-		return err
-	}
-	var challenge map[string]string
-	if err := json.Unmarshal([]byte(line), &challenge); err != nil || challenge["auth"] != "required" {
-		return fmt.Errorf("flamedb: unexpected auth challenge: %s", line)
-	}
-
-	if err := c.sendLine("AUTH " + c.cfg.APIKey); err != nil {
-		return err
-	}
-
-	resp, err := c.readLine()
-	if err != nil {
-		return err
-	}
-	var authResp map[string]string
-	if err := json.Unmarshal([]byte(resp), &authResp); err != nil {
-		return fmt.Errorf("flamedb: auth parse error: %w", err)
-	}
-	if authResp["auth"] != "ok" {
-		return fmt.Errorf("flamedb: auth failed: %s", authResp["error"])
-	}
-	c.authed = true
-	return nil
-}
-
-func (c *Client) readLine() (string, error) {
-
-	if !c.scanner.Scan() {
-		if err := c.scanner.Err(); err != nil {
-			return "", fmt.Errorf("flamedb: read: %w", err)
-		}
-		return "", fmt.Errorf("flamedb: connection closed")
-	}
-	return c.scanner.Text(), nil
-}
-
-func (c *Client) sendLine(line string) error {
-
-	if _, err := c.writer.WriteString(line + "\n"); err != nil {
-		return fmt.Errorf("flamedb: write: %w", err)
-	}
-	return c.writer.Flush()
-}
-
-func (c *Client) sendLines(lines []string) error {
-
-	for _, l := range lines {
-		if _, err := c.writer.WriteString(l + "\n"); err != nil {
-			return fmt.Errorf("flamedb: write: %w", err)
-		}
-	}
-	return c.writer.Flush()
-}
-
-// command sends one line and parses the JSON response.
-// Caller must hold c.mu.
-func (c *Client) command(ctx context.Context, line string) (map[string]json.RawMessage, error) {
-	return c.commandMulti(ctx, []string{line})
-}
-
-func (c *Client) commandMulti(ctx context.Context, lines []string) (map[string]json.RawMessage, error) {
-	if c.closed {
-		return nil, fmt.Errorf("flamedb: client closed")
-	}
-	for _, line := range lines {
-		if strings.ContainsAny(line, "\r\n\x1f") {
-			return nil, fmt.Errorf("flamedb: invalid command framing")
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if c.conn == nil {
-		if err := c.dial(ctx); err != nil {
-			return nil, fmt.Errorf("flamedb: reconnect failed; command was not sent: %w", err)
-		}
-	}
-	conn := c.conn
-	deadline := time.Now().Add(c.cfg.timeout())
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	_ = c.conn.SetDeadline(deadline)
-	done := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()); close(done) })
-	defer func() {
-		if !stop() {
-			<-done
-		}
-	}()
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := c.sendLines(lines); err != nil {
-		conn.Close()
-		c.conn = nil
-		return nil, fmt.Errorf("flamedb: command failed; outcome unknown; not retried: %w", err)
-	}
-	raw, err := c.readLine()
-	if err != nil {
-		conn.Close()
-		c.conn = nil
-		return nil, fmt.Errorf("flamedb: command failed; outcome unknown; not retried: %w", err)
-	}
-	var result map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &result); err != nil {
-		conn.Close()
-		c.conn = nil
-		return nil, fmt.Errorf("flamedb: parse response; outcome unknown; not retried: %w", err)
-	}
-	if errMsg, ok := result["error"]; ok {
-		var s string
-		_ = json.Unmarshal(errMsg, &s)
-		return nil, fmt.Errorf("flamedb: %s", s)
-	}
-	return result, nil
-}
-
 // ─── Write ────────────────────────────────────────────────────────────────────
 
 // Write sends a WRITE command.
@@ -368,8 +181,6 @@ func (c *Client) Write(ctx context.Context, metric string, value float64, opts W
 	if err := validateBoards(opts.LeaderboardEntities); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	_, err := c.command(ctx, buildWrite(metric, value, opts))
 	return err
 }
@@ -404,8 +215,6 @@ func (c *Client) WriteBatch(ctx context.Context, items []WriteBatchItem) (*Batch
 			return nil, err
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	lines := []string{"WRITE_BATCH"}
 	for _, item := range items {
@@ -433,8 +242,6 @@ func (c *Client) Set(ctx context.Context, metric string, value float64, leaderbo
 	if err := validateIdentifiers([]string{metric}, nil); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	cmd := fmt.Sprintf("SET %s %g", metric, value)
 	if leaderboardEntity != "" {
 		cmd += fmt.Sprintf(` lb=%q`, leaderboardEntity)
@@ -470,8 +277,6 @@ func (c *Client) DeleteWithResult(ctx context.Context, metric string, opts Delet
 	if err := validateIdentifiers([]string{metric}, opts.Where); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	parts := []string{"DELETE " + metric}
 	if opts.DryRun {
 		parts[0] = "PREVIEW_DELETE " + metric
@@ -524,8 +329,6 @@ func (c *Client) Get(ctx context.Context, metrics []string, opts GetOpts) (*GetR
 	if opts.Order != "" && opts.Order != "ASC" && opts.Order != "DESC" {
 		return nil, fmt.Errorf("flamedb: invalid order")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	parts := []string{"GET " + strings.Join(metrics, ",")}
 
@@ -577,8 +380,6 @@ func (c *Client) Leaderboard(ctx context.Context, metric string, opts Leaderboar
 			return nil, err
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	parts := []string{"LEADERBOARD " + metric}
 	if opts.Board != "" {
@@ -624,8 +425,6 @@ func (c *Client) GroupLeaderboard(ctx context.Context, metric string, groups []G
 			return nil, err
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	parts := []string{"GROUP_LEADERBOARD " + metric}
 	if opts.Board != "" {
@@ -663,8 +462,6 @@ func (c *Client) Stats(ctx context.Context, metric string, tags []string) (*Stat
 	if err := validateIdentifiers(append([]string{metric}, tags...), nil); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	cmd := fmt.Sprintf("STATS %s TAGS %s", metric, strings.Join(tags, " "))
 	result, err := c.command(ctx, cmd)
@@ -724,8 +521,6 @@ func (c *Client) ListMetrics(ctx context.Context, where map[string]string) ([]st
 	if len(clauses) > 0 {
 		cmd += " WHERE " + strings.Join(clauses, " AND ")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	result, err := c.command(ctx, cmd)
 	if err != nil {
 		return nil, err

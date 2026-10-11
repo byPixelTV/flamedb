@@ -25,7 +25,7 @@ class ClientTest {
      }
     }
    }
-   FlameDB.connect(FlameDBConfig("127.0.0.1",server.localPort,"test")).use { db ->
+   FlameDB.connect(FlameDBConfig("127.0.0.1",server.localPort,"test", readConnections=0)).use { db ->
     assertEquals(listOf("smp:kills"), db.listMetrics())
     assertEquals("METRICS", received.get())
     assertEquals(listOf("smp:kills"), db.listMetrics(mapOf("uuid" to "player-id")))

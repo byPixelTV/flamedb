@@ -1,6 +1,28 @@
 # FlameDB — Go SDK
 
-Go client for FlameDB. Thread-safe via an internal mutex over a single persistent TCP connection.
+Go client for FlameDB. Concurrent calls use a bounded TCP pool with reserved read capacity and exclusive response ownership per connection.
+
+## Concurrency, deadlines and timings
+
+The default pool has **two read connections and one write connection**. Connections open lazily; `New` authenticates one write connection. GET, LEADERBOARD, GROUP_LEADERBOARD, STATS, METRICS and PREVIEW_DELETE use reserved reads; mutations use writes. A blocked write cannot occupy read capacity. Each connection executes one complete request/response at a time.
+
+```go
+db, err := flamedb.New(flamedb.Config{
+    Host: "127.0.0.1", Port: 7777, APIKey: apiKey,
+    Timeout: 5 * time.Second,
+    ReadConnections: 2, WriteConnections: 1,
+    OnCommandTiming: func(t flamedb.CommandTiming) {
+        // QueueWait and RequestTime are time.Duration values.
+        // Forward to a bounded, non-blocking metrics sink.
+    },
+})
+```
+
+`Timeout` is a total deadline per protocol command, including pool wait, lazy connect/auth, socket I/O and response JSON parsing. The caller's context can impose an earlier deadline or cancellation. Multi-command helpers such as `DeleteByTags` apply it per command. `QueueWait` measures admission; `RequestTime` measures transport work after admission (including lazy authentication). A call that never acquires a connection has zero request time. `Success` reports the transport result, before public result conversion. Observers run after lease release; keep them quick and non-blocking, and safe for concurrent callbacks. Observer panics do not fail commands.
+
+Concurrent operations have **no ordering guarantee across connections**. Await a write before issuing a dependent read; do not depend on goroutine launch order. Increasing write capacity can reorder concurrent SET/DELETE/increment operations. Replication consistency is unchanged. For one shared connection, explicitly set `ReadConnections: 0, WriteConnections: 1`; omitting both selects the default pool.
+
+Queued cancellation never sends the command or interrupts another caller's socket. Active I/O cancellation invalidates the affected connection before reuse; ambiguous writes are **not retried**. `Close` rejects queued calls and closes active sockets permanently. Pool sizes are fixed, failed sockets are replaced on demand, and no timing history is retained by the SDK.
 
 ## Install
 
@@ -93,8 +115,8 @@ Opens + authenticates a TCP connection. Returns an error if auth fails.
 ## Connection recovery
 
 After a transport failure, timeout, or invalid JSON response, the client discards
-the connection. The next command reconnects and authenticates under the same
-mutex used for commands. Reconnection honors the caller's context and the configured
+the affected connection. Its next lease reconnects and authenticates before sending.
+Reconnection honors the caller's context and the configured
 timeout. `Close()` is permanent; subsequent commands do not reconnect.
 
 Failed commands are never replayed automatically. A write may already have been

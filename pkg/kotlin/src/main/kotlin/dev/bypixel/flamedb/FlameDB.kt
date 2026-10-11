@@ -1,20 +1,8 @@
 package dev.bypixel.flamedb
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.BufferedWriter
-import java.io.OutputStreamWriter
-import java.net.Socket
-import java.net.InetSocketAddress
 import kotlinx.serialization.encodeToString
 import java.time.LocalDate
 
@@ -22,123 +10,32 @@ import java.time.LocalDate
  * FlameDB client with coroutine-based I/O.
  *
  * All public methods are `suspend` functions safe to call from any coroutine.
- * I/O is dispatched to [Dispatchers.IO]; the internal mutex serializes
- * concurrent callers over the single TCP connection.
+ * Reserved read/write pools dispatch blocking socket I/O to Dispatchers.IO.
+ * Each leased connection has exclusive response ownership.
  */
 class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseable {
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val mutex = Mutex()
-
-    private val lifecycleLock = Any()
-    @Volatile private var closed = false
-    @Volatile private lateinit var socket: Socket
-    private lateinit var reader: BufferedReader
-    private lateinit var writer: BufferedWriter
-
-    // ─── Factory ──────────────────────────────────────────────────────────────
+    private val transport = CommandPool(cfg, json)
 
     companion object {
-        /**
-         * Opens a TCP connection to FlameDB and authenticates.
-         * Suspends on the IO dispatcher during the handshake.
-         */
-        suspend fun connect(cfg: FlameDBConfig): FlameDB = withContext(Dispatchers.IO) {
+        /** Authenticates one connection; other pool connections open on demand. */
+        suspend fun connect(cfg: FlameDBConfig): FlameDB {
             val client = FlameDB(cfg)
-            client.dial()
-            client
-        }
-    }
-
-    // ─── Connection ───────────────────────────────────────────────────────────
-
-    private fun dial() {
-        require(cfg.timeoutMs > 0) { "timeoutMs must be positive" }
-        require(!cfg.apiKey.contains('\n') && !cfg.apiKey.contains('\r')) { "invalid API key" }
-        synchronized(lifecycleLock) {
-            if (closed) throw FlameDBException("FlameDB client is closed")
-            socket = Socket()
-        }
-        try {
-            socket.connect(InetSocketAddress(cfg.host, cfg.port), cfg.timeoutMs)
-            socket.soTimeout = cfg.timeoutMs
-            reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-            writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            performAuth()
-        } catch (error: Exception) { runCatching { socket.close() }; throw error }
-    }
-
-    private fun performAuth() {
-        val challenge = readLine()
-        val parsed = json.parseToJsonElement(challenge).jsonObject
-        check(parsed["auth"]?.jsonPrimitive?.content == "required") {
-            "FlameDB: unexpected auth challenge: $challenge"
-        }
-
-        sendLine("AUTH ${cfg.apiKey}")
-        writer.flush()
-
-        val resp = readLine()
-        val authResp = json.parseToJsonElement(resp).jsonObject
-        if (authResp["auth"]?.jsonPrimitive?.content != "ok") {
-            val err = authResp["error"]?.jsonPrimitive?.content ?: resp
-            throw FlameDBException("FlameDB auth failed: $err")
-        }
-    }
-
-    private fun readLine(): String =
-        reader.readLine() ?: throw FlameDBException("FlameDB connection closed")
-
-    private fun sendLine(line: String) {
-        require(!line.contains('\n') && !line.contains('\r') && !line.contains('\u001f')) { "invalid command framing" }
-        writer.write(line)
-        writer.newLine()
-    }
-
-    /**
-     * Sends [lines] and reads one JSON response. Throws [FlameDBException] on
-     * server-side errors.
-     */
-    private fun rawCommand(lines: List<String>): JsonObject {
-        lines.forEach { require(!it.contains('\n') && !it.contains('\r') && !it.contains('\u001f')) { "invalid command framing" } }
-        if (closed) throw FlameDBException("FlameDB client is closed")
-        if (socket.isClosed) {
-            try { dial() } catch (error: Exception) {
-                throw FlameDBException("FlameDB reconnect failed; command was not sent", error)
+            try {
+                client.transport.connect()
+                return client
+            } catch (error: Throwable) {
+                client.close()
+                throw error
             }
         }
-        val obj = try {
-            lines.forEach { sendLine(it) }
-            writer.flush()
-            json.parseToJsonElement(readLine()).jsonObject
-        } catch (error: Exception) {
-            runCatching { socket.close() }
-            throw FlameDBException(
-                "FlameDB command failed; outcome may be unknown. The command was not retried; the next call will reconnect.",
-                error,
-            )
-        }
-        val err = obj["error"]?.jsonPrimitive?.content
-        if (err != null) throw FlameDBException(err)
-        return obj
     }
 
-    /** Dispatches to IO and holds the mutex for the duration of the command. */
-    private suspend fun command(lines: List<String>): JsonObject =
-        withContext(Dispatchers.IO) {
-            mutex.withLock { rawCommand(lines) }
-        }
-
+    private suspend fun command(lines: List<String>): JsonObject = transport.command(lines)
     private suspend fun command(line: String): JsonObject = command(listOf(line))
 
-    // ─── Close ────────────────────────────────────────────────────────────────
-
-    override fun close() {
-        synchronized(lifecycleLock) {
-            closed = true
-            if (::socket.isInitialized) runCatching { socket.close() }
-        }
-    }
+    override fun close() = transport.close()
 
     // ─── Write ────────────────────────────────────────────────────────────────
 
@@ -412,5 +309,10 @@ data class FlameDBConfig(
     val host: String,
     val port: Int = 7777,
     val apiKey: String,
+    /** Total command deadline including pool wait, connection/auth and socket I/O. */
     val timeoutMs: Int = 5_000,
+    val readConnections: Int = 2,
+    val writeConnections: Int = 1,
+    /** Called when a command completes or fails. Keep the callback quick/non-blocking. */
+    val onCommandTiming: ((CommandTiming) -> Unit)? = null,
 )

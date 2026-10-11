@@ -1,8 +1,29 @@
 # FlameDB — Kotlin SDK
 
 Coroutine-based Kotlin client for FlameDB. Designed for Minecraft plugin devs
-on Folia/Paper/Velocity. All methods are `suspend` functions — no blocking, no
-callbacks.
+on Folia/Paper/Velocity. Network methods suspend the caller; blocking socket I/O
+runs on `Dispatchers.IO`.
+
+## Concurrency, deadlines and timings
+
+The default pool has **two read connections and one write connection**. Connections open lazily; `connect` authenticates one write connection. GET, LEADERBOARD, GROUP_LEADERBOARD, STATS, METRICS and PREVIEW_DELETE use reserved reads; mutations use writes. A blocked write cannot occupy read capacity. Each leased connection owns one complete request/response; concurrent coroutines are no longer serialized on a client-wide mutex.
+
+```kotlin
+val db = FlameDB.connect(FlameDBConfig(
+    host = "127.0.0.1", port = 7777, apiKey = apiKey,
+    timeoutMs = 5000, readConnections = 2, writeConnections = 1,
+    onCommandTiming = { timing ->
+        // queueWaitNanos and requestNanos are nanoseconds.
+        // Forward to a bounded, non-blocking metrics sink.
+    },
+))
+```
+
+`timeoutMs` is a total deadline per protocol command, including pool wait, lazy connect/auth, socket I/O and response JSON parsing. An enclosing coroutine timeout/cancellation can stop it earlier. Multi-command helpers such as `deleteByTags` apply it per command. `queueWaitNanos` measures admission; `requestNanos` measures transport work after admission (including lazy authentication). A call that never acquires a connection has zero request time. `success` reports the transport result, before public result conversion. Observers run after successful I/O releases its lease; keep them quick and non-blocking, and safe for concurrent callbacks. Observer exceptions do not fail commands.
+
+Concurrent operations have **no ordering guarantee across connections**. Await a write before issuing a dependent read; do not depend on coroutine launch order. Increasing write capacity can reorder concurrent SET/DELETE/increment operations. Replication consistency is unchanged. For one shared connection, set `readConnections = 0, writeConnections = 1`.
+
+Queued cancellation never sends the command or interrupts another caller's socket. Active cancellation closes the affected socket and holds its lease until the blocking worker actually exits; ambiguous writes are **not retried**. `close()` rejects queued calls and closes active sockets permanently. Pool sizes are fixed, failed sockets are replaced on demand, and no timing history is retained by the SDK.
 
 ## Dependency
 
@@ -192,7 +213,7 @@ amortize the round-trip cost.
 
 ## Connection failures
 
-The client serializes concurrent commands on one TCP connection. If sending or
+Each pool connection serializes its own commands. If sending or
 reading a response fails, it closes that connection and throws `FlameDBException`
 with the original cause. The next command reconnects and authenticates before
 sending. An explicit `close()` is permanent and disables reconnection.

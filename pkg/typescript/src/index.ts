@@ -6,11 +6,28 @@ export interface FlameDBConfig {
   host: string;
   port: number;
   apiKey: string;
-  /** Timeout in ms for individual commands (default: 5000) */
+  /** Total deadline including admission, connect/auth and socket I/O (default: 5000). */
   timeout?: number;
-  /** Max pending commands in pipeline before flushing (default: 64) */
+  /** Max pending commands per connection (default: 64). Further callers wait. */
   pipelineSize?: number;
+  /** Reserved read connections (default: 2). Zero shares the write pool. */
+  readConnections?: number;
+  /** Write connections (default: 1). */
+  writeConnections?: number;
+  /** Called after releasing admission capacity. Keep it quick/non-blocking. */
+  onCommandTiming?: (timing: CommandTiming) => void;
 }
+
+export interface CommandTiming {
+  command: string;
+  read: boolean;
+  queueWaitMs: number;
+  /** Includes lazy connect/auth, socket I/O and JSON parsing. */
+  requestMs: number;
+  success: boolean;
+}
+
+type ResolvedConfig = Required<Omit<FlameDBConfig, "onCommandTiming">> & Pick<FlameDBConfig, "onCommandTiming">;
 
 export interface Event {
   timestamp: number; // compatibility field; may lose nanosecond precision
@@ -134,11 +151,13 @@ class FlameConnection {
   private failure: Error | null = null;
   private readyPromise: Promise<void>;
 
-  constructor(private config: Required<FlameDBConfig>) {
+  constructor(private config: ResolvedConfig) {
     if (!Number.isInteger(config.timeout) || config.timeout <= 0 || !Number.isInteger(config.pipelineSize) || config.pipelineSize < 1) throw new Error("Invalid connection limits");
     validateLine(config.apiKey);
+    this.socket.setNoDelay(true);
     this.socket.setEncoding("utf8");
     this.socket.on("data", (chunk: string) => {
+      if (this.failure) return;
       this.buffer += chunk;
       if (this.buffer.length > 64 * 1024 * 1024) { this.fail(new Error("FlameDB response too large")); return; }
       let end: number;
@@ -155,16 +174,22 @@ class FlameConnection {
     this.socket.on("error", (err) => this.fail(err));
     this.socket.on("close", () => this.fail(new Error("FlameDB connection closed")));
     this.readyPromise = this.handshake();
+    // A deadline can expire just after constructing a lazy connection, before
+    // sendCommand attaches its await. Preserve rejection for callers while
+    // avoiding an unhandled background handshake rejection in that gap.
+    void this.readyPromise.catch(() => {});
   }
 
   private fail(err: Error): void {
     this.failure ??= err;
     for (const pending of this.queue.splice(0)) pending.reject(this.failure);
+    this.buffer = "";
     this.inbox = [];
     this.socket.destroy();
   }
 
   private async handshake(): Promise<void> {
+    const timer = setTimeout(() => this.fail(new Error("FlameDB connect timeout")), this.config.timeout);
     try {
       // Register before connecting: an immediate server greeting must not be lost.
       const challenge = this.recv();
@@ -175,6 +200,7 @@ class FlameConnection {
       const auth = JSON.parse(await response);
       if (auth.auth !== "ok") throw new Error(`Auth failed: ${auth.error ?? "invalid response"}`);
     } catch (err) { this.fail(err as Error); throw err; }
+    finally { clearTimeout(timer); }
   }
 
   ready(): Promise<void> { return this.readyPromise; }
@@ -193,12 +219,26 @@ class FlameConnection {
     });
   }
 
-  command(line: string): Promise<unknown> { return this.multilineCommand([line]); }
+  async multilineCommand(lines: string[], deadline: number): Promise<unknown> {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("FlameDB deadline exceeded before send");
+    let timer: ReturnType<typeof setTimeout>;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("FlameDB command timeout; outcome unknown; not retried");
+        this.fail(error);
+        reject(error);
+      }, remaining);
+    });
+    try { return await Promise.race([this.sendCommand(lines, deadline), expired]); }
+    finally { clearTimeout(timer!); }
+  }
 
-  async multilineCommand(lines: string[]): Promise<unknown> {
+  private async sendCommand(lines: string[], deadline: number): Promise<unknown> {
     for (const line of lines) validateLine(line);
     await this.ready();
     if (this.failure) throw this.failure;
+    if (performance.now() >= deadline) throw new Error("FlameDB deadline exceeded before send");
     if (this.queue.length >= this.config.pipelineSize) throw new Error("FlameDB pipeline is full");
     const response = this.recv();
     this.socket.write(lines.join("\n") + "\n");
@@ -210,10 +250,84 @@ class FlameConnection {
         return value;
       }); } catch (err) { this.fail(err as Error); throw err; }
     if (parsed.error) throw new Error(parsed.error);
+    if (performance.now() >= deadline) throw new Error("FlameDB command deadline exceeded; not retried");
     return parsed;
   }
 
   destroy(): void { this.fail(new Error("FlameDB connection closed")); }
+}
+
+type PoolSlot = { connection?: FlameConnection; load: number };
+type PoolWaiter = { resolve: (slot: PoolSlot) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
+
+// Pipelining stays FIFO on each socket. Separate pools prevent write traffic
+// from consuming read admission capacity or delaying read responses.
+class CommandPool {
+  private slots: PoolSlot[];
+  private waiters = new Set<PoolWaiter>();
+  private closed = false;
+
+  constructor(private config: ResolvedConfig, size: number) {
+    this.slots = Array.from({length: size}, () => ({load: 0}));
+  }
+
+  private available(): PoolSlot | undefined {
+    let chosen: PoolSlot | undefined;
+    for (const slot of this.slots) {
+      if (slot.load < this.config.pipelineSize && (!chosen || slot.load < chosen.load)) chosen = slot;
+    }
+    return chosen;
+  }
+
+  private acquire(deadline: number): Promise<PoolSlot> {
+    if (this.closed) return Promise.reject(new Error("FlameDB pool closed"));
+    if (performance.now() >= deadline) return Promise.reject(new Error("FlameDB pool wait timeout; command was not sent"));
+    const slot = this.available();
+    if (slot) { slot.load++; return Promise.resolve(slot); }
+    return new Promise((resolve, reject) => {
+      const waiter: PoolWaiter = {resolve, reject, timer: setTimeout(() => {
+        this.waiters.delete(waiter);
+        reject(new Error("FlameDB pool wait timeout; command was not sent"));
+      }, Math.max(1, deadline - performance.now()))};
+      this.waiters.add(waiter);
+    });
+  }
+
+  private release(slot: PoolSlot): void {
+    slot.load--;
+    if (this.closed) return;
+    const waiter = this.waiters.values().next().value;
+    if (waiter) {
+      this.waiters.delete(waiter);
+      clearTimeout(waiter.timer);
+      slot.load++;
+      waiter.resolve(slot);
+    }
+  }
+
+  private connection(slot: PoolSlot): FlameConnection {
+    if (!slot.connection || slot.connection.isFailed()) slot.connection = new FlameConnection(this.config);
+    return slot.connection;
+  }
+
+  async connect(): Promise<void> { await this.connection(this.slots[0]).ready(); }
+
+  async command(lines: string[], deadline: number, acquired: () => void): Promise<unknown> {
+    const slot = await this.acquire(deadline);
+    acquired();
+    try {
+      if (this.closed) throw new Error("FlameDB pool closed");
+      if (performance.now() >= deadline) throw new Error("FlameDB pool wait timeout; command was not sent");
+      return await this.connection(slot).multilineCommand(lines, deadline);
+    } finally { this.release(slot); }
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const waiter of this.waiters) { clearTimeout(waiter.timer); waiter.reject(new Error("FlameDB pool closed")); }
+    this.waiters.clear();
+    for (const slot of this.slots) slot.connection?.destroy();
+  }
 }
 
 function validateLine(line: string): void {
@@ -228,33 +342,60 @@ function identifier(value: string): string {
 // ─── FlameDB Client ──────────────────────────────────────────────────────────
 
 export class FlameDB {
-  private config: Required<FlameDBConfig>;
-  private conn: FlameConnection | null = null;
+  private config: ResolvedConfig;
+  private readPool: CommandPool | null = null;
+  private writePool: CommandPool | null = null;
 
   constructor(config: FlameDBConfig) {
     this.config = {
       timeout: 5000,
       pipelineSize: 64,
+      readConnections: 2,
+      writeConnections: 1,
       ...config,
     };
+    for (const value of [this.config.timeout, this.config.pipelineSize, this.config.writeConnections]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error("Invalid connection limits");
+    }
+    if (!Number.isInteger(this.config.readConnections) || this.config.readConnections < 0 ||
+        this.config.readConnections > 1024 || this.config.writeConnections > 1024) throw new Error("Invalid pool sizes");
   }
 
-  private getConn(): FlameConnection {
-    if (!this.conn || this.conn.isFailed()) {
-      this.conn = new FlameConnection(this.config);
+  private pool(read: boolean): CommandPool {
+    this.writePool ??= new CommandPool(this.config, this.config.writeConnections);
+    if (!read || this.config.readConnections === 0) return this.writePool;
+    return this.readPool ??= new CommandPool(this.config, this.config.readConnections);
+  }
+
+  private async command(input: string | string[]): Promise<unknown> {
+    const lines = typeof input === "string" ? [input] : input;
+    lines.forEach(validateLine);
+    const command = lines[0].split(" ", 1)[0];
+    const read = ["GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE"].includes(command);
+    const started = performance.now();
+    let admitted: number | undefined;
+    let success = false;
+    try {
+      const result = await this.pool(read).command(lines, started + this.config.timeout, () => { admitted = performance.now(); });
+      success = true;
+      return result;
+    } finally {
+      const finished = performance.now();
+      try { this.config.onCommandTiming?.({command, read, queueWaitMs: (admitted ?? finished) - started,
+        requestMs: admitted === undefined ? 0 : finished - admitted, success}); } catch { /* Telemetry cannot fail a command. */ }
     }
-    return this.conn;
   }
 
   /** Explicitly connect and authenticate. Called lazily otherwise. */
   async connect(): Promise<void> {
-    await this.getConn().ready();
+    await this.pool(false).connect();
   }
 
-  /** Close the TCP connection. */
+  /** Close all connections and reject active/queued commands. Later calls reconnect. */
   disconnect(): void {
-    this.conn?.destroy();
-    this.conn = null;
+    this.readPool?.close();
+    this.writePool?.close();
+    this.readPool = this.writePool = null;
   }
 
   // ─── Write ──────────────────────────────────────────────────────────────────
@@ -284,7 +425,7 @@ export class FlameDB {
       parts.push("QUORUM");
     }
 
-    await this.getConn().command(parts.join(" "));
+    await this.command(parts.join(" "));
   }
 
   /** Write multiple events in a single WRITE_BATCH command. */
@@ -310,7 +451,7 @@ export class FlameDB {
     }
     lines.push("END");
 
-    const result = await this.getConn().multilineCommand(lines);
+    const result = await this.command(lines);
     return result as BatchResult;
   }
 
@@ -323,7 +464,7 @@ export class FlameDB {
   ): Promise<void> {
     let cmd = `SET ${identifier(metric)} ${finite(value)}`;
     if (leaderboardEntity !== undefined) cmd += ` lb=${JSON.stringify(leaderboardEntity)}`;
-    await this.getConn().command(cmd);
+    await this.command(cmd);
   }
 
   // ─── Delete ─────────────────────────────────────────────────────────────────
@@ -344,7 +485,7 @@ export class FlameDB {
     }
     if (options.from) parts.push(`FROM ${fmtDate(options.from)}`);
     if (options.to) parts.push(`TO ${fmtDate(options.to)}`);
-    const response = await this.getConn().command(parts.join(" ")) as {delete?: DeleteResult};
+    const response = await this.command(parts.join(" ")) as {delete?: DeleteResult};
     if (!response.delete || response.delete.dry_run !== (options.dryRun ?? false) ||
         !Number.isSafeInteger(response.delete.events) || response.delete.events < 0 ||
         !Number.isSafeInteger(response.delete.leaderboard_entries) || response.delete.leaderboard_entries < 0)
@@ -392,7 +533,7 @@ export class FlameDB {
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
     if (options.order) parts.push(`ORDER ${options.order}`);
 
-    return (await this.getConn().command(parts.join(" "))) as GetResult;
+    return (await this.command(parts.join(" "))) as GetResult;
   }
 
   // ─── Leaderboard ────────────────────────────────────────────────────────────
@@ -405,7 +546,7 @@ export class FlameDB {
     if (options.board !== undefined) parts.push(`BOARD ${identifier(options.board)}`);
     if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`);
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
-    const result = (await this.getConn().command(parts.join(" "))) as {
+    const result = (await this.command(parts.join(" "))) as {
       leaderboard: LeaderboardEntry[];
     };
     return (result.leaderboard ?? []).map((entry: any) => ({ entity_id: entry.entity_id, score: entry.value }));
@@ -425,7 +566,7 @@ export class FlameDB {
     }
     if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`);
     if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`);
-    const result = (await this.getConn().command(parts.join(" "))) as {
+    const result = (await this.command(parts.join(" "))) as {
       leaderboard: GroupLeaderboardEntry[];
     };
     return (result.leaderboard ?? []).map((entry: any) => ({ group: entry.entity_id, score: entry.value }));
@@ -436,13 +577,13 @@ export class FlameDB {
   /** Lists cluster-wide metric names, optionally filtered by event tags. */
   async listMetrics(where: Record<string, string> = {}): Promise<string[]> {
     const clauses = Object.entries(where).map(([k, v]) => `${identifier(k)}=${JSON.stringify(v)}`).join(" AND ");
-    const result = await this.getConn().command("METRICS" + (clauses ? ` WHERE ${clauses}` : "")) as { metric_keys: string[] };
+    const result = await this.command("METRICS" + (clauses ? ` WHERE ${clauses}` : "")) as { metric_keys: string[] };
     return result.metric_keys;
   }
 
   async stats(metric: string, tags: string[]): Promise<StatsResult> {
     const cmd = `STATS ${identifier(metric)} TAGS ${tags.map(identifier).join(" ")}`;
-    return ((await this.getConn().command(cmd)) as { stats: StatsResult }).stats;
+    return ((await this.command(cmd)) as { stats: StatsResult }).stats;
   }
 }
 
