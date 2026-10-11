@@ -122,6 +122,19 @@ kotlin {
     jvmToolchain(21)
 }
 
+tasks.test {
+    exclude("**/*StressTest.class")
+}
+
+tasks.register<Test>("sdkStressTest") {
+    description = "Run bounded Kotlin SDK stress against local TCP fixtures (not a database benchmark)."
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/*StressTest.class")
+    testLogging.showStandardStreams = true
+}
+
 publishing {
     repositories {
         maven {

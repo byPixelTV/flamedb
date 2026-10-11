@@ -149,9 +149,47 @@ data class WriteBatchItem(
     val options: WriteOptions = WriteOptions(),
 )
 
-class FlameDBException : RuntimeException {
-    constructor(message: String) : super(message)
-    constructor(message: String, cause: Throwable) : super(message, cause)
+enum class FlameDBErrorKind {
+    OVERLOADED, POOL_WAIT_TIMEOUT, CONNECTION, AUTHENTICATION, SERVER_REJECTION,
+    INVALID_RESPONSE, RESPONSE_TOO_LARGE, REQUEST_TIMEOUT, REQUEST_FAILED,
+    REQUEST_CANCELLED, CLIENT_CLOSED,
+}
+
+enum class FlameDBPhase { POOL_WAIT, CONNECT, AUTHENTICATE, REQUEST }
+
+/** RESPONSE_RECEIVED means a validated response reached the SDK, not atomic batch success. */
+enum class ExecutionStatus { NOT_SENT, UNKNOWN, RESPONSE_RECEIVED, NOT_APPLICABLE }
+
+class FlameDBException(
+    message: String,
+    val kind: FlameDBErrorKind,
+    val command: String? = null,
+    val mutating: Boolean = false,
+    val executionStatus: ExecutionStatus = ExecutionStatus.NOT_SENT,
+    val phase: FlameDBPhase = FlameDBPhase.REQUEST,
+    cause: Throwable? = null,
+) : RuntimeException(message, cause) {
+    // Preserve both existing JVM constructor signatures and catch compatibility.
+    constructor(message: String) : this(message, FlameDBErrorKind.REQUEST_FAILED)
+    constructor(message: String, cause: Throwable) : this(message, FlameDBErrorKind.REQUEST_FAILED, cause = cause)
+
+    val outcomeUnknown: Boolean get() = executionStatus == ExecutionStatus.UNKNOWN
+}
+
+/** Cancellation retains its native type. Shared cancellation causes carry one diagnostic;
+ * use CommandTiming.failure for details of each individual call in a cancelled group. */
+fun Throwable.flameDBFailure(): FlameDBException? {
+    val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Throwable, Boolean>())
+    val pending = java.util.ArrayDeque<Throwable>()
+    pending.add(this)
+    while (pending.isNotEmpty()) {
+        val error = pending.removeFirst()
+        if (!seen.add(error)) continue
+        if (error is FlameDBException) return error
+        error.suppressed.forEach { pending.add(it) }
+        error.cause?.let { pending.add(it) }
+    }
+    return null
 }
 
 /** Counts are a preview when dryRun is true, otherwise confirmed deletions. */
@@ -161,7 +199,8 @@ data class DeleteResult(
  val events: Long,
  @SerialName("leaderboard_entries") val leaderboardEntries: Long,
 )
-data class MetricDeleteResult(val metric: String, val result: DeleteResult? = null, val error: String? = null)
+data class MetricDeleteResult(val metric: String, val result: DeleteResult? = null, val error: String? = null,
+                            val failure: FlameDBException? = null)
 data class DeleteByTagsResult(
  val dryRun: Boolean,
  val events: Long,

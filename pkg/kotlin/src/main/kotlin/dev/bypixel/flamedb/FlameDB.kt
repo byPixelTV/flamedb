@@ -34,6 +34,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
 
     private suspend fun command(lines: List<String>): JsonObject = transport.command(lines)
     private suspend fun command(line: String): JsonObject = command(listOf(line))
+    private suspend fun <T> command(line: String, decode: (JsonObject) -> T): T = transport.command(listOf(line), decode)
 
     override fun close() = transport.close()
 
@@ -55,8 +56,11 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             items.forEach { add(buildWrite(it.metric, it.value, it.options)) }
             add("END")
         }
-        val resp = command(lines)
-        return json.decodeFromJsonElement(resp)
+        return transport.command(lines) {
+            val result = json.decodeFromJsonElement<BatchResult>(it)
+            check(result.accepted >= 0 && result.failed >= 0 && result.errors.all { error -> error.index >= 0 }) { "invalid batch counters" }
+            result
+        }
     }
 
     private fun buildWrite(metric: String, value: Double, opts: WriteOptions): String =
@@ -112,10 +116,11 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             from?.let { append(" FROM $it") }
             to?.let { append(" TO $it") }
         }
-        val resp = command(cmd)
-        val result = json.decodeFromJsonElement<DeleteResult>(resp["delete"] ?: throw FlameDBException("missing delete result (updated server required)"))
-        if (result.dryRun != dryRun || result.events < 0 || result.leaderboardEntries < 0) throw FlameDBException("inconsistent delete result")
-        return result
+        return command(cmd) { resp ->
+            val result = json.decodeFromJsonElement<DeleteResult>(resp["delete"] ?: error("missing delete result (updated server required)"))
+            check(result.dryRun == dryRun && result.events >= 0 && result.leaderboardEntries >= 0) { "inconsistent delete result" }
+            result
+        }
     }
 
     /** Per-metric errors may have applied remotely; totals include confirmed results only. */
@@ -136,7 +141,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                results += MetricDeleteResult(metric, error = e.message ?: e.toString())
+                results += MetricDeleteResult(metric, error = e.message ?: e.toString(), failure = e.flameDBFailure())
             }
         }
         return DeleteByTagsResult(dryRun, results.sumOf { it.result?.events ?: 0L },
@@ -167,8 +172,7 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             options.offset?.let { append(" OFFSET $it") }
             options.order?.let { append(" ORDER $it") }
         }
-        val resp = command(cmd)
-        return json.decodeFromJsonElement(resp)
+        return command(cmd) { json.decodeFromJsonElement<GetResult>(it) }
     }
 
     private fun buildMetricSpec(
@@ -238,9 +242,9 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
         }
-        val resp = command(cmd)
-        val rawElement = resp["leaderboard"] ?: return emptyList()
-        return json.decodeFromJsonElement(rawElement)
+        return command(cmd) { resp ->
+            resp["leaderboard"]?.let { json.decodeFromJsonElement<List<LeaderboardEntry>>(it) } ?: emptyList()
+        }
     }
 
     // ─── Group Leaderboard ────────────────────────────────────────────────────
@@ -272,9 +276,9 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
             options.limit?.let { append(" LIMIT $it") }
             options.offset?.let { append(" OFFSET $it") }
         }
-        val resp = command(cmd)
-        val rawElement = resp["leaderboard"] ?: return emptyList()
-        return json.decodeFromJsonElement(rawElement)
+        return command(cmd) { resp ->
+            resp["leaderboard"]?.let { json.decodeFromJsonElement<List<GroupLeaderboardEntry>>(it) } ?: emptyList()
+        }
     }
 
     // ─── Stats ────────────────────────────────────────────────────────────────
@@ -285,14 +289,14 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     /** Lists cluster-wide metric names, optionally filtered by event tags. */
     suspend fun listMetrics(where: Map<String, String> = emptyMap()): List<String> {
         val clauses = where.entries.joinToString(" AND ") { (k, v) -> "${identifier(k)}=${json.encodeToString(v)}" }
-        val resp = command("METRICS" + if (clauses.isEmpty()) "" else " WHERE $clauses")
-        return json.decodeFromJsonElement(resp["metric_keys"] ?: throw FlameDBException("missing metric_keys"))
+        return command("METRICS" + if (clauses.isEmpty()) "" else " WHERE $clauses") { resp ->
+            json.decodeFromJsonElement<List<String>>(resp["metric_keys"] ?: error("missing metric_keys"))
+        }
     }
 
     suspend fun stats(metric: String, vararg tags: String): StatsResult {
         val cmd = "STATS ${identifier(metric)} TAGS ${tags.joinToString(" ") { identifier(it) }}"
-        val resp = command(cmd)
-        return json.decodeFromJsonElement(resp["stats"] ?: throw FlameDBException("missing stats"))
+        return command(cmd) { resp -> json.decodeFromJsonElement<StatsResult>(resp["stats"] ?: error("missing stats")) }
     }
 
     private fun identifier(value: String): String {
@@ -315,4 +319,9 @@ data class FlameDBConfig(
     val writeConnections: Int = 1,
     /** Called when a command completes or fails. Keep the callback quick/non-blocking. */
     val onCommandTiming: ((CommandTiming) -> Unit)? = null,
+    /** Waiting callers per class, excluding active leases. Zero rejects any wait. */
+    val maxQueuedReads: Int = 1024,
+    val maxQueuedWrites: Int = 1024,
+    /** Wire bytes before LF per response, including auth and an optional CR. */
+    val maxResponseBytes: Int = 8 * 1024 * 1024,
 )

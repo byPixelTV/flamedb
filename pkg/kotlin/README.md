@@ -12,18 +12,91 @@ The default pool has **two read connections and one write connection**. Connecti
 val db = FlameDB.connect(FlameDBConfig(
     host = "127.0.0.1", port = 7777, apiKey = apiKey,
     timeoutMs = 5000, readConnections = 2, writeConnections = 1,
+    maxQueuedReads = 1024, maxQueuedWrites = 1024,
+    maxResponseBytes = 8 * 1024 * 1024,
     onCommandTiming = { timing ->
         // queueWaitNanos and requestNanos are nanoseconds.
+        // failure contains per-command error/outcome details, including cancellation.
         // Forward to a bounded, non-blocking metrics sink.
     },
 ))
 ```
 
-`timeoutMs` is a total deadline per protocol command, including pool wait, lazy connect/auth, socket I/O and response JSON parsing. An enclosing coroutine timeout/cancellation can stop it earlier. Multi-command helpers such as `deleteByTags` apply it per command. `queueWaitNanos` measures admission; `requestNanos` measures transport work after admission (including lazy authentication). A call that never acquires a connection has zero request time. `success` reports the transport result, before public result conversion. Observers run after successful I/O releases its lease; keep them quick and non-blocking, and safe for concurrent callbacks. Observer exceptions do not fail commands.
+`timeoutMs` is a total deadline per protocol command, including pool wait, lazy connect/auth, socket I/O, response JSON parsing and typed result conversion. An enclosing coroutine timeout/cancellation can stop it earlier. Multi-command helpers such as `deleteByTags` apply it per command. `queueWaitNanos` measures admission; `requestNanos` measures work after admission (including lazy authentication and result conversion). A call that never acquires a connection has zero request time. `success` includes result validation; `failure` contains the structured failure when unsuccessful. Observers run after successful I/O releases its lease; keep them quick and non-blocking, and safe for concurrent callbacks. Observer exceptions do not fail commands. On cancellation, the caller/observer may return before blocking-worker cleanup finishes; that lease is held until the worker actually exits. JVM scheduling, DNS lookup and non-interruptible decoding can delay cleanup beyond the caller's deadline.
 
 Concurrent operations have **no ordering guarantee across connections**. Await a write before issuing a dependent read; do not depend on coroutine launch order. Increasing write capacity can reorder concurrent SET/DELETE/increment operations. Replication consistency is unchanged. For one shared connection, set `readConnections = 0, writeConnections = 1`.
 
 Queued cancellation never sends the command or interrupts another caller's socket. Active cancellation closes the affected socket and holds its lease until the blocking worker actually exits; ambiguous writes are **not retried**. `close()` rejects queued calls and closes active sockets permanently. Pool sizes are fixed, failed sockets are replaced on demand, and no timing history is retained by the SDK.
+
+## Admission and response limits
+
+| Configuration | Default | Meaning |
+|---|---|---|
+| `readConnections` | `2` | Reserved read leases; zero explicitly shares write connections |
+| `writeConnections` | `1` | Exclusive write leases |
+| `maxQueuedReads` | `1024` | Maximum reads waiting for a lease |
+| `maxQueuedWrites` | `1024` | Maximum writes waiting for a lease |
+| `maxResponseBytes` | `8 * 1024 * 1024` | Maximum UTF-8 wire bytes in each response before LF |
+| `timeoutMs` | `5000` | Total deadline for one protocol command |
+
+Queue limits exclude active leases and must be non-negative; zero allows an immediately available connection but rejects any wait. Each class has its own admission budget. A full queue fails early with `OVERLOADED` and `NOT_SENT`, without opening a connection or sending the command. Cancellation, timeout and close release waiting reservations in `finally`; an active connection returns only after its worker exits. Admission bounds work retained by this client, not the number of coroutines/batch objects your application creates. Use a bounded producer and reuse a client rather than starting unlimited jobs or constructing clients per request.
+
+`maxResponseBytes` must be positive. The limit applies separately to the initial auth challenge, the auth reply and every command response. It is enforced incrementally on raw bytes before accumulating the complete frame. LF is required and excluded from the count; an optional CR before LF is included in the count and removed before decoding. Exact-limit frames are accepted. UTF-8 is decoded strictly, including characters split across TCP reads; invalid or incomplete UTF-8 and EOF before LF are invalid responses, even when the partial bytes happen to be valid JSON. Responses must be JSON objects.
+
+Oversized, invalid and truncated replies discard only the affected connection. Its next lease reconnects and authenticates; other pool connections remain usable. Slow trickle traffic does not refresh the total deadline. Response buffers grow only within the configured limit and are not retained between frames; a fixed input buffer of at most 8 KiB remains per connected socket. The byte limit is **not** a JVM heap ceiling: decoded strings, JSON trees and result objects use additional memory, as do simultaneously active responses. Choose limits and pagination for your heap budget; very large explicitly configured limits can still exhaust it.
+
+## Structured failures and mutation outcomes
+
+All transport/protocol failures remain `FlameDBException`. The existing `(message)` and `(message, cause)` constructors and catches remain available. New fields are `kind`, `command` (protocol verb), `phase`, `mutating`, `executionStatus` and `outcomeUnknown`. Available causes are preserved. Existing caller argument validation still uses `IllegalArgumentException`; legacy manually constructed `FlameDBException` defaults to `REQUEST_FAILED`/`NOT_SENT`.
+
+| `kind` | Meaning / execution status |
+|---|---|
+| `OVERLOADED` | No waiting capacity; `NOT_SENT` |
+| `POOL_WAIT_TIMEOUT` | Total SDK deadline expired before a lease; `NOT_SENT` |
+| `CONNECTION` | TCP/DNS/connect deadline failed; command `NOT_SENT` |
+| `AUTHENTICATION` | Auth rejection, unexpected challenge or auth I/O/deadline failure; command `NOT_SENT` |
+| `SERVER_REJECTION` | Valid `error` response; connection remains usable; mutations conservatively `UNKNOWN` |
+| `INVALID_RESPONSE` | Invalid UTF-8/JSON/object/schema, truncated response or invalid result counters; connection discarded |
+| `RESPONSE_TOO_LARGE` | Byte limit exceeded while reading; connection discarded |
+| `REQUEST_TIMEOUT` | Deadline expired after admission during request/result handling |
+| `REQUEST_FAILED` | Other request I/O failure; connection discarded |
+| `REQUEST_CANCELLED` | Details of native coroutine cancellation, delivered through timing/suppressed diagnostics |
+| `CLIENT_CLOSED` | Permanent shutdown; queued calls `NOT_SENT`, active calls depend on send/response progress |
+
+`phase` is `POOL_WAIT`, `CONNECT`, `AUTHENTICATE` or `REQUEST`. Invalid/oversized auth frames keep their response-specific `kind`, with `AUTHENTICATE` phase and `NOT_SENT` status.
+
+`executionStatus` is `NOT_SENT` before the first command write attempt; `UNKNOWN` for a mutating request that may have reached the server without a validated result; `RESPONSE_RECEIVED` if a validated result reached the SDK but delivery to the caller lost a deadline/cancellation race; and `NOT_APPLICABLE` for sent reads. `RESPONSE_RECEIVED` does not mean an entire batch succeeded atomically. Because flush failures cannot prove how many bytes reached the server, the SDK marks writes conservatively from the first write attempt. A server rejection also cannot prove that no mutation occurred: quorum and batch failures may follow partial application. The SDK never automatically replays commands, including `UNKNOWN` mutations.
+
+```kotlin
+try {
+    db.write("kills", 1.0)
+} catch (cancelled: kotlinx.coroutines.CancellationException) {
+    // Preserve structured concurrency. Native timeout/cancellation types are retained.
+    // cancelled.flameDBFailure() can expose a suppressed diagnostic.
+    throw cancelled
+} catch (failure: FlameDBException) {
+    when (failure.kind) {
+        FlameDBErrorKind.OVERLOADED, FlameDBErrorKind.POOL_WAIT_TIMEOUT -> {
+            // This call was NOT_SENT. Apply bounded application-level backpressure.
+        }
+        else -> {
+            if (failure.outcomeUnknown) {
+                // Reconcile the outcome; do not blindly repeat an increment.
+            }
+        }
+    }
+}
+```
+
+Native cancellation may be shared by a group of coroutines and copied by coroutine stack recovery. Suppressed diagnostics retain at most one SDK detail per cancellation cause, preventing a reused cancellation exception from growing an unbounded history. For the status of **each individual call**, use `onCommandTiming` and `CommandTiming.failure`; `flameDBFailure()` is a diagnostic helper and a shared outer cancellation can represent several operations. A close/cancellation race may report `CLIENT_CLOSED` when shutdown has already closed the pool. `deleteByTags` keeps its existing per-metric `error` strings and adds `MetricDeleteResult.failure` for structured details; coroutine cancellation still propagates.
+
+## Compatibility and verification
+
+Source callers can omit the new options. The new finite defaults intentionally change overload behavior: bursts beyond connection plus queue capacity now fail promptly instead of retaining unlimited waits. Increase queue limits explicitly if a previously tested workload needs more admitted callers; this is a memory/latency tradeoff, not faster database execution. Replies larger than 8 MiB, missing LF, or malformed UTF-8 that were previously accepted/replacement-decoded now fail. Existing missing-leaderboard/GET defaults are retained, while undecodable result fields and invalid batch/delete counters produce structured errors.
+
+The additional data-class fields change generated constructor/default/copy JVM signatures (`FlameDBConfig`, `CommandTiming`, `MetricDeleteResult`); **recompile consuming Kotlin/Java applications**. Catching `FlameDBException` remains compatible, but use structured fields rather than parsing error message wording. No version has been published by this change. Explicit `writeBatch` remains available; an automatic batching queue is outside this scope.
+
+Run `gradlew.bat test --no-daemon --console=plain` for the existing and new local TCP regression suites. `gradlew.bat sdkStressTest --no-daemon --console=plain` separately runs 100,000 mixed requests with 128 workers and a 10,000-caller overload/cancellation probe. The size rejection oracle is tested against a known unsafe `BufferedReader.readLine()` counterexample. See [HARDENING_RESULTS.md](HARDENING_RESULTS.md) for measured results and limits; these fixtures perform no database work.
 
 ## Dependency
 
