@@ -9,7 +9,7 @@ import java.time.LocalDate
 /**
  * FlameDB client with coroutine-based I/O.
  *
- * All public methods are `suspend` functions safe to call from any coroutine.
+ * Network methods suspend and are safe to call from any coroutine.
  * Reserved read/write pools dispatch blocking socket I/O to Dispatchers.IO.
  * Each leased connection has exclusive response ownership.
  */
@@ -19,6 +19,15 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     private val transport = CommandPool(cfg, json)
 
     companion object {
+        /** SDK-managed native batches and bounded on-disk backlog, usable offline.
+         * record() acknowledges local admission; connect()/write() still await the server.
+         * One dedicated directory per client; shutdown() drains and releases ownership. */
+        fun buffered(
+            cfg: FlameDBConfig,
+            journalDirectory: java.nio.file.Path,
+            options: BufferedWriteConfig = BufferedWriteConfig(),
+        ): BufferedFlameDB = BufferedFlameDB(cfg, journalDirectory, options)
+
         /** Authenticates one connection; other pool connections open on demand. */
         suspend fun connect(cfg: FlameDBConfig): FlameDB {
             val client = FlameDB(cfg)

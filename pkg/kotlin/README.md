@@ -4,6 +4,40 @@ Coroutine-based Kotlin client for FlameDB. Designed for Minecraft plugin devs
 on Folia/Paper/Velocity. Network methods suspend the caller; blocking socket I/O
 runs on `Dispatchers.IO`.
 
+## Automatic buffering for frequent events
+
+Use the SDK-managed client when listeners produce frequent metrics. It owns batching,
+the sender, a bounded journal, retry decisions, logging and shutdown. No application
+queue, coroutine per event or custom connection pool is needed:
+
+```kotlin
+val db = FlameDB.buffered(
+    FlameDBConfig(host = "localhost", apiKey = apiKey),
+    java.nio.file.Path.of("flamedb-journal"),
+)
+
+// Ordinary listener: no launch and no suspend required.
+val accepted = db.record("smp:blocks-broken", 1.0,
+    WriteOptions(leaderboardEntity = playerId, tags = mapOf("player" to playerId)))
+// false means local admission failed; the SDK logs and exposes lastFailure.
+
+// Reads use reserved SDK connections; buffered metrics become visible after delivery.
+val totals = db.getSum("smp:blocks-broken")
+
+// Plugin shutdown (suspends); close()/use are available for blocking lifecycles.
+db.shutdown()
+```
+
+Default settings work without a `BufferedWriteConfig`: 128 events/batch, 100 ms
+flush, one sender and a 256 MiB journal admission budget. Memory does not grow with
+the backlog; full capacity rejects early rather than evicting acknowledged events.
+An independent flusher seals the journal even during connection failures or blocked
+writes. **`record()` acknowledges local OS-cache admission, not database success.**
+Existing `FlameDB.connect(...).write(...)` still waits for the server and behaves
+as before. Unknown/partial writes are retained for inspection and never automatically
+replayed. See [BUFFERED_WRITES.md](BUFFERED_WRITES.md) for acknowledgement, durability,
+bounded callbacks, recovery/audit helpers and shutdown details.
+
 ## Concurrency, deadlines and timings
 
 The default pool has **two read connections and one write connection**. Connections open lazily; `connect` authenticates one write connection. GET, LEADERBOARD, GROUP_LEADERBOARD, STATS, METRICS and PREVIEW_DELETE use reserved reads; mutations use writes. A blocked write cannot occupy read capacity. Each leased connection owns one complete request/response; concurrent coroutines are no longer serialized on a client-wide mutex.
@@ -96,7 +130,7 @@ Native cancellation may be shared by a group of coroutines and copied by corouti
 
 Source callers can omit the new options. The new finite defaults intentionally change overload behavior: bursts beyond connection plus queue capacity now fail promptly instead of retaining unlimited waits. Increase queue limits explicitly if a previously tested workload needs more admitted callers; this is a memory/latency tradeoff, not faster database execution. Replies larger than 8 MiB, missing LF, or malformed UTF-8 that were previously accepted/replacement-decoded now fail. Existing missing-leaderboard/GET defaults are retained, while undecodable result fields and invalid batch/delete counters produce structured errors.
 
-The additional data-class fields change generated constructor/default/copy JVM signatures (`FlameDBConfig`, `CommandTiming`, `MetricDeleteResult`); **recompile consuming Kotlin/Java applications**. Catching `FlameDBException` remains compatible, but use structured fields rather than parsing error message wording. No version has been published by this change. Explicit `writeBatch` remains available; an automatic batching queue is outside this scope.
+The additional data-class fields change generated constructor/default/copy JVM signatures (`FlameDBConfig`, `CommandTiming`, `MetricDeleteResult`); **recompile consuming Kotlin/Java applications**. Catching `FlameDBException` remains compatible, but use structured fields rather than parsing error message wording. No version has been published by this change. Explicit `writeBatch` remains available. SDK-managed automatic batching is available separately through `FlameDB.buffered`; direct-client acknowledgement semantics and existing configuration signatures are unchanged by that addition.
 
 Run `gradlew.bat test --no-daemon --console=plain` for the existing and new local TCP regression suites. `gradlew.bat sdkStressTest --no-daemon --console=plain` separately runs 100,000 mixed requests with 128 workers and a 10,000-caller overload/cancellation probe. The size rejection oracle is tested against a known unsafe `BufferedReader.readLine()` counterexample. See [HARDENING_RESULTS.md](HARDENING_RESULTS.md) for measured results and limits; these fixtures perform no database work.
 

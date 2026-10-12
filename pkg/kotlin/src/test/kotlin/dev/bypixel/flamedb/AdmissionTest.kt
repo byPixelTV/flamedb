@@ -129,7 +129,9 @@ class AdmissionTest {
         val decoding = CountDownLatch(1)
         val release = CountDownLatch(1)
         TcpFixture { socket, _, _ -> socket.reply("{}") }.use { server ->
-            val pool = CommandPool(server.config(100).copy(maxQueuedWrites = 1), Json)
+            // The oracle blocks decoding and tests request/pool deadlines. Give
+            // the unrelated initial TCP/auth setup room under a loaded JVM.
+            val pool = CommandPool(server.config(500).copy(maxQueuedWrites = 1), Json)
             pool.connect()
             try {
                 val active = async { runCatching { pool.command(listOf("WRITE held 1")) {
