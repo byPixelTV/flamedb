@@ -174,6 +174,9 @@ class FlameDBException(
     constructor(message: String, cause: Throwable) : this(message, FlameDBErrorKind.REQUEST_FAILED, cause = cause)
 
     val outcomeUnknown: Boolean get() = executionStatus == ExecutionStatus.UNKNOWN
+
+    override fun toString(): String = if (command == null) super.toString() else
+        "${super.toString()} [kind=$kind, command=$command, phase=$phase, executionStatus=$executionStatus]"
 }
 
 /** Cancellation retains its native type. Shared cancellation causes carry one diagnostic;

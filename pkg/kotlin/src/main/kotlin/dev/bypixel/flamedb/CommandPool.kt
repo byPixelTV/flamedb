@@ -86,6 +86,7 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
         @Volatile var phase = FlameDBPhase.POOL_WAIT
         val sent = AtomicBoolean(false)
         val received = AtomicBoolean(false)
+        val workerStarted = AtomicBoolean(false)
         fun failure(kind: FlameDBErrorKind, message: String, cause: Throwable? = null): FlameDBException =
             FlameDBException(message, kind, name, !read,
                 when {
@@ -137,12 +138,14 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
             val connected = withTimeoutOrNull(cfg.timeoutMs.toLong()) {
                 val connection = writes.acquire(state)
                 state.phase = FlameDBPhase.CONNECT
-                blocking(connection, writes.available) { cancelled -> connection.dial(cancelled, state, deadline) }
+                blocking(connection, writes.available, state, deadline) { cancelled -> connection.dial(cancelled, state, deadline) }
                 true
             }
             if (connected == null) throw state.failure(
-                if (state.phase == FlameDBPhase.AUTHENTICATE) FlameDBErrorKind.AUTHENTICATION else FlameDBErrorKind.CONNECTION,
-                "FlameDB connect timeout; command was not sent", SocketTimeoutException("total connect deadline exceeded"))
+                if (!state.workerStarted.get()) FlameDBErrorKind.REQUEST_TIMEOUT
+                else if (state.phase == FlameDBPhase.AUTHENTICATE) FlameDBErrorKind.AUTHENTICATION else FlameDBErrorKind.CONNECTION,
+                if (!state.workerStarted.get()) "FlameDB IO dispatch timeout; handshake was not started"
+                else "FlameDB connect timeout; command was not sent", SocketTimeoutException("total connect deadline exceeded"))
         } catch (error: CancellationException) {
             attachCancellation(error, state.failure(FlameDBErrorKind.REQUEST_CANCELLED, "FlameDB connect cancelled"))
             throw error
@@ -158,6 +161,7 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
         val state = RequestState(name, name in readCommands)
         val pool = if (state.read) reads else writes
         val started = System.nanoTime()
+        val deadline = started + cfg.timeoutMs * 1_000_000L
         var acquired = 0L
         var success = false
         var reportedFailure: FlameDBException? = null
@@ -167,16 +171,17 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
                 val connection = pool.acquire(state)
                 acquired = System.nanoTime()
                 state.phase = FlameDBPhase.CONNECT
-                Pair(true, blocking(connection, pool.available) { cancelled ->
-                    connection.command(lines, cancelled, state, started + cfg.timeoutMs * 1_000_000L, decode)
+                Pair(true, blocking(connection, pool.available, state, deadline) { cancelled ->
+                    connection.command(lines, cancelled, state, deadline, decode)
                 })
             } ?: throw state.failure(
-                when (state.phase) {
+                if (acquired != 0L && !state.workerStarted.get()) FlameDBErrorKind.REQUEST_TIMEOUT else when (state.phase) {
                     FlameDBPhase.POOL_WAIT -> FlameDBErrorKind.POOL_WAIT_TIMEOUT
                     FlameDBPhase.CONNECT -> FlameDBErrorKind.CONNECTION
                     FlameDBPhase.AUTHENTICATE -> FlameDBErrorKind.AUTHENTICATION
                     FlameDBPhase.REQUEST -> FlameDBErrorKind.REQUEST_TIMEOUT
                 }, if (acquired == 0L) "FlameDB pool wait timeout; command was not sent"
+                else if (!state.workerStarted.get()) "FlameDB IO dispatch timeout; command was not sent"
                 else "FlameDB command timeout; not retried", SocketTimeoutException("total command deadline exceeded"))
             success = true
             return result.second
@@ -200,7 +205,8 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
         }
     }
 
-    private suspend fun <T> blocking(connection: Connection, pool: Channel<Connection>, block: (AtomicBoolean) -> T): T =
+    private suspend fun <T> blocking(connection: Connection, pool: Channel<Connection>, state: RequestState,
+                                    deadline: Long, block: (AtomicBoolean) -> T): T =
         suspendCancellableCoroutine { continuation ->
             val cancelled = AtomicBoolean(false)
             val operationLock = Any()
@@ -208,7 +214,9 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
             continuation.invokeOnCancellation {
                 synchronized(operationLock) {
                     cancelled.set(true)
-                    if (!finished) connection.invalidate()
+                    // A queued worker has not touched the socket. Preserve a
+                    // healthy connection; keep its lease until the task drains.
+                    if (!finished && state.workerStarted.get()) connection.invalidate()
                 }
             }
             // Socket close alone cannot wake a worker still awaiting an IO
@@ -219,7 +227,16 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
             try {
                 ioDispatcher.dispatch(continuation.context, Runnable {
                     val result = try {
-                        if (cancelled.get()) throw CancellationException("request cancelled before send")
+                        synchronized(operationLock) {
+                            if (cancelled.get()) throw CancellationException("request cancelled before send")
+                            // Coroutine timers can themselves be delayed by a
+                            // busy dispatcher. Check the actual deadline before
+                            // any connect/auth/socket work, not just cancellation.
+                            if (System.nanoTime() >= deadline) throw state.failure(FlameDBErrorKind.REQUEST_TIMEOUT,
+                                "FlameDB IO dispatch timeout; command was not sent",
+                                SocketTimeoutException("total command deadline exceeded before IO started"))
+                            state.workerStarted.set(true)
+                        }
                         Result.success(block(cancelled))
                     } catch (error: Throwable) { Result.failure(error) }
                     closeHandle.dispose()
@@ -330,7 +347,9 @@ internal class CommandPool(private val cfg: FlameDBConfig, private val json: Jso
                 remaining(deadline)
                 return result
             } catch (error: Exception) {
-                if (error !is FlameDBException || error.kind != FlameDBErrorKind.SERVER_REJECTION) invalidate()
+                // dial() discards its own failed/partial handshakes. A request
+                // that failed before its first write leaves a ready socket intact.
+                if (state.sent.get() && (error !is FlameDBException || error.kind != FlameDBErrorKind.SERVER_REJECTION)) invalidate()
                 throw error
             }
         }
