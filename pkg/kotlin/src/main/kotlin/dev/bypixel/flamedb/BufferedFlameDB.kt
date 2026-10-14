@@ -112,11 +112,13 @@ class BufferedFlameDB internal constructor(
         if (journal.auditFilesAtStartup > 0) logger.warning("FlameDB journal contains ${journal.auditFilesAtStartup} audit files; manual reconciliation required at $directory; no automatic replay")
     }
 
-    private fun warn(reason: String) {
+    private fun warn(reason: String) = warn { reason }
+
+    private fun warn(reason: () -> String) {
         val now = System.nanoTime()
         val previous = nextWarning.get()
         if (now >= previous && nextWarning.compareAndSet(previous, now + 10_000_000_000L)) {
-            logger.warning("FlameDB buffered writes: $reason; admitted=${admitted.get()}, confirmed=${confirmed.get()}, uncertain=${uncertain.get()}, rejected=${rejected.get()}; journal=${journal.directory}")
+            logger.warning("FlameDB buffered writes: ${reason()}; admitted=${admitted.get()}, confirmed=${confirmed.get()}, uncertain=${uncertain.get()}, rejected=${rejected.get()}; journal=${journal.directory}")
         }
     }
 
@@ -234,10 +236,19 @@ class BufferedFlameDB internal constructor(
             return true
         } catch (e: Exception) {
             id?.let { callbacks.remove(it) }
-            lastFailure = e.flameDBFailure() ?: FlameDBException("buffered write admission failed", FlameDBErrorKind.REQUEST_FAILED,
+            val failure = e.flameDBFailure() ?: FlameDBException("buffered write admission failed", FlameDBErrorKind.REQUEST_FAILED,
                 command = "WRITE", mutating = true, executionStatus = ExecutionStatus.NOT_SENT, cause = e)
+            lastFailure = failure
             rejected.incrementAndGet()
-            warn("local admission failed (${e.javaClass.simpleName}); event NOT acknowledged")
+            warn {
+                val detail = (failure.message ?: e.javaClass.simpleName)
+                .replace(Regex("[\\p{Cntrl}]"), " ").take(160)
+                val cause = failure.cause?.let { error ->
+                "; cause=${error.javaClass.simpleName}: ${(error.message ?: "unknown").replace(Regex("[\\p{Cntrl}]"), " ").take(160)}"
+                } ?: ""
+                "local admission failed (kind=${failure.kind}, status=${failure.executionStatus}, reason=$detail$cause); " +
+                    "journal-bytes=${journal.retainedBytes()}, max-journal-bytes=${ingestion.maxJournalBytes}; event NOT acknowledged"
+            }
             return false
         }
     }

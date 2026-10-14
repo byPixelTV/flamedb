@@ -118,3 +118,94 @@ Keep their audit files intact; do not rename them to pending or blindly resend
 them. Their exact payloads/timestamps and authoritative history/scores must be
 reconciled before deciding any repair. Raising a timeout or getting a faster
 server response does not retroactively classify those outcomes.
+
+## Local journal admission failure
+
+`local admission failed; event NOT acknowledged` occurs before the SDK accepts
+the new event. It is separate from a server request timeout. The SDK and the
+previous Moonlight configuration defaulted to 268435456 bytes (256 MiB), counting
+retained pending and audit files across restarts. A reported 0.99 GB directory
+therefore points to an exhausted budget if that default is still configured;
+directory size alone does not establish the running configuration or exclude an
+I/O failure. For the reported deployment, the user confirmed that the Moonlight
+setting is absent, so the previous hardcoded 256 MiB fallback applies.
+
+With sufficient free disk space, explicitly allow a larger backlog in Moonlight's
+configuration and restart its writer:
+
+```yaml
+flamedb:
+  ingestion:
+    max-journal-bytes: 4294967296 # 4 GiB, operator-selected backlog capacity
+```
+
+This is a plugin setting, not the FlameDB server's `/root/config.yml`. Raising it
+does not fix a sustained producer/consumer imbalance or reconcile unknown writes.
+Preserve uncertain/partial/recovered files. The updated SDK diagnostic reports
+failure kind, execution status, bounded reason/cause, `journal-bytes` and
+`max-journal-bytes`; those fields distinguish an admission limit from another
+local failure. The diagnostic change still needs an SDK build and plugin rollout.
+
+`admitted=0` alongside positive `confirmed` can happen after restarting with
+pending files: admissions count new calls in this process, while confirmations
+also include recovered pending events. Rejected calls were not journaled, so
+callers must respect the Boolean return value. Restart does not reset retained
+bytes or erase audit material.
+
+## Follow-up for the deployed dev.45 single-node server
+
+The reported server already runs `0.1.1-dev.45`, with Zstd, no seeds and
+replication factor one. This is the repaired batch implementation; the older
+per-event fsync issue is not a sufficient explanation for its remaining live
+timeouts. Their exact server-side cause has not been established from the client
+warning alone. The current admission rejection has a separate cause: retained
+journal bytes exceed Moonlight's implicit 256 MiB budget.
+
+The next Pebble change stages each final leaderboard score once per atomic batch,
+while applying every accepted increment and overflow check in input order. It
+retains all original raw events and the single synchronous WAL commit. Single
+writes also avoid a second lookup of a score already read under its entity lock.
+Slow Pebble batches (at least 250 ms) now report entry/ACK counts and timings for
+receive, lock wait, local execution, replication and response. No payloads, tag
+values, metric names or credentials are included in that diagnostic.
+
+Against the deployed dev.45 source, the local native Windows benchmark uses
+Zstd, five boards, 128 events per batch, four Go execution threads and three
+identical 125-batch runs per case. For repeated metric/player scores, median
+batch time falls from 19.07 ms to 2.50 ms (7.62 times faster); WAL bytes per batch
+fall from 102155 to 8082 (92.1% less). For 250 distinct metrics, WAL bytes are
+unchanged and median time is 26.35 ms versus 24.08 ms. The repeated-score gain
+must not be applied to workloads containing only distinct score keys. Both
+cases independently verify all 16000 events and five boards in every run.
+
+An actual buffered Kotlin SDK check against a local four-CPU/four-GiB Linux Docker
+Pebble server with Zstd confirms 30000 events for five metrics and 1500 player IDs,
+including 7500 definitely-unsent events recovered from an offline journal. Sixty
+four producers run alongside two read connections, issuing 3351 statistics reads.
+All events and five boards are correct; uncertain/rejected counts are zero and
+the acknowledged state survives SIGKILL/restart without resending any write.
+Across 235 SDK write batches, measured p99 is 787.56 ms and maximum 1173.01 ms,
+below the unchanged five-second command deadline. This is a checked synthetic
+burst, not a sustained 1500-player Minecraft capacity test. Local slow-batch logs
+attribute the observed delay to local execution; they do not establish the cause
+on the production host.
+
+Moonlight's local configuration reader, ingestion model and packaged YAML now use
+a 4 GiB fallback/default for this setup. An existing explicitly configured value
+still wins. These EraMC edits remain uncommitted. The generic SDK default remains
+256 MiB; other users must choose their own capacity. The new Moonlight behavior
+requires building/replacing the plugin and restarting its writer; pulling the
+server image alone cannot change a plugin's admission budget.
+
+Do **not delete the journal directory**. `.pending` and `.open` contain unsent
+events; deleting them loses those events. `.inflight`, `.uncertain`, `.partial`,
+`.result.json` and recovery/audit material must be retained for reconciliation.
+Unknown writes may already be reflected in leaderboard scores, so blindly
+resending them can double-count increments. Confirmed `.done` files are already
+cleaned by the SDK; restarting does not purge unknown data. A faster server does
+not retroactively resolve those outcomes.
+
+Evidence is retained in `.compat/pebble-journal-rootcause/`. Run
+`node deploy/check-pebble-journal.cjs correctness`, `benchmark` and `sdk` for the
+required checks. The real SDK test is opt-in (`realPebbleTest`) and requires a
+test-owned Docker fixture, so ordinary SDK tests do not need a running database.

@@ -76,6 +76,15 @@ metadata can exceed the limit conservatively instead of discarding already admit
 data. Monitor disk free space as well as this budget. Reconcile/clean audit data only
 with the writer stopped, then reopen so accounting reflects operator changes.
 
+Admission warnings include the structured failure kind/status, reason, current
+`journal-bytes` and configured `max-journal-bytes`. For example, an existing
+0.99 GiB journal exceeds the default 256 MiB budget even after a fresh SDK start.
+Restart does not remove audit files or reset their disk usage. With adequate free
+disk space, an operator can explicitly increase the admission budget (for example
+to 4 GiB) and reopen the writer to admit new events while preserving those files.
+This supplies backlog capacity; it does not resolve uncertain outcomes or prove
+sustainable server throughput. Rejected events were not admitted to the journal.
+
 Journal append goes to the OS cache; sealing fsyncs before send. The flusher operates
 independently of socket I/O/backoff. Scheduler delays, synchronous filesystem calls,
 power loss and filesystem metadata durability can still exceed/affect this interval.

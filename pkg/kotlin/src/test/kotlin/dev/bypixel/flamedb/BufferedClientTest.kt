@@ -206,8 +206,12 @@ class BufferedClientTest {
             Fixture().use { server ->
                 server.mode = mode
                 server.blockWrites = true
-                if (mode == "TIMEOUT") server.delayMs = 600
-                val db = BufferedFlameDB(server.config(150, 1024), path, config(batch = 8), logger)
+                // Lost/malformed ACK tests do not depend on a tiny scheduling
+                // budget for their unrelated warmup read. The timeout case
+                // still withholds its write ACK well beyond its own deadline.
+                if (mode == "TIMEOUT") server.delayMs = 1500
+                val requestMs = if (mode == "TIMEOUT") 500 else 1000
+                val db = BufferedFlameDB(server.config(requestMs, 1024), path, config(batch = 8), logger)
                 val callbacks = ConcurrentHashMap.newKeySet<Int>()
                 var firstBatch = emptyList<String>()
                 try {
@@ -420,6 +424,48 @@ class BufferedClientTest {
                     until { db.statistics().confirmed == accepted + 1L }
                     assertEquals(accepted + 1, server.lines.size)
                 } finally { server.blockWrites = false; db.shutdown() }
+            }
+        } finally { clean(path) }
+    }
+
+    @Test fun admissionLogsExposeBudgetAndValidationCausesWithoutPayload() = runBlocking {
+        val path = dir()
+        val messages = ConcurrentLinkedQueue<String>()
+        val logger = Logger.getAnonymousLogger().apply {
+            useParentHandlers = false
+            level = Level.ALL
+            addHandler(object : java.util.logging.Handler() {
+                override fun publish(record: java.util.logging.LogRecord) { messages += record.message }
+                override fun flush() {}
+                override fun close() {}
+            })
+        }
+        try {
+            Fixture().use { server ->
+                val invalid = BufferedFlameDB(server.config(), path, config(), logger)
+                try { assertFalse(invalid.record("bad metric SECRET_PAYLOAD", 12345.6789)) }
+                finally { invalid.shutdown() }
+                val cause = messages.first { it.contains("local admission failed") }
+                assertTrue(cause.contains("kind=REQUEST_FAILED") && cause.contains("status=NOT_SENT"))
+                assertTrue(cause.contains("IllegalArgumentException: invalid metric identifier"))
+                assertFalse(cause.contains("SECRET_PAYLOAD") || cause.contains("12345.6789"))
+                messages.clear()
+                val audit = path.resolve("0000000000000000001-retained.uncertain")
+                val original = ByteArray(4096) { (it % 127).toByte() }
+                Files.write(audit, original)
+                val full = BufferedFlameDB(server.config(), path, config().copy(maxJournalBytes = 2048), logger)
+                try {
+                    assertFalse(full.record("new-event", 1.0))
+                    val warning = messages.first { it.contains("local admission failed") }
+                    assertTrue(warning.contains("kind=OVERLOADED") && warning.contains("status=NOT_SENT"))
+                    assertTrue(warning.contains("reason=buffered write journal admission limit exceeded"))
+                    assertTrue(warning.contains("journal-bytes=4096, max-journal-bytes=2048"))
+                    assertEquals(0L, full.statistics().admitted)
+                    assertEquals(1L, full.statistics().rejected)
+                    delay(100)
+                    assertTrue(server.lines.isEmpty())
+                    assertContentEquals(original, Files.readAllBytes(audit))
+                } finally { full.shutdown() }
             }
         } finally { clean(path) }
     }

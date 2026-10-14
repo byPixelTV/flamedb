@@ -578,6 +578,21 @@ func isConnectionClosed(err error) bool {
 }
 
 func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header string, internal bool) {
+	started := time.Now()
+	var receive, lockWait, localWork, replication, response time.Duration
+	var observed *query.BatchResult
+	var entries int
+	defer func() {
+		elapsed := time.Since(started)
+		if !s.shared && elapsed >= 250*time.Millisecond {
+			accepted, failed := 0, 0
+			if observed != nil {
+				accepted, failed = observed.Accepted, observed.Failed
+			}
+			// Payloads, metric names and credentials never enter this diagnostic.
+			log.Printf("slow Pebble WRITE_BATCH entries=%d accepted=%d failed=%d total_ms=%d receive_ms=%d lock_wait_ms=%d local_ms=%d replication_ms=%d response_ms=%d", entries, accepted, failed, elapsed.Milliseconds(), receive.Milliseconds(), lockWait.Milliseconds(), localWork.Milliseconds(), replication.Milliseconds(), response.Milliseconds())
+		}
+	}()
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	ended := false
@@ -614,8 +629,11 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		s.handleSharedBatch(conn, lines, batchQuorum, internal)
 		return
 	}
+	entries = len(lines)
+	receive = time.Since(started)
 
 	result := &query.BatchResult{OK: true}
+	observed = result
 	type localItem struct {
 		index int
 		line  string
@@ -725,8 +743,12 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 			localIndexByBatchIndex[i] = item.index
 		}
 
+		waiting := time.Now()
 		unlock := s.lockMutations(localQueries)
+		lockWait = time.Since(waiting)
+		working := time.Now()
 		localResult, err := s.exec.ExecuteBatch(localQueries)
+		localWork = time.Since(working)
 		if err != nil {
 			for _, item := range local {
 				result.Failed++
@@ -759,6 +781,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 				})
 				replicationIndexByItem = append(replicationIndexByItem, item.index)
 			}
+			replicating := time.Now()
 			if err := s.cluster.ReplicateBatch(replicationItems); err != nil {
 				for _, index := range replicationIndexByItem {
 					result.Accepted--
@@ -766,6 +789,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 					result.Errors = append(result.Errors, query.BatchItemError{Index: index, Error: err.Error()})
 				}
 			}
+			replication = time.Since(replicating)
 		}
 		unlock()
 	}
@@ -773,7 +797,9 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 	if result.Failed > 0 {
 		result.OK = false
 	}
+	responding := time.Now()
 	writeJSON(conn, result)
+	response = time.Since(responding)
 }
 
 func upstreamBatchResult(data []byte) (int, []query.BatchItemError, error) {

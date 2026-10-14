@@ -280,7 +280,7 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 				if err != nil {
 					return err
 				}
-				if err := e.lb.StageValue(batch, metric, entity, current+q.Value, false); err != nil {
+				if err := e.lb.StageValueFromCurrent(batch, metric, entity, current, current+q.Value, false); err != nil {
 					return err
 				}
 			}

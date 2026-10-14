@@ -64,7 +64,11 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 	accepted := []int{}
 	committed := []storage.Event{}
 	err := e.lb.AtomicMutationMany(locks, func(batch *pebble.Batch) error {
-		scores := map[scoreKey]float64{}
+		type scoreState struct {
+			initial, current float64
+			changed          bool
+		}
+		scores := map[scoreKey]scoreState{}
 		for _, i := range valid {
 			q := queries[i]
 			receipt := []byte("repl-applied:" + q.OperationID)
@@ -84,16 +88,16 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 			next := make(map[scoreKey]float64, len(boards[i]))
 			for board, entity := range boards[i] {
 				key := scoreKey{aggregates.BoardMetric(q.Metric, board), entity}
-				current, ok := scores[key]
+				state, ok := scores[key]
 				if !ok {
-					var err error
-					current, err = e.lb.Get(key.metric, key.entity)
+					current, err := e.lb.Get(key.metric, key.entity)
 					if err != nil {
 						return err
 					}
-					scores[key] = current
+					state = scoreState{initial: current, current: current}
+					scores[key] = state
 				}
-				value := current + q.Value
+				value := state.current + q.Value
 				if math.IsNaN(value) || math.IsInf(value, 0) {
 					fail(i, fmt.Errorf("leaderboard value must be finite"))
 					break
@@ -111,10 +115,9 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 				return err
 			}
 			for key, value := range next {
-				if err := e.lb.StageValueFromCurrent(batch, key.metric, key.entity, scores[key], value, false); err != nil {
-					return err
-				}
-				scores[key] = value
+				state := scores[key]
+				state.current, state.changed = value, true
+				scores[key] = state
 			}
 			if q.IsReplica && q.OperationID != "" {
 				if err := batch.Set(receipt, []byte{1}, nil); err != nil {
@@ -123,6 +126,17 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 			}
 			accepted = append(accepted, i)
 			committed = append(committed, event)
+		}
+		// Scores are invisible until the shared commit. Keep validation and
+		// floating-point addition in input order, but write each final score
+		// once instead of writing and deleting every intermediate sort key.
+		for key, state := range scores {
+			if !state.changed {
+				continue
+			}
+			if err := e.lb.StageValueFromCurrent(batch, key.metric, key.entity, state.initial, state.current, false); err != nil {
+				return err
+			}
 		}
 		return nil
 	})

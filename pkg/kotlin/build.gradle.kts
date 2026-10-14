@@ -124,6 +124,16 @@ kotlin {
 
 tasks.test {
     exclude("**/*StressTest.class")
+    exclude("**/RealPebbleBufferedTest.class")
+}
+
+tasks.register<Test>("realPebbleTest") {
+    description = "Run the buffered SDK against an explicitly provided local Pebble TCP fixture."
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/RealPebbleBufferedTest.class")
+    testLogging.showStandardStreams = true
 }
 
 tasks.register<Test>("sdkStressTest") {
