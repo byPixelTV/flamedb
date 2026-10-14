@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"runtime"
 	"strings"
 	"time"
@@ -87,6 +88,14 @@ func applyPerfOptions(opts *pebble.Options) {
 	opts.BytesPerSync = bytesPerSync
 	opts.WALBytesPerSync = walBytesPerSync
 	opts.WALMinSyncInterval = func() time.Duration { return 200 * time.Microsecond }
+	// Healthy writes emit nothing. Pebble previously discarded these events,
+	// leaving commit delays indistinguishable from a compaction write stall.
+	opts.AddEventListener(pebble.EventListener{
+		WriteStallBegin: func(info pebble.WriteStallBeginInfo) {
+			log.Printf("Pebble write stall begin reason=%s", info.Reason)
+		},
+		WriteStallEnd: func() { log.Print("Pebble write stall end") },
+	})
 	opts.CompactionConcurrencyRange = func() (int, int) {
 		cpus := runtime.GOMAXPROCS(0)
 		if cpus < 2 {

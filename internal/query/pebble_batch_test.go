@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sync"
@@ -10,6 +11,38 @@ import (
 	"github.com/byPixelTV/flamedb/internal/storage"
 	dto "github.com/prometheus/client_model/go"
 )
+
+func TestPebbleBatchTimingDoesNotChangeWireReply(t *testing.T) {
+	store, err := storage.Open(t.TempDir(), "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	exec := NewExecutor(store, aggregates.New(store.DB()))
+	r, err := exec.ExecuteBatch([]*Query{{Type: QueryTypeWrite, Metric: "m", Timestamp: 1, Value: 2, UpdateLB: true, LBEntityID: "new-player"}})
+	if err != nil || !r.OK || r.Accepted != 1 || r.Failed != 0 {
+		t.Fatal(r, err)
+	}
+	timing := r.PebbleTiming
+	// Fast phases can round to zero on a coarse host clock.
+	if timing == nil || timing.Stage < 0 || timing.Commit < 0 || timing.ScoreRead < 0 || timing.EventStage < 0 || timing.Cardinality < 0 || timing.LegacyScans != 1 {
+		t.Fatalf("incomplete timing: %+v", timing)
+	}
+	if timing.ScoreRead+timing.EventStage > timing.Stage {
+		t.Fatalf("nested phases exceed stage: %+v", timing)
+	}
+	wire, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wire) != `{"ok":true,"accepted":1,"failed":0}` {
+		t.Fatalf("wire reply changed: %s", wire)
+	}
+	value, err := aggregates.New(store.DB()).Get("m", "new-player")
+	if err != nil || value != 2 {
+		t.Fatal(value, err)
+	}
+}
 
 func TestPebbleBatchSingleDurableWALCommit(t *testing.T) {
 	store, err := storage.Open(t.TempDir(), "none")

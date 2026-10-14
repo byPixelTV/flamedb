@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/storage"
@@ -13,7 +14,8 @@ import (
 // One durable WAL commit replaces one synchronous commit per leaderboard event.
 // All score stripes remain locked through that commit, including concurrent SETs.
 func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
-	r := &BatchResult{OK: true}
+	timing := &PebbleBatchTiming{}
+	r := &BatchResult{OK: true, PebbleTiming: timing}
 	failed := make(map[int]bool)
 	fail := func(i int, err error) {
 		if failed[i] {
@@ -63,7 +65,9 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 	}
 	accepted := []int{}
 	committed := []storage.Event{}
-	err := e.lb.AtomicMutationMany(locks, func(batch *pebble.Batch) error {
+	var mutation aggregates.MutationTiming
+	var lookup aggregates.LookupStats
+	err := e.lb.AtomicMutationManyTimed(locks, func(batch *pebble.Batch) error {
 		type scoreState struct {
 			initial, current float64
 			changed          bool
@@ -90,7 +94,9 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 				key := scoreKey{aggregates.BoardMetric(q.Metric, board), entity}
 				state, ok := scores[key]
 				if !ok {
-					current, err := e.lb.Get(key.metric, key.entity)
+					reading := time.Now()
+					current, err := e.lb.GetWithLookupStats(key.metric, key.entity, &lookup)
+					timing.ScoreRead += time.Since(reading)
 					if err != nil {
 						return err
 					}
@@ -111,7 +117,10 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 				continue
 			}
 			event := storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags}
-			if err := e.store.StageEvent(batch, event); err != nil {
+			staging := time.Now()
+			err := e.store.StageEvent(batch, event)
+			timing.EventStage += time.Since(staging)
+			if err != nil {
 				return err
 			}
 			for key, value := range next {
@@ -139,7 +148,9 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 			}
 		}
 		return nil
-	})
+	}, &mutation)
+	timing.EntityLock, timing.Stage, timing.Commit = mutation.LockWait, mutation.Stage, mutation.Commit
+	timing.LegacyScans, timing.LegacyEntries = lookup.LegacyScans, lookup.LegacyEntries
 	if err != nil {
 		// No result is acknowledged before the shared synchronous commit.
 		for _, i := range valid {
@@ -147,9 +158,11 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 		}
 	} else {
 		r.Accepted = len(accepted)
+		recording := time.Now()
 		for _, event := range committed {
 			e.store.RecordCommittedEvent(event)
 		}
+		timing.Cardinality = time.Since(recording)
 	}
 	r.OK = r.Failed == 0
 	return r, nil

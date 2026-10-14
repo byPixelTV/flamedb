@@ -586,11 +586,15 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		elapsed := time.Since(started)
 		if !s.shared && elapsed >= 250*time.Millisecond {
 			accepted, failed := 0, 0
+			var detail query.PebbleBatchTiming
 			if observed != nil {
 				accepted, failed = observed.Accepted, observed.Failed
+				if observed.PebbleTiming != nil {
+					detail = *observed.PebbleTiming
+				}
 			}
 			// Payloads, metric names and credentials never enter this diagnostic.
-			log.Printf("slow Pebble WRITE_BATCH entries=%d accepted=%d failed=%d total_ms=%d receive_ms=%d lock_wait_ms=%d local_ms=%d replication_ms=%d response_ms=%d", entries, accepted, failed, elapsed.Milliseconds(), receive.Milliseconds(), lockWait.Milliseconds(), localWork.Milliseconds(), replication.Milliseconds(), response.Milliseconds())
+			log.Printf("slow Pebble WRITE_BATCH entries=%d accepted=%d failed=%d total_ms=%d receive_ms=%d lock_wait_ms=%d local_ms=%d replication_ms=%d response_ms=%d entity_lock_ms=%d stage_ms=%d score_read_ms=%d event_stage_ms=%d commit_ms=%d cardinality_ms=%d legacy_scans=%d legacy_entries=%d", entries, accepted, failed, elapsed.Milliseconds(), receive.Milliseconds(), lockWait.Milliseconds(), localWork.Milliseconds(), replication.Milliseconds(), response.Milliseconds(), detail.EntityLock.Milliseconds(), detail.Stage.Milliseconds(), detail.ScoreRead.Milliseconds(), detail.EventStage.Milliseconds(), detail.Commit.Milliseconds(), detail.Cardinality.Milliseconds(), detail.LegacyScans, detail.LegacyEntries)
 		}
 	}()
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -749,6 +753,9 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		working := time.Now()
 		localResult, err := s.exec.ExecuteBatch(localQueries)
 		localWork = time.Since(working)
+		if localResult != nil {
+			result.PebbleTiming = localResult.PebbleTiming
+		}
 		if err != nil {
 			for _, item := range local {
 				result.Failed++

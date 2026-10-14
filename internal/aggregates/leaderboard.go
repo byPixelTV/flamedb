@@ -9,6 +9,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/byPixelTV/flamedb/internal/keyspace"
 	"github.com/byPixelTV/flamedb/internal/types"
@@ -116,6 +117,15 @@ func (l *Leaderboard) setLocked(metric, entityID string, current, value float64)
 }
 
 func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
+	return l.GetWithLookupStats(metric, entityID, nil)
+}
+
+// LookupStats counts legacy fallback scans, without retaining any entity data.
+type LookupStats struct {
+	LegacyScans, LegacyEntries int
+}
+
+func (l *Leaderboard) GetWithLookupStats(metric, entityID string, stats *LookupStats) (float64, error) {
 	// O(1) lookup via entity index
 	data, closer, err := l.db.Get(lbEntityKey(metric, entityID))
 	if err == nil {
@@ -129,6 +139,9 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 	}
 
 	// Fallback: scan legacy data without an entity index.
+	if stats != nil {
+		stats.LegacyScans++
+	}
 	prefix := []byte("lb:" + keyspace.Component(metric) + ":")
 	iter, err := l.db.NewIter(&pebble.IterOptions{
 		LowerBound: prefix,
@@ -140,6 +153,9 @@ func (l *Leaderboard) Get(metric, entityID string) (float64, error) {
 	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
+		if stats != nil {
+			stats.LegacyEntries++
+		}
 		var entry LeaderboardEntry
 		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
 			continue
@@ -227,6 +243,21 @@ func (l *Leaderboard) AtomicMutation(metric, entity string, fn func(*pebble.Batc
 
 // AtomicMutationMany locks all affected entities in stable order for one batch.
 func (l *Leaderboard) AtomicMutationMany(keys []string, fn func(*pebble.Batch) error) error {
+	return l.AtomicMutationManyTimed(keys, fn, nil)
+}
+
+// MutationTiming separates synchronous commit from entity locking and staging.
+// Stage contains the callback's reads and writes; these are nested measurements.
+type MutationTiming struct {
+	LockWait, Stage, Commit time.Duration
+}
+
+func (l *Leaderboard) AtomicMutationManyTimed(keys []string, fn func(*pebble.Batch) error, timing *MutationTiming) error {
+	var started time.Time
+	if timing != nil {
+		*timing = MutationTiming{}
+		started = time.Now()
+	}
 	indices := make(map[uint32]struct{}, len(keys))
 	for _, key := range keys {
 		h := fnv.New32a()
@@ -241,6 +272,9 @@ func (l *Leaderboard) AtomicMutationMany(keys []string, fn func(*pebble.Batch) e
 	for _, index := range ordered {
 		l.mu[index].Lock()
 	}
+	if timing != nil {
+		timing.LockWait = time.Since(started)
+	}
 	defer func() {
 		for i := len(ordered) - 1; i >= 0; i-- {
 			l.mu[ordered[i]].Unlock()
@@ -248,10 +282,24 @@ func (l *Leaderboard) AtomicMutationMany(keys []string, fn func(*pebble.Batch) e
 	}()
 	batch := l.db.NewIndexedBatch()
 	defer batch.Close()
-	if err := fn(batch); err != nil {
+	if timing != nil {
+		started = time.Now()
+	}
+	err := fn(batch)
+	if timing != nil {
+		timing.Stage = time.Since(started)
+	}
+	if err != nil {
 		return err
 	}
-	return batch.Commit(pebble.Sync)
+	if timing != nil {
+		started = time.Now()
+	}
+	err = batch.Commit(pebble.Sync)
+	if timing != nil {
+		timing.Commit = time.Since(started)
+	}
+	return err
 }
 
 func (l *Leaderboard) StageValue(batch *pebble.Batch, metric, entity string, value float64, remove bool) error {

@@ -209,3 +209,36 @@ Evidence is retained in `.compat/pebble-journal-rootcause/`. Run
 `node deploy/check-pebble-journal.cjs correctness`, `benchmark` and `sdk` for the
 required checks. The real SDK test is opt-in (`realPebbleTest`) and requires a
 test-owned Docker fixture, so ordinary SDK tests do not need a running database.
+
+## Production evidence after updating to dev.46
+
+The supplied 2026-10-14 23:49:38–23:50:12 UTC logs confirm dev.46 started and
+recovered the existing WAL. All displayed slow batches accepted their entries,
+with zero failed items. Local processing took 256–4525 ms; receive, server mutation
+lock wait, replication and response took zero milliseconds after rounding. This
+locates the observed delay inside local execution, but does not yet distinguish
+score/event reads, the synchronous commit, entity locks or cardinality processing.
+There is no batch exceeding five seconds in this excerpt and no client timeout
+correlated with these particular batches. The historical unknown outcomes remain
+unresolved. Do not infer a total event rate from logs that omit fast batches.
+
+The follow-up diagnostic adds `entity_lock_ms`, `stage_ms`, `score_read_ms`,
+`event_stage_ms`, `commit_ms`, `cardinality_ms`, `legacy_scans` and
+`legacy_entries` to the existing slow-batch log. `score_read_ms` and
+`event_stage_ms` are portions of `stage_ms`, not additional time. Entity locking,
+staging, commit and cardinality are successive portions of `local_ms`. Commit
+includes Pebble commit admission/write stalls and the durable WAL sync; a high
+`commit_ms` alone does not prove a slow physical disk. Score reads include the
+legacy fallback scan used when an entity index is missing. Scan counters measure
+that work without logging player IDs, metrics, scores or tags.
+Pebble's formerly discarded write-stall events now log `Pebble write stall begin
+reason=...` and `Pebble write stall end` when it pauses ingestion for memory-table
+or level-zero pressure. Healthy writes do not emit those events.
+
+This change diagnoses the remaining delay; it does not claim to resolve it or
+raise the SDK deadline. A test-owned in-memory filesystem explicitly blocks WAL
+sync and verifies the mutation remains unacknowledged until release and the delay
+is attributed to commit. Failed staging still never commits. Additional tests
+check indexed/legacy/missing lookups and the unchanged JSON batch reply, alongside
+the ordered score/history, overflow, overwrite, receipt and recovery regressions.
+Run `node deploy/check-pebble-local-delay.cjs` for race tests and vet.

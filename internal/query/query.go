@@ -136,6 +136,13 @@ type BatchResult struct {
 	Accepted int              `json:"accepted"`
 	Failed   int              `json:"failed"`
 	Errors   []BatchItemError `json:"errors,omitempty"`
+	// Internal diagnostics never change protocol replies.
+	PebbleTiming *PebbleBatchTiming `json:"-"`
+}
+
+type PebbleBatchTiming struct {
+	EntityLock, Stage, ScoreRead, EventStage, Commit, Cardinality time.Duration
+	LegacyScans, LegacyEntries                                    int
 }
 
 type SeriesPoint struct {
