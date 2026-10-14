@@ -1,0 +1,35 @@
+auth:
+  enabled: true
+  keys:
+    - name: application
+      key: "${FLAMEDB_API_KEY}"
+      permissions: [read, write]
+server:
+  host: 0.0.0.0
+  port: 7777
+  node_id: api
+  max_connections: 1024
+  max_request_bytes: 8388608
+  max_response_bytes: 67108864
+  max_batch_entries: 10000
+  request_timeout: 30s
+  shutdown_timeout: 30s
+  metrics_address: 0.0.0.0:9090
+storage:
+  engine: timescaledb
+  postgres:
+    dsn: "${FLAMEDB_POSTGRES_DSN}"
+    max_connections: 8
+    quorum_replication_factor: 0 # Enable only with the matching durable topology.
+  redis:
+    mode: standalone
+    address: "${FLAMEDB_REDIS_ADDRESS}"
+    password: "${FLAMEDB_REDIS_PASSWORD}"
+    pool_size: 32
+  max_query_events: 1000000
+cluster:
+  enabled: true
+  replication_factor: 1
+performance:
+  batch_size: 1000
+  max_inflight_requests: 512

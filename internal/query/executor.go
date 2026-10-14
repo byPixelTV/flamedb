@@ -53,61 +53,7 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 }
 
 func (e *Executor) ExecuteBatch(queries []*Query) (*BatchResult, error) {
-	result := &BatchResult{OK: true}
-	var events []storage.Event
-	var receipts []string
-	var indices []int
-	fail := func(index int, err error) {
-		result.Failed++
-		result.Errors = append(result.Errors, BatchItemError{Index: index, Error: err.Error()})
-	}
-	flush := func() {
-		if len(events) == 0 {
-			return
-		}
-		if err := e.store.WriteEventsWithReceipts(events, receipts, true); err != nil {
-			for _, i := range indices {
-				fail(i, err)
-			}
-		} else {
-			result.Accepted += len(events)
-		}
-		events = nil
-		receipts = nil
-		indices = nil
-	}
-	for i, q := range queries {
-		if q == nil || q.Type != QueryTypeWrite {
-			fail(i, fmt.Errorf("batch only supports WRITE"))
-			continue
-		}
-		if math.IsNaN(q.Value) || math.IsInf(q.Value, 0) || q.Timestamp < 0 {
-			fail(i, fmt.Errorf("invalid write value or timestamp"))
-			continue
-		}
-		if q.Timestamp == 0 {
-			q.Timestamp = e.nextTimestamp()
-		}
-		if q.UpdateLB || len(q.LBEntities) > 0 {
-			flush()
-			if _, err := e.executeMutation(q); err != nil {
-				fail(i, err)
-			} else {
-				result.Accepted++
-			}
-			continue
-		}
-		events = append(events, storage.Event{Metric: q.Metric, Timestamp: q.Timestamp, Value: q.Value, Tags: q.Tags})
-		receipt := ""
-		if q.IsReplica {
-			receipt = q.OperationID
-		}
-		receipts = append(receipts, receipt)
-		indices = append(indices, i)
-	}
-	flush()
-	result.OK = result.Failed == 0
-	return result, nil
+	return e.executeWriteBatch(queries)
 }
 
 func (e *Executor) executeGroupLeaderboard(q *Query) (*Result, error) {
@@ -307,6 +253,9 @@ func (e *Executor) executeMutation(q *Query) (*Result, error) {
 	}
 	if len(locks) == 0 {
 		locks = append(locks, q.Metric+":")
+	}
+	if q.IsReplica && q.OperationID != "" {
+		locks = append(locks, "repl-applied:"+q.OperationID)
 	}
 	err := e.lb.AtomicMutationMany(locks, func(batch *pebble.Batch) error {
 		receipt := []byte("repl-applied:" + q.OperationID)

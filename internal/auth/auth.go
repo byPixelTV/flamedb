@@ -16,11 +16,12 @@ type Session struct {
 }
 
 type Auth struct {
-	keys map[string]*Session
+	disabled bool
+	keys     map[string]*Session
 }
 
 func New(cfg config.AuthConfig) *Auth {
-	a := &Auth{keys: make(map[string]*Session)}
+	a := &Auth{keys: make(map[string]*Session), disabled: !cfg.IsEnabled()}
 	for _, k := range cfg.Keys {
 		perms := make(map[Permission]bool)
 		for _, p := range k.Permissions {
@@ -38,6 +39,9 @@ func New(cfg config.AuthConfig) *Auth {
 }
 
 func (a *Auth) Validate(key string) (*Session, bool) {
+	if a.disabled {
+		return &Session{Name: "anonymous", Permissions: map[Permission]bool{PermRead: true, PermWrite: true}}, true
+	}
 	session, ok := a.keys[key]
 	return session, ok
 }

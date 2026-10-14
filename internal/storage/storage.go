@@ -485,7 +485,11 @@ func (s *Storage) StageEvent(batch *pebble.Batch, e Event) error {
 	if err != nil {
 		return err
 	}
-	if old, closer, err := s.db.Get(key); err == nil {
+	old, closer, err := batch.Get(key)
+	if err == pebble.ErrNotIndexed {
+		old, closer, err = s.db.Get(key)
+	}
+	if err == nil {
 		previous, decodeErr := decodeEventValue(old, e.Metric)
 		closer.Close()
 		if decodeErr != nil {

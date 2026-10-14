@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/storage"
@@ -34,6 +35,8 @@ const (
 )
 
 type Query struct {
+	EntityID    string
+	Radius      int
 	DryRun      bool
 	OperationID string
 	Type        QueryType
@@ -76,6 +79,7 @@ type DeleteResult struct {
 }
 
 type Result struct {
+	Ranking        *RankingResult              `json:"ranking,omitempty"`
 	Delete         *DeleteResult               `json:"delete,omitempty"`
 	MetricKeys     []string                    `json:"metric_keys,omitempty"`
 	Events         []storage.Event             `json:"events,omitempty"`
@@ -87,6 +91,40 @@ type Result struct {
 	Series         []SeriesPoint               `json:"series,omitempty"`
 	SeriesByMetric map[string][]SeriesPoint    `json:"series_by_metric,omitempty"`
 }
+
+type RankedEntry struct {
+	EntityID string  `json:"entity_id"`
+	Value    float64 `json:"value"`
+	Rank     int64   `json:"rank"`
+}
+type RankingResult struct {
+	Rank   *int64        `json:"rank"`
+	Score  *float64      `json:"score"`
+	Count  int64         `json:"count"`
+	Around []RankedEntry `json:"around,omitempty"`
+}
+
+// MarshalJSON distinguishes an absent around request from its valid empty page.
+func (r RankingResult) MarshalJSON() ([]byte, error) {
+	type fields struct {
+		Rank   *int64         `json:"rank"`
+		Score  *float64       `json:"score"`
+		Count  int64          `json:"count"`
+		Around *[]RankedEntry `json:"around,omitempty"`
+	}
+	out := fields{Rank: r.Rank, Score: r.Score, Count: r.Count}
+	if r.Around != nil {
+		out.Around = &r.Around
+	}
+	return json.Marshal(out)
+}
+
+const (
+	QueryTypeRank             QueryType = "RANK"
+	QueryTypeScore            QueryType = "SCORE"
+	QueryTypeAround           QueryType = "AROUND"
+	QueryTypeLeaderboardCount QueryType = "LEADERBOARD_COUNT"
+)
 
 type BatchItemError struct {
 	Index int    `json:"index"`

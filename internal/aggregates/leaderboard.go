@@ -246,7 +246,7 @@ func (l *Leaderboard) AtomicMutationMany(keys []string, fn func(*pebble.Batch) e
 			l.mu[ordered[i]].Unlock()
 		}
 	}()
-	batch := l.db.NewBatch()
+	batch := l.db.NewIndexedBatch()
 	defer batch.Close()
 	if err := fn(batch); err != nil {
 		return err
@@ -259,6 +259,13 @@ func (l *Leaderboard) StageValue(batch *pebble.Batch, metric, entity string, val
 	if err != nil {
 		return err
 	}
+	return l.StageValueFromCurrent(batch, metric, entity, current, value, remove)
+}
+
+// StageValueFromCurrent stages a score using the caller's locked, current value.
+// Batch callers supply the previous staged score, so repeated updates remove
+// intermediate sort keys and retain the original float64 accumulation order.
+func (l *Leaderboard) StageValueFromCurrent(batch *pebble.Batch, metric, entity string, current, value float64, remove bool) error {
 	if err := batch.Delete(lbKey(metric, entity, current), nil); err != nil {
 		return err
 	}

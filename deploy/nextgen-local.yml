@@ -1,0 +1,22 @@
+# Developer services from compose.nextgen.yml; credentials are local examples.
+auth:
+  keys:
+    - name: developer
+      key: "${FLAMEDB_API_KEY}"
+      permissions: [read, write]
+server:
+  host: 127.0.0.1
+  port: 7777
+  node_id: local-api
+  metrics_address: 127.0.0.1:9090
+storage:
+  engine: timescaledb
+  postgres:
+    dsn: postgres://flamedb:flamedb@127.0.0.1:55432/flamedb?sslmode=disable
+    max_connections: 32
+  redis:
+    mode: standalone
+    address: 127.0.0.1:56379
+cluster:
+  enabled: true
+  replication_factor: 1

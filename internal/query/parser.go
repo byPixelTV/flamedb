@@ -39,6 +39,9 @@ func Parse(input string) (result *Query, err error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("empty query")
 	}
+	if isRankingCommand(strings.ToUpper(tokens[0])) {
+		return parseRanking(tokens)
+	}
 
 	q := &Query{
 		OperationID: operationID,

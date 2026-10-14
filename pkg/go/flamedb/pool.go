@@ -84,7 +84,7 @@ func (c *Client) Close() (result error) {
 
 func isReadCommand(name string) bool {
 	switch name {
-	case "GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE":
+	case "GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE", "RANK", "SCORE", "AROUND", "LEADERBOARD_COUNT":
 		return true
 	default:
 		return false

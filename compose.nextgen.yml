@@ -1,0 +1,61 @@
+name: flamedb-nextgen
+services:
+  postgres:
+    image: ${FLAMEDB_POSTGRES_IMAGE:-timescale/timescaledb:latest-pg17@sha256:b346edcdb51a1fd6020e3965e0bd1c9f3406fa6d5fbce1e28f4852587ef934e2}
+    command: [postgres, -c, "max_wal_size=${FLAMEDB_POSTGRES_MAX_WAL_SIZE:-4GB}", -c, "checkpoint_timeout=${FLAMEDB_POSTGRES_CHECKPOINT_TIMEOUT:-2min}", -c, "wal_compression=${FLAMEDB_POSTGRES_WAL_COMPRESSION:-lz4}"]
+    environment:
+      POSTGRES_USER: flamedb
+      POSTGRES_PASSWORD: flamedb
+      POSTGRES_DB: flamedb
+    ports: ["127.0.0.1:${FLAMEDB_POSTGRES_PORT:-55432}:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U flamedb -d flamedb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:8-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
+    command: [redis-server, --appendonly, "yes", --appendfsync, everysec]
+    ports: ["127.0.0.1:${FLAMEDB_REDIS_PORT:-56379}:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  api:
+    &api
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.nextgen
+    image: flamedb-nextgen-api:local
+    environment:
+      FLAMEDB_API_KEY: ${FLAMEDB_API_KEY:-development-change-me}
+      FLAMEDB_POSTGRES_DSN: postgres://flamedb:flamedb@postgres:5432/flamedb?sslmode=disable
+      FLAMEDB_REDIS_ADDRESS: redis:6379
+    volumes: ["./deploy/nextgen.yml:/etc/flamedb/config.yml:ro"]
+    ports: ["127.0.0.1:${FLAMEDB_API_PORT:-7777}:7777", "127.0.0.1:${FLAMEDB_METRICS_PORT:-9090}:9090"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9090/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 40s
+    restart: unless-stopped
+  api-2:
+    <<: *api
+    profiles: [multi]
+    ports: ["127.0.0.1:${FLAMEDB_API2_PORT:-7778}:7777", "127.0.0.1:${FLAMEDB_METRICS2_PORT:-9091}:9090"]
+  api-3:
+    <<: *api
+    profiles: [multi]
+    ports: ["127.0.0.1:${FLAMEDB_API3_PORT:-7779}:7777", "127.0.0.1:${FLAMEDB_METRICS3_PORT:-9092}:9090"]
+volumes:
+  postgres-data:
+  redis-data:

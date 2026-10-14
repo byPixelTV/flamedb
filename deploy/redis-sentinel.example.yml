@@ -1,0 +1,10 @@
+# Merge this storage.redis section into nextgen.yml for an existing Sentinel installation.
+storage:
+  redis:
+    mode: sentinel
+    addresses: [sentinel-1:26379, sentinel-2:26379, sentinel-3:26379]
+    master_name: flamedb-ranking
+    username: "${FLAMEDB_REDIS_USERNAME}"
+    password: "${FLAMEDB_REDIS_PASSWORD}"
+    tls: true
+    pool_size: 32

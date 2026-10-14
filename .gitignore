@@ -7,3 +7,7 @@ data*
 node_modules
 dist
 *.zip
+.compat/
+.unlazy/
+internal/compat/sdk/**/build/
+internal/compat/sdk/**/.gradle/

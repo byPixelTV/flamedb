@@ -1,4 +1,12 @@
-> **Upgrade notice:** This version automatically migrates legacy Pebble databases at startup after creating a local checkpoint under `<data_path>.pre-v2-*/db`. The data path remains unchanged. Clusters still require a separate internal key. Before upgrading an existing installation, read the [audit and upgrade guide](AUDIT_2026-09-18.md).
+> **Next Generation:** A PostgreSQL/TimescaleDB backend with rebuildable Redis rankings is implemented alongside the legacy deployment. Start it with `docker compose -f compose.nextgen.yml up -d --build`. Read the [deployment, migration and measured performance guide](docs/nextgen.md) and [frozen SDK compatibility contract](docs/compatibility.md). Existing SDK calls remain supported; lowercase raw-event aliases repair the frozen Kotlin/TypeScript casing defect. The 200,000 requests/s engineering target has not been demonstrated by local measurements.
+
+For `REQUEST_TIMEOUT` on leaderboard batches in the existing Pebble deployment,
+see the [server batch fix, measurements and rollout notes](docs/pebble-batch-timeouts.md).
+
+The [current Pebble versus Next Gen comparison](docs/backend-comparison.md)
+measures both backends with equal local workload and resource limits.
+
+> **Legacy upgrade notice:** Pebble mode automatically migrates old databases after creating a checkpoint under `<data_path>.pre-v2-*/db`. Switching to PostgreSQL uses the separate read-only `cmd/import-postgres` tool; existing data directories are not automatically imported. See the [legacy audit](AUDIT_2026-09-18.md).
 
 <div align="center">
   <h1>FlameDB</h1>
@@ -35,7 +43,7 @@
 
 <br />
 
-FlameDB is a distributed Go database built for game backends and analytics-heavy workloads. It focuses on speed, simple ops, and cluster-ready defaults.
+FlameDB serves universal stats, events, analytics and exact leaderboards through its existing TCP protocol. The shared-storage backend keeps raw events and absolute scores in PostgreSQL/TimescaleDB, projects exact rankings into Redis, and permits multiple API nodes over the same durable data. Namespaced metrics and arbitrary entities remain application-neutral.
 
 ## Why FlameDB
 

@@ -130,6 +130,27 @@ export interface LeaderboardOptions {
   board?: string;
 }
 
+/** Selects an all-time board or a half-open event window. */
+export interface RankingOptions extends LeaderboardOptions {
+  from?: Date;
+  to?: Date;
+  entityTag?: string;
+}
+
+/** Global one-based ordinal rank in the selected leaderboard's tie order. */
+export interface RankedEntry {
+  entity_id: string;
+  score: number;
+  rank: number;
+}
+
+interface RankingResult {
+  rank: number | null;
+  score: number | null;
+  count: number;
+  around?: RankedEntry[];
+}
+
 export interface GroupDef {
   name: string;
   members: string[];
@@ -371,7 +392,7 @@ export class FlameDB {
     const lines = typeof input === "string" ? [input] : input;
     lines.forEach(validateLine);
     const command = lines[0].split(" ", 1)[0];
-    const read = ["GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE"].includes(command);
+    const read = ["GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE", "RANK", "SCORE", "AROUND", "LEADERBOARD_COUNT"].includes(command);
     const started = performance.now();
     let admitted: number | undefined;
     let success = false;
@@ -550,6 +571,73 @@ export class FlameDB {
       leaderboard: LeaderboardEntry[];
     };
     return (result.leaderboard ?? []).map((entry: any) => ({ entity_id: entry.entity_id, score: entry.value }));
+  }
+
+  /** One-based global rank, or null for a missing entity. */
+  async getRank(metric: string, entity: string, options: RankingOptions = {}): Promise<number | null> {
+    return (await this.ranking("RANK", metric, entity, undefined, options)).rank;
+  }
+
+  /** Current score, including zero, or null for a missing entity. */
+  async getScore(metric: string, entity: string, options: RankingOptions = {}): Promise<number | null> {
+    return (await this.ranking("SCORE", metric, entity, undefined, options)).score;
+  }
+
+  /** Entity plus up to radius neighbors on either side, retaining global ranks. */
+  async getAroundEntity(metric: string, entity: string, radius: number, options: RankingOptions = {}): Promise<RankedEntry[]> {
+    if (!Number.isSafeInteger(radius) || radius < 0 || radius > 100000) throw new Error("Invalid ranking radius");
+    return (await this.ranking("AROUND", metric, entity, radius, options)).around!;
+  }
+
+  /** Full entity count; LIMIT/OFFSET do not change this count or global ranks. */
+  async getLeaderboardCount(metric: string, options: RankingOptions = {}): Promise<number> {
+    return (await this.ranking("LEADERBOARD_COUNT", metric, undefined, undefined, options)).count;
+  }
+
+  private async ranking(command: string, metric: string, entity: string | undefined, radius: number | undefined, options: RankingOptions): Promise<RankingResult> {
+    const parts = [command, identifier(metric)];
+    if (command !== "LEADERBOARD_COUNT") {
+      if (typeof entity !== "string" || entity.length === 0) throw new Error("Invalid ranking entity");
+      parts.push(JSON.stringify(entity));
+    }
+    if (radius !== undefined) parts.push(String(radius));
+    const windowed = options.from !== undefined || options.to !== undefined;
+    if (options.board !== undefined) {
+      if (windowed || options.board.includes(":")) throw new Error("BOARD cannot be combined with FROM/TO or contain a colon");
+      parts.push("BOARD", identifier(options.board));
+    }
+    if (windowed && options.entityTag === undefined) throw new Error("entityTag required with from or to");
+    for (const [name, date] of [["FROM", options.from], ["TO", options.to]] as const) {
+      if (date !== undefined) {
+        if (!(date instanceof Date) || !Number.isFinite(date.getTime()) || date.getTime() < 0) throw new Error("Invalid ranking time range");
+        parts.push(name, date.toISOString());
+      }
+    }
+    if (options.from && options.to && options.from > options.to) throw new Error("Invalid ranking time range");
+    if (options.entityTag !== undefined) {
+      const tag = identifier(options.entityTag);
+      if (windowed) parts.push("ENTITY", tag);
+    }
+    for (const [name, value] of [["LIMIT", options.limit], ["OFFSET", options.offset]] as const) {
+      if (value !== undefined) {
+        if (!Number.isSafeInteger(value) || value < 0 || name === "LIMIT" && value > 1000000) throw new Error("Invalid ranking pagination");
+        parts.push(name, String(value));
+      }
+    }
+    const response = await this.command(parts.join(" ")) as {ranking?: any};
+    const r = response?.ranking;
+    if (!r || !Number.isSafeInteger(r.count) || r.count < 0 ||
+        !(r.rank === null || Number.isSafeInteger(r.rank) && r.rank >= 1 && r.rank <= r.count) ||
+        !(r.score === null || typeof r.score === "number" && Number.isFinite(r.score)) ||
+        (r.rank === null) !== (r.score === null)) throw new Error("Invalid ranking result (updated server required)");
+    if (command === "AROUND" && !Array.isArray(r.around)) throw new Error("Missing ranking around entries");
+    const around = r.around?.map((entry: any): RankedEntry => {
+      if (!entry || typeof entry.entity_id !== "string" || entry.entity_id.length === 0 ||
+          typeof entry.value !== "number" || !Number.isFinite(entry.value) ||
+          !Number.isSafeInteger(entry.rank) || entry.rank < 1 || entry.rank > r.count) throw new Error("Invalid ranking around entry");
+      return {entity_id: entry.entity_id, score: entry.value, rank: entry.rank};
+    });
+    return {rank: r.rank, score: r.score, count: r.count, ...(around === undefined ? {} : {around})};
   }
 
   // ─── Group Leaderboard ───────────────────────────────────────────────────────

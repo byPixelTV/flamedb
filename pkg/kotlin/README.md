@@ -138,11 +138,20 @@ Run `gradlew.bat test --no-daemon --console=plain` for the existing and new loca
 
 ```kotlin
 // build.gradle.kts
+repositories {
+    mavenCentral()
+    maven("https://repo.bypixel.dev/releases/")
+    maven("https://repo.bypixel.dev/snapshots/")
+}
 dependencies {
-    implementation("dev.bypixel:flamedb-kotlin-sdk:0.1.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    implementation("dev.bypixel:flamedb-kotlin-sdk:0.1.1-dev.44")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
 ```
+
+This is the SDK version resolved and verified by the EraMC integration. The older
+`0.1.0` dependency does not provide the buffered API shown above. This adoption
+does not publish a new SDK release.
 
 ## Usage
 

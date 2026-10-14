@@ -1,0 +1,14 @@
+.git
+.compat
+.unlazy
+node_modules
+**/node_modules
+**/build
+**/.gradle
+**/dist
+data*
+*.exe
+*.zip
+*.log
+.env
+.env.local

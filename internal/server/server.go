@@ -2,7 +2,9 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/byPixelTV/flamedb/internal/aggregates"
@@ -25,20 +28,28 @@ import (
 )
 
 type Server struct {
-	mutations [256]sync.Mutex
-	connMu    sync.Mutex
-	listener  net.Listener
-	conns     map[net.Conn]struct{}
-	connWG    sync.WaitGroup
-	closed    bool
-	exec      *query.Executor
-	auth      *auth.Auth
-	cluster   *cluster.Cluster
-	apiKey    string
-	store     *storage.Storage // neu
-	cfgPath   string
-	cfgMu     sync.Mutex
-	cfg       *config.Config
+	mutations     [256]sync.Mutex
+	connMu        sync.Mutex
+	listener      net.Listener
+	conns         map[net.Conn]struct{}
+	connWG        sync.WaitGroup
+	closed        bool
+	exec          query.Engine
+	shared        bool
+	lifecycle     context.Context
+	stopLifecycle context.CancelFunc
+	requests      chan struct{}
+	workWG        sync.WaitGroup
+	completed     atomic.Uint64
+	failed        atomic.Uint64
+	busy          atomic.Uint64
+	auth          *auth.Auth
+	cluster       *cluster.Cluster
+	apiKey        string
+	store         *storage.Storage // neu
+	cfgPath       string
+	cfgMu         sync.Mutex
+	cfg           *config.Config
 }
 
 func New(store *storage.Storage, lb *aggregates.Leaderboard, a *auth.Auth, c *cluster.Cluster, internalKey string, cfg *config.Config, cfgPath string) *Server {
@@ -89,6 +100,14 @@ func (s *Server) Listen(addr string) error {
 	if err != nil {
 		return err
 	}
+	if s.cfg != nil && s.cfg.Server.TLSCert != "" {
+		cert, err := tls.LoadX509KeyPair(s.cfg.Server.TLSCert, s.cfg.Server.TLSKey)
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	}
 	return s.Serve(ln)
 }
 
@@ -101,6 +120,11 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 	s.listener = ln
 	s.connMu.Unlock()
+	defer func() {
+		s.connMu.Lock()
+		s.listener = nil
+		s.connMu.Unlock()
+	}()
 	log.Printf("FlameDB listening on %s", ln.Addr())
 
 	for {
@@ -109,7 +133,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			return err
 		}
 		s.connMu.Lock()
-		if s.closed || len(s.conns) >= 1024 {
+		if s.closed || len(s.conns) >= s.connectionLimit() {
 			s.connMu.Unlock()
 			conn.Close()
 			continue
@@ -126,6 +150,9 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
+	if s.shared {
+		conn = &responseBoundConn{Conn: conn, limit: s.responseLimit()}
+	}
 	defer conn.Close()
 	reader := bufio.NewReaderSize(conn, 4096)
 
@@ -163,13 +190,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), (9<<20)+1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), s.requestLimit()+(1<<20)+1024)
 	_ = conn.SetDeadline(time.Time{})
 	// main loop
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		limit := 8 << 20
-		if session.Can(auth.PermInternal) {
+		limit := s.requestLimit()
+		if session.Can(auth.PermInternal) && !s.shared {
 			limit = 9 << 20
 		}
 		if len(line) > limit {
@@ -183,6 +210,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		if strings.HasPrefix(line, "REPL_BATCH ") {
 			if !session.Can(auth.PermInternal) {
 				writeJSON(conn, map[string]string{"error": "internal permission required"})
+				continue
+			}
+			if s.shared {
+				writeJSON(conn, map[string]string{"error": "legacy replication is unavailable with shared storage"})
 				continue
 			}
 			lines := strings.Split(strings.TrimSpace(line[len("REPL_BATCH "):]), "\x1f")
@@ -269,6 +300,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "internal permission required"})
 				continue
 			}
+			if s.shared {
+				writeJSON(conn, map[string]string{"error": "legacy cluster administration is unavailable with shared storage"})
+				continue
+			}
 			switch msg.Type {
 			case "CLUSTER_REPLICATION_STATS":
 				writeJSON(conn, s.cluster.ReplicationStats())
@@ -347,11 +382,26 @@ func (s *Server) handleConn(conn net.Conn) {
 				writeJSON(conn, map[string]string{"error": "permission denied: write required"})
 				continue
 			}
-		case query.QueryTypeMetrics, query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard:
+		case query.QueryTypeMetrics, query.QueryTypeGet, query.QueryTypeLeaderboard, query.QueryTypeStats, query.QueryTypeGroupLeaderboard, query.QueryTypeRank, query.QueryTypeScore, query.QueryTypeAround, query.QueryTypeLeaderboardCount:
 			if !session.Can(auth.PermRead) {
 				writeJSON(conn, map[string]string{"error": "permission denied: read required"})
 				continue
 			}
+		}
+		if s.shared {
+			result, err := s.executeShared(q)
+			if err != nil {
+				writeJSON(conn, map[string]string{"error": err.Error()})
+			} else if q.Type == query.QueryTypeMetrics {
+				keys := result.MetricKeys
+				if keys == nil {
+					keys = []string{}
+				}
+				writeJSON(conn, map[string]any{"metric_keys": keys})
+			} else {
+				writeJSON(conn, result)
+			}
+			continue
 		}
 
 		if q.Type == query.QueryTypeMetrics {
@@ -542,7 +592,7 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 		}
 		if line != "" {
 			size += len(line)
-			if len(lines) >= 10000 || size > 8<<20 {
+			if len(lines) >= s.batchLimit() || size > s.requestLimit() {
 				writeJSON(conn, map[string]string{"error": "batch limit exceeded"})
 				conn.Close()
 				return
@@ -558,6 +608,10 @@ func (s *Server) handleWriteBatch(conn net.Conn, scanner *bufio.Scanner, header 
 	}
 	if len(lines) == 0 {
 		writeJSON(conn, query.BatchResult{OK: true})
+		return
+	}
+	if s.shared {
+		s.handleSharedBatch(conn, lines, batchQuorum, internal)
 		return
 	}
 
@@ -792,11 +846,31 @@ func (s *Server) Close() {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+	s.connMu.Unlock()
+	if s.shared {
+		done := make(chan struct{})
+		go func() { s.workWG.Wait(); close(done) }()
+		timeout := 30 * time.Second
+		if s.cfg != nil && s.cfg.Server.ShutdownTimeout > 0 {
+			timeout = s.cfg.Server.ShutdownTimeout
+		}
+		select {
+		case <-done:
+		case <-time.After(timeout):
+		}
+		if s.stopLifecycle != nil {
+			s.stopLifecycle()
+		}
+	}
+	s.connMu.Lock()
 	for conn := range s.conns {
 		conn.Close()
 	}
 	s.connMu.Unlock()
 	s.connWG.Wait()
+	if s.shared {
+		s.cluster.Close()
+	}
 }
 
 func (s *Server) lockMutations(queries []*query.Query) func() {

@@ -31,7 +31,7 @@ data class CommandTiming(
 
 internal class CommandPool(private val cfg: FlameDBConfig, private val json: Json,
                            private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO) : AutoCloseable {
-    private val readCommands = setOf("GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE")
+    private val readCommands = setOf("GET", "LEADERBOARD", "GROUP_LEADERBOARD", "STATS", "METRICS", "PREVIEW_DELETE", "RANK", "SCORE", "AROUND", "LEADERBOARD_COUNT")
     @Volatile private var closed = false
     private val lifetime = Job()
     private val reads: Admission

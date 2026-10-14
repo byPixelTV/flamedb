@@ -45,6 +45,13 @@ class FlameDB private constructor(private val cfg: FlameDBConfig) : AutoCloseabl
     private suspend fun command(line: String): JsonObject = command(listOf(line))
     private suspend fun <T> command(line: String, decode: (JsonObject) -> T): T = transport.command(listOf(line), decode)
 
+    // Keep ranking decoding inside the normal transport's validation boundary,
+    // preserving structured failures, deadlines and reserved read admission.
+    internal suspend fun rankingCommand(line: String): RankingResult = command(line) { response ->
+        json.decodeFromJsonElement<RankingResult>(response["ranking"] ?: error("missing ranking result (updated server required)"))
+            .also { it.validate(line.startsWith("AROUND ")) }
+    }
+
     override fun close() = transport.close()
 
     // ─── Write ────────────────────────────────────────────────────────────────

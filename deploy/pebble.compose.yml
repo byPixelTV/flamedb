@@ -1,0 +1,21 @@
+# Use within the existing Compose project so flamedb-data keeps its identity.
+services:
+  flamedb:
+    networks:
+      - proxy
+      - flame
+    ports:
+      - "7777:7777"
+    volumes:
+      - /home/docker-data/flamedb/config.yml:/root/config.yml
+      - flamedb-data:/root/data-node1
+    image: ghcr.io/bypixeltv/flamedb:dev
+    command: ./app /root/config.yml
+networks:
+  proxy:
+    external: true
+  flame: null
+volumes:
+  flamedb-data:
+    driver: local
+  grafana: null
