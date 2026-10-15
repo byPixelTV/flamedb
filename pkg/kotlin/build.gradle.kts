@@ -125,6 +125,7 @@ kotlin {
 tasks.test {
     exclude("**/*StressTest.class")
     exclude("**/RealPebbleBufferedTest.class")
+    exclude("**/ProductionJournalTest.class")
 }
 
 tasks.register<Test>("realPebbleTest") {
@@ -142,6 +143,15 @@ tasks.register<Test>("sdkStressTest") {
     testClassesDirs = sourceSets.test.get().output.classesDirs
     classpath = sourceSets.test.get().runtimeClasspath
     include("**/*StressTest.class")
+    testLogging.showStandardStreams = true
+}
+
+tasks.register<Test>("productionJournalTest") {
+    description = "Replay copies of a supplied journal only into an explicit local test-owned Pebble fixture."
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    include("**/ProductionJournalTest.class")
     testLogging.showStandardStreams = true
 }
 

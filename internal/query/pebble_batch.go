@@ -27,6 +27,7 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 	}
 	type scoreKey struct{ metric, entity string }
 	boards := make([]map[string]string, len(queries))
+	targets := map[string]map[string]struct{}{}
 	locks := []string{}
 	valid := []int{}
 	for i, q := range queries {
@@ -49,7 +50,12 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 			boards[i][board] = entity
 		}
 		for board, entity := range boards[i] {
-			locks = append(locks, aggregates.BoardMetric(q.Metric, board)+":"+entity)
+			metric := aggregates.BoardMetric(q.Metric, board)
+			locks = append(locks, metric+":"+entity)
+			if targets[metric] == nil {
+				targets[metric] = map[string]struct{}{}
+			}
+			targets[metric][entity] = struct{}{}
 		}
 		if len(boards[i]) == 0 {
 			locks = append(locks, q.Metric+":")
@@ -68,6 +74,7 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 	var mutation aggregates.MutationTiming
 	var lookup aggregates.LookupStats
 	err := e.lb.AtomicMutationManyTimed(locks, func(batch *pebble.Batch) error {
+		reader := e.lb.NewLockedBatchLookup(targets, &lookup)
 		type scoreState struct {
 			initial, current float64
 			changed          bool
@@ -95,7 +102,7 @@ func (e *Executor) executeWriteBatch(queries []*Query) (*BatchResult, error) {
 				state, ok := scores[key]
 				if !ok {
 					reading := time.Now()
-					current, err := e.lb.GetWithLookupStats(key.metric, key.entity, &lookup)
+					current, err := reader.Get(key.metric, key.entity)
 					timing.ScoreRead += time.Since(reading)
 					if err != nil {
 						return err
