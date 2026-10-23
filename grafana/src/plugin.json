@@ -1,0 +1,15 @@
+{
+  "$schema": "https://grafana.com/schemas/plugin/v2.json",
+  "type": "datasource", "name": "FlameDB", "id": "flamedb-flamedb-datasource",
+  "backend": true, "executable": "gpx_flamedb", "metrics": true, "alerting": true,
+  "annotations": false,
+  "info": {
+    "description": "Query FlameDB metrics with a visual query builder.",
+    "author": { "name": "FlameDB" }, "keywords": ["flamedb", "metrics", "minecraft", "timeseries"],
+    "logos": { "small": "img/logo.svg", "large": "img/logo.svg" },
+    "links": [{ "name": "Project", "url": "https://github.com/byPixelTV/flamedb" }],
+    "screenshots": [], "version": "0.1.0", "updated": "2026-10-23"
+  },
+  "dependencies": { "grafanaDependency": ">=13.2.0", "plugins": [] },
+  "includes": [{ "type": "dashboard", "name": "Minecraft overview", "path": "dashboards/overview.json" }]
+}

@@ -122,15 +122,15 @@ func TestPostgresAutomaticDirectCopy(t *testing.T) {
 	if r, err := writer.ExecuteBatch([]*query.Query{{Type: query.QueryTypeWrite, Metric: names[0], Timestamp: explicit, Value: 9}, {Type: query.QueryTypeWrite, Metric: names[0], Value: 1}}); err != nil || r.Accepted != 2 {
 		t.Fatalf("mixed COPY: %+v %v", r, err)
 	}
-	if trace.staged.Load() != 1 {
-		t.Fatal("mixed timestamps bypassed overwrite staging")
+	if trace.staged.Load() != 0 {
+		t.Fatal("SDK-sized explicit overwrite unnecessarily used temp COPY staging")
 	}
 	r := run(t, e, &query.Query{Type: query.QueryTypeGet, Metric: names[0], Aggregate: query.AggSum}).Aggregate
 	if r.Count != 85 || r.Value != 93 {
 		t.Fatalf("explicit overwrite lost: %+v", r)
 	}
 	// Reused Query pointers historically represent the same final event key;
-	// retain that behavior through staging instead of colliding in direct COPY.
+	// retain that behavior through array upserts instead of colliding in direct COPY.
 	aliased := &query.Query{Type: query.QueryTypeWrite, Metric: prefix + "alias", Value: 1}
 	if rejected, err := writer.copyWrites(ctx, []*query.Query{aliased, aliased}); err != nil || len(rejected) != 0 {
 		t.Fatalf("aliased COPY: %v %v", rejected, err)
@@ -138,8 +138,8 @@ func TestPostgresAutomaticDirectCopy(t *testing.T) {
 	if count := run(t, e, &query.Query{Type: query.QueryTypeGet, Metric: aliased.Metric, Aggregate: query.AggCount}).Aggregate.Count; count != 1 {
 		t.Fatalf("aliased event semantics changed: %d", count)
 	}
-	if trace.staged.Load() != 2 {
-		t.Fatal("aliased timestamps bypassed overwrite staging")
+	if trace.staged.Load() != 0 {
+		t.Fatal("small aliased writes unnecessarily used temp COPY staging")
 	}
 	run(t, e, &query.Query{Type: query.QueryTypeSet, Metric: names[0], Value: math.MaxFloat64, UpdateLB: true, LBEntityID: "x"})
 	bad := &query.Query{Type: query.QueryTypeWrite, Metric: names[0], Value: math.MaxFloat64, UpdateLB: true, LBEntityID: "x", LBEntities: map[string]string{"uncreated": "y"}}

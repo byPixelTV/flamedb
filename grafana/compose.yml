@@ -1,0 +1,17 @@
+services:
+  grafana:
+    image: grafana/grafana:13.2.4
+    ports:
+      - "127.0.0.1:3300:3000"
+    environment:
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: flamedb-flamedb-datasource
+      FLAMEDB_HOST: ${FLAMEDB_HOST:-host.docker.internal}
+      FLAMEDB_PORT: ${FLAMEDB_PORT:-7777}
+      FLAMEDB_API_KEY: ${FLAMEDB_API_KEY:?Set a read-only FlameDB API key}
+    volumes:
+      - ./dist:/var/lib/grafana/plugins/flamedb-flamedb-datasource:ro
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+volumes:
+  grafana-data:

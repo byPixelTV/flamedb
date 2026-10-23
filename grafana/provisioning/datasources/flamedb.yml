@@ -1,0 +1,15 @@
+apiVersion: 1
+# Keep the API key in an environment variable, never in this file.
+datasources:
+  - name: FlameDB
+    uid: flamedb
+    type: flamedb-flamedb-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      host: $FLAMEDB_HOST
+      port: $FLAMEDB_PORT
+      timeoutSeconds: 10
+      maxScanEvents: 50000
+    secureJsonData:
+      apiKey: $FLAMEDB_API_KEY

@@ -15,7 +15,7 @@ func verifyPlayerSums(c *client, o options, s *counters) error {
 	for m := 0; m < o.metrics; m++ {
 		for entity := 0; entity < o.entities; entity++ {
 			c.SetDeadline(time.Now().Add(o.timeout))
-			if _, err := fmt.Fprintf(c, "GET %s SUM WHERE player=\"player%d\" AND region=\"eu\"\n", metric(o, m), entity); err != nil {
+			if _, err := fmt.Fprintln(c, playerReadCommand(o, m, entity)); err != nil {
 				return err
 			}
 			r, err := c.read()

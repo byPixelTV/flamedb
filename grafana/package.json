@@ -1,0 +1,19 @@
+{
+  "name": "flamedb-datasource", "version": "0.1.0", "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && webpack --mode production && node scripts/build.mjs",
+    "dev": "webpack --mode development --watch",
+    "demo": "node scripts/demo.mjs"
+  },
+  "dependencies": {
+    "@grafana/data": "13.2.4", "@grafana/runtime": "13.2.4", "@grafana/ui": "13.2.4",
+    "react": "19.0.0", "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0", "@types/react-dom": "19.0.0",
+    "copy-webpack-plugin": "13.0.1", "ts-loader": "9.5.4", "typescript": "5.9.3",
+    "webpack": "5.102.1", "webpack-cli": "6.0.1"
+  }
+}
+

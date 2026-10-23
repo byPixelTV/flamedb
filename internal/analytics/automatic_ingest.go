@@ -21,6 +21,14 @@ type ingestScores struct {
 // absolute scores with typed arrays. No temporary relation is needed. Explicit
 // timestamps and aliased Query pointers keep the overwrite-capable path.
 func (e *Engine) copyAutomaticRows(ctx context.Context, tx pgx.Tx, items []*query.Query, scores []scoreKey, current map[scoreKey]float64) error {
+	return e.copyArrayRows(ctx, tx, items, scores, current, false)
+}
+
+func (e *Engine) copyExplicitRows(ctx context.Context, tx pgx.Tx, items []*query.Query, scores []scoreKey, current map[scoreKey]float64) error {
+	return e.copyArrayRows(ctx, tx, items, scores, current, true)
+}
+
+func (e *Engine) copyArrayRows(ctx context.Context, tx pgx.Tx, items []*query.Query, scores []scoreKey, current map[scoreKey]float64, overwrite bool) error {
 	tagSet := map[ingestTag]bool{}
 	metricSet := map[string]bool{}
 	for _, q := range items {
@@ -69,7 +77,48 @@ func (e *Engine) copyAutomaticRows(ctx context.Context, tx pgx.Tx, items []*quer
 	}
 	sort.Strings(changedMetrics)
 	batch := &pgx.Batch{}
-	if len(scores) > 0 && len(items) > 32 && (len(items) >= 64 || len(metrics) == 1) {
+	if overwrite {
+		type eventKey struct {
+			metric    string
+			timestamp int64
+		}
+		positions := make(map[eventKey]int, len(items))
+		unique := make([]*query.Query, 0, len(items))
+		for _, q := range items {
+			key := eventKey{q.Metric, q.Timestamp}
+			if position, exists := positions[key]; exists {
+				unique[position] = q
+			} else {
+				positions[key] = len(unique)
+				unique = append(unique, q)
+			}
+		}
+		for _, large := range []bool{false, true} {
+			names, timestamps, values, tags := []string{}, []int64{}, []float64{}, []string{}
+			for _, q := range unique {
+				name := EncodeString(q.Metric)
+				if (len(name) > indexTextBudget) != large {
+					continue
+				}
+				raw, err := json.Marshal(EncodeTags(q.Tags))
+				if err != nil {
+					return err
+				}
+				names = append(names, name)
+				timestamps = append(timestamps, q.Timestamp)
+				values = append(values, q.Value)
+				tags = append(tags, string(raw))
+			}
+			if len(names) == 0 {
+				continue
+			}
+			conflict := `(metric,ts) WHERE octet_length(metric)<=2000`
+			if large {
+				conflict = `(row_id,ts)`
+			}
+			batch.Queue(`INSERT INTO flame_events(metric,ts,value,tags) SELECT metric,ts,value,tags FROM unnest($1::text[],$2::bigint[],$3::double precision[],$4::jsonb[]) t(metric,ts,value,tags) ON CONFLICT `+conflict+` DO UPDATE SET value=excluded.value,tags=excluded.tags`, names, timestamps, values, tags)
+		}
+	} else if len(scores) > 0 && len(items) > 32 && (len(items) >= 64 || len(metrics) == 1) {
 		// Small per-metric score jobs benefit from a single prepared SQL batch
 		// for events, tags, absolute scores and generation, rather than COPY's
 		// additional protocol exchanges. JSON strings are encoded as JSONB.

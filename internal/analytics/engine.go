@@ -39,6 +39,8 @@ type Engine struct {
 	quorumReplicationFactor int
 	now                     func() int64
 	ingest                  *writeCoalescer
+	filters                 filterPlanner
+	reads                   *aggregateReader
 }
 
 const schema = `
@@ -105,6 +107,9 @@ func Open(ctx context.Context, options Options) (*Engine, error) {
 	if err == nil {
 		_, err = tx.Exec(ctx, largeKeySchema)
 	}
+	if err == nil {
+		_, err = tx.Exec(ctx, eventFilterSchema)
+	}
 	if err == nil && options.Timescale {
 		_, err = tx.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS timescaledb; SELECT create_hypertable('flame_events','ts',chunk_time_interval => 86400000000000::bigint,if_not_exists => true,migrate_data => true)`)
 	}
@@ -132,6 +137,7 @@ func Open(ctx context.Context, options Options) (*Engine, error) {
 		}
 	}
 	e.ingest = newWriteCoalescer(e)
+	e.reads = newAggregateReader(e)
 	return e, nil
 }
 
@@ -149,6 +155,9 @@ func newClusterCache(options *redis.ClusterOptions) *redis.ClusterClient {
 	return redis.NewClusterClient(&clusterOptions)
 }
 func (e *Engine) Close() {
+	if e.reads != nil {
+		e.reads.close()
+	}
 	if e.ingest != nil {
 		e.ingest.close()
 	}

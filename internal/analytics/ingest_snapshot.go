@@ -43,7 +43,7 @@ func (e *Engine) beginIngest(ctx context.Context, items []*query.Query) (*ingest
 		}
 	}
 	s := &ingestSnapshot{versions: map[string]int64{}, current: map[scoreKey]float64{}, initial: map[scoreKey]*float64{}, clocks: map[string]int64{}}
-	s.staged = !allAutomatic || aliased
+	s.staged = (!allAutomatic || aliased) && len(items) > 1024
 	begin := `BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL synchronous_commit=on`
 	if s.staged {
 		begin += `; CREATE TEMP TABLE IF NOT EXISTS flame_ingest(ord bigint,metric text,ts bigint,value double precision,tags jsonb) ON COMMIT DELETE ROWS`
@@ -90,7 +90,7 @@ func (e *Engine) beginIngest(ctx context.Context, items []*query.Query) (*ingest
 	}
 	if len(targets) > 0 {
 		versionSQL := `SELECT metric,version FROM flame_metrics WHERE flame_identity_hash(metric)=ANY(ARRAY(SELECT flame_identity_hash(name) FROM unnest($1::text[]) names(name))) AND metric=ANY($1::text[])`
-		allSmall := len(items) <= 32
+		allSmall := true
 		for _, name := range encoded {
 			allSmall = allSmall && len(name) <= indexTextBudget
 		}
@@ -99,7 +99,7 @@ func (e *Engine) beginIngest(ctx context.Context, items []*query.Query) (*ingest
 		}
 		batch.Queue(versionSQL, encoded)
 		m, b, id := []string{}, []string{}, []string{}
-		allSmall = len(items) <= 32
+		allSmall = true
 		for key := range targets {
 			metric, board, entity := EncodeString(key.metric), EncodeString(key.board), EncodeString(key.entity)
 			m = append(m, metric)

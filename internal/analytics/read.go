@@ -10,6 +10,7 @@ import (
 	"github.com/byPixelTV/flamedb/internal/query"
 	"github.com/byPixelTV/flamedb/internal/storage"
 	"github.com/byPixelTV/flamedb/internal/types"
+	"github.com/jackc/pgx/v5"
 )
 
 func (e *Engine) listMetrics(ctx context.Context, where map[string]string) ([]string, error) {
@@ -359,13 +360,16 @@ func (e *Engine) window(ctx context.Context, q *query.Query) ([]types.Leaderboar
 }
 
 func (e *Engine) aggregate(ctx context.Context, q *query.Query, metric string) (*query.AggregateResult, error) {
+	if e.reads != nil && len(q.Where) > 0 {
+		return e.reads.submit(ctx, q, metric)
+	}
+	return e.aggregateDirect(ctx, q, metric)
+}
+
+func (e *Engine) aggregateDirect(ctx context.Context, q *query.Query, metric string) (*query.AggregateResult, error) {
 	to := q.To
 	if to == 0 {
 		to = math.MaxInt64
-	}
-	tags, _ := json.Marshal(EncodeTags(q.Where))
-	if q.Where == nil {
-		tags = []byte(`{}`)
 	}
 	expression := `COALESCE(sum(value ORDER BY ts),0)`
 	if q.Aggregate == query.AggCount {
@@ -373,7 +377,28 @@ func (e *Engine) aggregate(ctx context.Context, q *query.Query, metric string) (
 	}
 	var count int
 	var value float64
-	err := e.db.QueryRow(ctx, `SELECT count(*),`+expression+` FROM flame_events WHERE flame_identity_hash(metric)=flame_identity_hash($1) AND metric=$1 AND ts >= $2 AND ts < $3 AND tags @> $4::jsonb`, EncodeString(metric), q.From, to, string(tags)).Scan(&count, &value)
+	source, args := e.aggregateCandidates(ctx, metric, q.Where, q.From, to)
+	sql := `SELECT count(*),` + expression + ` FROM ` + source
+	var err error
+	if len(q.Where) == 0 {
+		err = e.db.QueryRow(ctx, sql, args...).Scan(&count, &value)
+	} else {
+		// The token lookup has a stable selective plan. Automatic plan selection
+		// otherwise custom-plans every player/value because its generic cost is
+		// conservatively estimated, spending more CPU planning than reading.
+		// SendBatch runs these statements in one implicit transaction and one
+		// round trip. LOCAL restores the caller's session mode on success/error.
+		batch := &pgx.Batch{}
+		batch.Queue(`SET LOCAL plan_cache_mode=force_generic_plan`)
+		batch.Queue(sql, args...)
+		results := e.db.SendBatch(ctx, batch)
+		if _, err = results.Exec(); err == nil {
+			err = results.QueryRow().Scan(&count, &value)
+		}
+		if closeErr := results.Close(); err == nil {
+			err = closeErr
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -1,0 +1,7 @@
+.runtime/
+# The repository's broad data* rule also matches datasource source files.
+!src/datasource.ts
+!pkg/plugin/datasource.go
+!pkg/plugin/datasource_test.go
+!provisioning/datasources/
+!provisioning/datasources/**

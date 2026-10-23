@@ -29,6 +29,7 @@ type options struct {
 	readCommands, fingerprints                  []string
 	verificationFile, verifyFile                string
 	timestampStart                              int64
+	playerFilter                                string
 }
 type response struct {
 	canonical string
@@ -146,6 +147,14 @@ type pending struct {
 }
 
 func metric(o options, i int) string { return fmt.Sprintf("%s.%d", o.prefix, i) }
+
+func playerReadCommand(o options, m, entity int) string {
+	command := fmt.Sprintf("GET %s SUM WHERE player=\"player%d\"", metric(o, m), entity)
+	if o.playerFilter != "player" {
+		command += ` AND region="eu"`
+	}
+	return command
+}
 func frame(o options, s *counters, worker, iteration int) (string, pending) {
 	p := pending{start: time.Now()}
 	if o.mode == "player-sum" || (o.mode == "player-mixed" && iteration%5 == 4) {
@@ -368,7 +377,7 @@ func prepareFixture(o *options, s *counters) error {
 		for m := 0; m < o.metrics; m++ {
 			for entity := 0; entity < o.entities; entity++ {
 				index := m*o.entities + entity
-				o.readCommands[index] = fmt.Sprintf("GET %s SUM WHERE player=\"player%d\" AND region=\"eu\"", metric(*o, m), entity)
+				o.readCommands[index] = playerReadCommand(*o, m, entity)
 				count := o.fixtureEvents / o.entities
 				if entity < o.fixtureEvents%o.entities {
 					count++
@@ -382,6 +391,9 @@ func prepareFixture(o *options, s *counters) error {
 }
 
 func run(o options) error {
+	if o.playerFilter != "" && o.playerFilter != "player" && o.playerFilter != "player-region" {
+		return fmt.Errorf("player-filter must be player or player-region")
+	}
 	if o.verifyFile != "" {
 		return verifySaved(o)
 	}
@@ -476,6 +488,7 @@ func run(o options) error {
 	report["leaderboard_on_write"] = o.leaderboard
 	report["automatic_timestamps"] = o.automaticTimestamps
 	report["timestamp_start"] = startTimestamp
+	report["player_filter"] = o.playerFilter
 	report["all_entity_scores_verified"] = document.Boards
 	report["fixture_events_per_metric"] = 0
 	if o.mode != "write" && o.mode != "mixed" {
@@ -510,6 +523,7 @@ func main() {
 	flag.StringVar(&o.addrs, "addrs", "127.0.0.1:7777", "comma separated API addresses (round robin per client)")
 	flag.StringVar(&o.key, "key", os.Getenv("FLAMEDB_API_KEY"), "API key; defaults to FLAMEDB_API_KEY")
 	flag.StringVar(&o.mode, "mode", "write", "write, mixed (80/20 writes/top), player-sum, player-mixed (80/20 writes/player SUM), rank, window, sum, avg, count, history, tags, top")
+	flag.StringVar(&o.playerFilter, "player-filter", "player-region", "player or player-region: filters used by player-sum/player-mixed and their independent readback")
 	flag.BoolVar(&o.leaderboard, "leaderboard", true, "update all-time leaderboard on measured writes; false exercises plain event batching")
 	flag.BoolVar(&o.automaticTimestamps, "automatic-timestamps", false, "omit explicit ts on measured writes, exercising the shared SDK-default allocator")
 	flag.IntVar(&o.fixtureEvents, "fixture-events", 1000, "events per metric seeded outside timed read-only runs")

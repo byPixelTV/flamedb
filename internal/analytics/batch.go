@@ -93,6 +93,12 @@ func (e *Engine) copyWritesWithPublisher(ctx context.Context, items []*query.Que
 	}
 	if len(explicit) == 0 && unaliased {
 		err = e.copyAutomaticRows(ctx, tx, accepted, finalKeys, current)
+	} else if len(accepted) <= 1024 {
+		// SDK-sized explicit batches use prepared array upserts, avoiding two
+		// COPY exchanges and temporary-table planning on every durable commit.
+		// Event keys are deduplicated after ordered score validation; the last
+		// raw payload wins while every accepted leaderboard increment remains.
+		err = e.copyExplicitRows(ctx, tx, accepted, finalKeys, current)
 	} else {
 		// Keep each connection's staging relations and clear their rows at commit.
 		// Repeated COPY requests then avoid create/drop churn in PostgreSQL catalogs.
