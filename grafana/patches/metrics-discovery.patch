@@ -1,0 +1,81 @@
+diff --git a/internal/query/executor.go b/internal/query/executor.go
+index b106ed1..fd1abd5 100644
+--- a/internal/query/executor.go
++++ b/internal/query/executor.go
+@@ -189,7 +189,6 @@ func (e *Executor) ListMetrics(where map[string]string) ([]string, error) {
+ }
+ 
+ func (e *Executor) listAllMetrics() ([]string, error) {
+-	// Scan all keys and extract metric names.
+ 	iter, err := e.store.DB().NewIter(&pebble.IterOptions{})
+ 	if err != nil {
+ 		return nil, err
+@@ -198,32 +197,49 @@ func (e *Executor) listAllMetrics() ([]string, error) {
+ 
+ 	seen := make(map[string]bool)
+ 	var metrics []string
++	add := func(encoded string) {
++		name := strings.SplitN(keyspace.DecodeComponent(encoded), "\x1f", 2)[0]
++		if !seen[name] {
++			seen[name] = true
++			metrics = append(metrics, name)
++		}
++	}
+ 
+-	for iter.First(); iter.Valid(); iter.Next() {
++	// Metric keys are contiguous: <encoded metric>:<timestamp>. Seek past
++	// each entire prefix rather than reading every event and secondary index.
++	// The exclusive successor of a colon-terminated prefix replaces ':' by ';'.
++	for valid := iter.First(); valid; {
+ 		key := string(iter.Key())
+ 		if strings.HasPrefix(key, "lb-entity:") {
+-			parts := strings.SplitN(strings.TrimPrefix(key, "lb-entity:"), ":", 2)
+-			if len(parts) == 2 {
+-				parts[0] = keyspace.DecodeComponent(parts[0])
+-				parts[0] = strings.SplitN(parts[0], "\x1f", 2)[0]
+-				if !seen[parts[0]] {
+-					seen[parts[0]] = true
+-					metrics = append(metrics, parts[0])
+-				}
++			rest := strings.TrimPrefix(key, "lb-entity:")
++			if separator := strings.IndexByte(rest, ':'); separator >= 0 {
++				encoded := rest[:separator]
++				add(encoded)
++				valid = iter.SeekGE([]byte("lb-entity:" + encoded + ";"))
++			} else {
++				valid = iter.Next()
++			}
++			continue
++		}
++		skipped := false
++		for _, prefix := range []string{"idx:", "lb:", "card:", "card-count:", "repl-outbox:", "repl-applied:"} {
++			if strings.HasPrefix(key, prefix) {
++				valid = iter.SeekGE([]byte(prefix[:len(prefix)-1] + ";"))
++				skipped = true
++				break
+ 			}
+ 		}
+-		// Skip index and leaderboard keys.
+-		if strings.HasPrefix(key, "idx:") ||
+-			strings.HasPrefix(key, "lb:") ||
+-			strings.HasPrefix(key, "card:") || strings.HasPrefix(key, "card-count:") || strings.HasPrefix(key, "lb-entity:") || strings.HasPrefix(key, "repl-outbox:") || strings.HasPrefix(key, "repl-applied:") {
++		if skipped {
+ 			continue
+ 		}
+-		// The metric name precedes the first colon.
+-		parts := strings.SplitN(key, ":", 2)
+-		parts[0] = keyspace.DecodeComponent(parts[0])
+-		if len(parts) > 0 && !seen[parts[0]] {
+-			seen[parts[0]] = true
+-			metrics = append(metrics, parts[0])
++		if separator := strings.IndexByte(key, ':'); separator >= 0 {
++			encoded := key[:separator]
++			add(encoded)
++			valid = iter.SeekGE([]byte(encoded + ";"))
++		} else {
++			// Retain discovery behavior for legacy keys without a delimiter.
++			add(key)
++			valid = iter.Next()
+ 		}
+ 	}
+ 	return metrics, iter.Error()
