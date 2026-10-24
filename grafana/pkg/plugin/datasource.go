@@ -38,8 +38,9 @@ type queryModel struct {
 	Legend      string   `json:"legend"`
 }
 type Datasource struct {
-	client  *wireClient
-	maxScan int
+	serverGrouping bool
+	client         *wireClient
+	maxScan        int
 }
 
 var identifier = regexp.MustCompile(`^[a-zA-Z0-9_.:/-]+$`)
@@ -68,7 +69,7 @@ func New(_ context.Context, s backend.DataSourceInstanceSettings) (instancemgmt.
 	if key == "" || strings.ContainsAny(key, " \t\r\n\x00\x1f") {
 		return nil, errors.New("a valid FlameDB API key is required")
 	}
-	return &Datasource{client: &wireClient{address: net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)), apiKey: key, timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, slots: make(chan struct{}, 8)}, maxScan: cfg.MaxScanEvents}, nil
+	return &Datasource{serverGrouping: true, client: &wireClient{address: net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)), apiKey: key, timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, slots: make(chan struct{}, 8)}, maxScan: cfg.MaxScanEvents}, nil
 }
 
 func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
@@ -181,22 +182,41 @@ func (d *Datasource) execute(ctx context.Context, q backend.DataQuery, m queryMo
 	if !q.TimeRange.To.After(q.TimeRange.From) {
 		return nil, errors.New("invalid time range")
 	}
+	ctx, cancel := context.WithTimeout(ctx, d.client.timeout)
+	defer cancel()
 	interval, err := bucketInterval(q, m)
 	if err != nil {
 		return nil, err
+	}
+	unsupportedGrouping := false
+	if d.serverGrouping && len(m.GroupBy) > 0 {
+		frames, supported, err := d.groupedFrames(ctx, q, m, interval)
+		if err != nil || supported {
+			return frames, err
+		}
+		unsupportedGrouping = true
 	}
 	suffix := where(m.Filters) + " FROM " + q.TimeRange.From.UTC().Format(time.RFC3339Nano) + " TO " + q.TimeRange.To.UTC().Format(time.RFC3339Nano)
 	var frames data.Frames
 	all := map[string][]event{}
 	for _, metric := range m.Metrics {
-		command := "GET " + metric + suffix
 		native := m.Mode == "timeseries" && len(m.GroupBy) == 0
+		if !native && !((m.Mode == "latest" || m.Mode == "table") && len(m.GroupBy) == 0) {
+			events, err := d.readEvents(ctx, metric, m.Filters, q.TimeRange.From, q.TimeRange.To)
+			if err != nil {
+				if unsupportedGrouping {
+					return nil, fmt.Errorf("%w; update the FlameDB server to use server-side grouping without the raw scan limit", err)
+				}
+				return nil, err
+			}
+			all[metric] = events
+			continue
+		}
+		command := "GET " + metric + suffix
 		if native {
 			command += " GROUP BY " + interval.String() + " " + m.Aggregation
-		} else if m.Mode == "latest" && len(m.GroupBy) == 0 {
+		} else if (m.Mode == "latest" || m.Mode == "table") && len(m.GroupBy) == 0 {
 			command += " LIMIT 1 ORDER DESC"
-		} else {
-			command += " LIMIT " + strconv.Itoa(d.maxScan+1) + " ORDER ASC"
 		}
 		r, err := d.client.query(ctx, command)
 		if err != nil {

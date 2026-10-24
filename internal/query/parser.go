@@ -458,6 +458,27 @@ func Parse(input string) (result *Query, err error) {
 			}
 			q.From = ts
 			i += 2
+		case "TAGS":
+			if q.Type != QueryTypeGet || len(q.GroupTags) > 0 || i+1 >= len(tokens) {
+				return nil, fmt.Errorf("GET TAGS requires one comma-separated tag list")
+			}
+			q.GroupTags = strings.Split(tokens[i+1], ",")
+			i += 2
+		case "LAST":
+			if q.Type != QueryTypeGet || q.LastPerGroup {
+				return nil, fmt.Errorf("LAST is only valid once for GET TAGS")
+			}
+			q.LastPerGroup = true
+			i++
+		case "POINTS":
+			if q.Type != QueryTypeGet || q.GroupPointLimit != 0 || i+1 >= len(tokens) {
+				return nil, fmt.Errorf("GET TAGS POINTS requires a positive limit")
+			}
+			q.GroupPointLimit, err = strconv.Atoi(tokens[i+1])
+			if err != nil || q.GroupPointLimit <= 0 {
+				return nil, fmt.Errorf("invalid POINTS")
+			}
+			i += 2
 		case "COUNT", "SUM", "AVG":
 			if q.Type != QueryTypeGet {
 				return nil, fmt.Errorf("%s is only valid for GET", strings.ToUpper(tokens[i]))
@@ -668,6 +689,9 @@ func parseDurationSpec(spec string) (time.Duration, error) {
 }
 
 func validateQuery(q *Query) error {
+	if err := validateGrouped(q); err != nil {
+		return err
+	}
 	if q.DryRun && (q.IsReplica || q.Quorum) {
 		return fmt.Errorf("DRY_RUN cannot be combined with replication flags or QUORUM")
 	}

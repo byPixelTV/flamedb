@@ -1,0 +1,8 @@
+[
+"craftattack:blocks-broken","craftattack:blocks-placed","craftattack:clans:joins","craftattack:damage-dealt","craftattack:damage-taken","craftattack:deaths","craftattack:kills","craftattack:mob-kills","playtime:sessions","smp:kills",
+"system:chunks","system:cpu:cores","system:cpu:seconds","system:cpu:system","system:entities","system:events:chat","system:events:join","system:events:login","system:events:ping","system:events:quit",
+"system:gc:collections","system:gc:duration_bucket","system:gc:duration_seconds","system:gc:freed_bucket","system:gc:freed_bytes","system:gc:notification:count","system:gc:notification:duration_seconds","system:gc:notification:freed_bytes",
+"system:global-playercount","system:jvm:memory:committed","system:jvm:memory:init","system:jvm:memory:max","system:jvm:memory:used","system:mspt","system:players","system:players:max","system:plugins","system:process:start_time_seconds","system:process:uptime_seconds",
+"system:ram:allocated","system:ram:max","system:ram:usage","system:ram:used","system:region:chunks","system:region:entities","system:region:mspt","system:region:online_players","system:region:tps","system:region:util","system:regions","system:regions:util","system:regions:world","system:regions:world_nether","system:regions:world_the_end",
+"system:threads:current","system:threads:daemon","system:threads:peak","system:threads:started","system:tps","system:util","system:world:chunks","system:world:entities","system:world:players"
+]

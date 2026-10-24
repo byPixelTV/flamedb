@@ -56,8 +56,8 @@ func groupedSeries(all map[string][]event, m queryModel, interval time.Duration)
 			times := []time.Time{}
 			values := []*float64{}
 			for i, ts := range stamps {
-				// Explicit null in gaps prevents Grafana drawing a continuous measurement.
-				if i > 0 && ts-stamps[i-1] > int64(interval) {
+				// Tolerate one empty bucket (sampling jitter); retain explicit nulls for longer gaps.
+				if i > 0 && (ts-stamps[i-1])/int64(interval) > 2 {
 					times = append(times, time.Unix(0, stamps[i-1]+int64(interval)).UTC())
 					values = append(values, nil)
 				}

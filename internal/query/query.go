@@ -55,16 +55,19 @@ type Query struct {
 	UpdateLB   bool
 	LBEntityID string
 	// LBEntities updates named leaderboards in the same metric mutation.
-	LBEntities  map[string]string
-	Board       string
-	TagKeys     []string
-	Quorum      bool
-	IsReplica   bool
-	ForceLocal  bool
-	Groups      []GroupDef
-	Aggregate   AggType
-	GroupBy     time.Duration
-	GroupBySpec string
+	LBEntities      map[string]string
+	Board           string
+	TagKeys         []string
+	Quorum          bool
+	IsReplica       bool
+	ForceLocal      bool
+	Groups          []GroupDef
+	Aggregate       AggType
+	GroupBy         time.Duration
+	GroupBySpec     string
+	GroupTags       []string
+	LastPerGroup    bool
+	GroupPointLimit int
 
 	// EntityTag is the tag key identifying entities in windowed leaderboards.
 	// Required when FROM or TO is set.
@@ -79,6 +82,7 @@ type DeleteResult struct {
 }
 
 type Result struct {
+	Grouped        *GroupedResult              `json:"grouped,omitempty"`
 	Ranking        *RankingResult              `json:"ranking,omitempty"`
 	Delete         *DeleteResult               `json:"delete,omitempty"`
 	MetricKeys     []string                    `json:"metric_keys,omitempty"`
@@ -160,4 +164,20 @@ type AggregateResult struct {
 type StatsResult struct {
 	Metric   string             `json:"metric"`
 	TagStats []storage.TagStats `json:"tag_stats"`
+}
+
+// Compact grouped results omit the duplicated legacy Event aliases.
+type TaggedSeries struct {
+	Tags   map[string]string `json:"tags"`
+	Points []SeriesPoint     `json:"points"`
+}
+type TaggedValue struct {
+	Tags  map[string]string `json:"tags"`
+	TS    int64             `json:"ts"`
+	Value float64           `json:"value"`
+}
+type GroupedResult struct {
+	IntervalNS int64          `json:"interval_ns"`
+	Series     []TaggedSeries `json:"series,omitempty"`
+	Latest     []TaggedValue  `json:"latest,omitempty"`
 }

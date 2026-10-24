@@ -1,0 +1,1467 @@
+diff --git a/grafana/README.md b/grafana/README.md
+index 01e5a32..3cd2086 100644
+--- a/grafana/README.md
++++ b/grafana/README.md
+@@ -53,11 +53,17 @@ This exposes Grafana on http://localhost:3300 and provisions the datasource and
+ 5. Optionally group by `server`, `world`, or `region`. Use the Table panel for joined region rows, or a Stat panel with a sparkline for time series.
+ 6. Set panel units, colors and thresholds in Grafana. Legend templates support `{{metric}}` and tags such as `{{server}}`.
+ 
+-The dashboard time range always applies. Latest means the last sample **inside that range**, not necessarily a current live value. The table includes a timestamp column per metric so different sample ages remain visible. Missing observations are null, not zero. A grouped time series inserts a null in gaps rather than connecting missing data.
++The dashboard time range always applies. Latest means the last sample **inside that range**, not necessarily a current live value. The table includes a timestamp column per metric so different sample ages remain visible. Missing observations are null, not zero. A grouped time series tolerates one empty bucket for sampling jitter and inserts a null for longer gaps. This does not invent missing samples or fill long outages.
+ 
+ Metric names come from FlameDB's cluster-wide `METRICS` command. Tag suggestions are a bounded sample of the latest 1,000 events of the first selected metric; suggestions may be incomplete. You can enter custom metric names, tag names and values. Dashboard variables can be used in metric names, filter values and legends; only single-value exact filters are supported. Dynamic query-variable discovery and multi-value/All expansion are not implemented.
+ 
+-Time series without tag grouping use FlameDB's native time aggregation. Grouped series and tables read bounded raw events and calculate in the plugin. The default limit is 50,000 events **per metric**; exceeding it returns an explicit error. Narrow the time range or add filters instead of relying on partial results. At most 16 metrics are allowed per query, with up to 1,000 groups for series/latest output or 10,000 table rows. The output interval is increased when necessary to respect Grafana's maximum data points (capped at 10,000 per series). Responses are bounded to 16 MiB, TCP concurrency to 8 per datasource, and requests default to a 10-second timeout. On older servers, `METRICS` requires an updated FlameDB build.
++With an updated FlameDB server, tag-grouped histories and latest tables are computed on the server. The server streams matching events without retaining or returning the raw history. These queries do **not** use the plugin's 50,000-event raw scan limit. Series output is automatically coarsened when needed (at most 20,000 points across the panel's metrics); sums/counts include every event and AVG uses weighted sums/counts. No part of the dashboard time range is dropped. Latest mode returns one compact observation per tag combination and metric.
++
++Grouped output remains bounded: up to 1,000 groups for time series and latest Stat panels, 10,000 table groups and a bounded response size. If a long range contains more unique historical region IDs, filter by server/world/region. The entire query still obeys the configured timeout; increase it for genuinely expensive histories if needed. Output limits are explicit errors, not silent truncation.
++
++Update **both FlameDB and the datasource plugin** for this path; in a cluster update every node that serves reads. No dashboard JSON change is needed. An older server automatically falls back to bounded raw time-window reads, where Scan limit per metric still applies. The fallback cannot provide unlimited history and its error tells you to update the server. Time series without tag grouping continue using native FlameDB aggregation. Raw responses remain bounded to 16 MiB, connections to 8 per datasource, and a panel query defaults to a 10-second timeout. Pagination uses separate storage snapshots, so the legacy fallback is not an atomic snapshot of concurrent historical backfills.
++
++The new protocol is single-metric `GET ... GROUP BY 1m AVG TAGS server,world,region POINTS 20000` for series and `GET ... TAGS server,world,region LAST` for latest values, with the usual WHERE/FROM/TO filters. POINTS caps total output points; the response reports its effective `interval_ns`. Fixed-duration buckets are supported; calendar month/year grouping is intentionally rejected for this path.
+ 
+ Alerts use the same backend queries; template variables in alert rules should be replaced by literal metric/filter values. For the overview template, write `tps`, `mspt`, `players`, `cpu_load`, `memory_used` and `chunks` metrics with `server`, `world` and `region` tags. Rename the metrics in the builder to match your collector. CPU is expected in percent and memory in bytes; adjust units for your collector.
+ 
+diff --git a/grafana/pkg/plugin/client.go b/grafana/pkg/plugin/client.go
+index e9100c0..e4f9346 100644
+--- a/grafana/pkg/plugin/client.go
++++ b/grafana/pkg/plugin/client.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net"
+ 	"strings"
+ 	"time"
+@@ -30,7 +31,23 @@ type point struct {
+ 	Value float64 `json:"value"`
+ 	Count int     `json:"count"`
+ }
++type taggedSeries struct {
++	Tags   map[string]string `json:"tags"`
++	Points []point           `json:"points"`
++}
++type taggedValue struct {
++	Tags  map[string]string `json:"tags"`
++	TS    int64             `json:"ts"`
++	Value float64           `json:"value"`
++}
++type groupedReply struct {
++	IntervalNS int64          `json:"interval_ns"`
++	Series     []taggedSeries `json:"series"`
++	Latest     []taggedValue  `json:"latest"`
++}
+ type reply struct {
++	Grouped *groupedReply `json:"grouped"`
++
+ 	Error      string   `json:"error"`
+ 	Auth       string   `json:"auth"`
+ 	MetricKeys []string `json:"metric_keys"`
+@@ -60,26 +77,13 @@ func (c *wireClient) query(parent context.Context, command string) (*reply, erro
+ 	_ = conn.SetDeadline(deadline)
+ 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+ 	defer stop()
+-	scanner := bufio.NewScanner(conn)
+-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
++	reader := bufio.NewReaderSize(conn, 64*1024)
+ 	read := func() (*reply, error) {
+-		if !scanner.Scan() {
+-			if ctx.Err() != nil {
+-				return nil, ctx.Err()
+-			}
+-			if scanner.Err() != nil {
+-				return nil, scanner.Err()
+-			}
+-			return nil, errors.New("FlameDB closed the connection")
++		r, err := readReply(reader)
++		if err != nil && ctx.Err() != nil {
++			return nil, ctx.Err()
+ 		}
+-		var r reply
+-		if err := json.Unmarshal(scanner.Bytes(), &r); err != nil {
+-			return nil, fmt.Errorf("invalid FlameDB response: %w", err)
+-		}
+-		if r.Error != "" {
+-			return nil, errors.New(r.Error)
+-		}
+-		return &r, nil
++		return r, err
+ 	}
+ 	greeting, err := read()
+ 	if err != nil {
+@@ -103,3 +107,44 @@ func (c *wireClient) query(parent context.Context, command string) (*reply, erro
+ 	}
+ 	return read()
+ }
++
++const maxResponseBytes = 16 * 1024 * 1024
++
++var errResponseTooLarge = errors.New("FlameDB response exceeds the 16 MiB frame limit")
++
++// Read an entire newline-delimited frame with an explicit byte ceiling. Scanner's
++// token error was ambiguous and could also originate in an upstream cluster hop.
++func readReply(reader *bufio.Reader) (*reply, error) {
++	var raw []byte
++	for {
++		chunk, err := reader.ReadSlice('\n')
++		if len(raw)+len(chunk) > maxResponseBytes {
++			return nil, errResponseTooLarge
++		}
++		raw = append(raw, chunk...)
++		if err == bufio.ErrBufferFull {
++			continue
++		}
++		if err != nil {
++			if err == io.EOF && len(raw) > 0 {
++				return nil, io.ErrUnexpectedEOF
++			}
++			if err == io.EOF {
++				return nil, errors.New("FlameDB closed the connection")
++			}
++			return nil, err
++		}
++		break
++	}
++	var r reply
++	if err := json.Unmarshal(raw, &r); err != nil {
++		return nil, fmt.Errorf("invalid FlameDB response: %w", err)
++	}
++	if r.Error != "" {
++		if strings.Contains(r.Error, "bufio.Scanner: token too long") {
++			return nil, fmt.Errorf("%w: upstream response limit exceeded", errResponseTooLarge)
++		}
++		return nil, errors.New(r.Error)
++	}
++	return &r, nil
++}
+diff --git a/grafana/pkg/plugin/datasource.go b/grafana/pkg/plugin/datasource.go
+index aa1cdcf..b53a68c 100644
+--- a/grafana/pkg/plugin/datasource.go
++++ b/grafana/pkg/plugin/datasource.go
+@@ -38,8 +38,9 @@ type queryModel struct {
+ 	Legend      string   `json:"legend"`
+ }
+ type Datasource struct {
+-	client  *wireClient
+-	maxScan int
++	serverGrouping bool
++	client         *wireClient
++	maxScan        int
+ }
+ 
+ var identifier = regexp.MustCompile(`^[a-zA-Z0-9_.:/-]+$`)
+@@ -68,7 +69,7 @@ func New(_ context.Context, s backend.DataSourceInstanceSettings) (instancemgmt.
+ 	if key == "" || strings.ContainsAny(key, " \t\r\n\x00\x1f") {
+ 		return nil, errors.New("a valid FlameDB API key is required")
+ 	}
+-	return &Datasource{client: &wireClient{address: net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)), apiKey: key, timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, slots: make(chan struct{}, 8)}, maxScan: cfg.MaxScanEvents}, nil
++	return &Datasource{serverGrouping: true, client: &wireClient{address: net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)), apiKey: key, timeout: time.Duration(cfg.TimeoutSeconds) * time.Second, slots: make(chan struct{}, 8)}, maxScan: cfg.MaxScanEvents}, nil
+ }
+ 
+ func (d *Datasource) CheckHealth(ctx context.Context, _ *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
+@@ -181,22 +182,41 @@ func (d *Datasource) execute(ctx context.Context, q backend.DataQuery, m queryMo
+ 	if !q.TimeRange.To.After(q.TimeRange.From) {
+ 		return nil, errors.New("invalid time range")
+ 	}
++	ctx, cancel := context.WithTimeout(ctx, d.client.timeout)
++	defer cancel()
+ 	interval, err := bucketInterval(q, m)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	unsupportedGrouping := false
++	if d.serverGrouping && len(m.GroupBy) > 0 {
++		frames, supported, err := d.groupedFrames(ctx, q, m, interval)
++		if err != nil || supported {
++			return frames, err
++		}
++		unsupportedGrouping = true
++	}
+ 	suffix := where(m.Filters) + " FROM " + q.TimeRange.From.UTC().Format(time.RFC3339Nano) + " TO " + q.TimeRange.To.UTC().Format(time.RFC3339Nano)
+ 	var frames data.Frames
+ 	all := map[string][]event{}
+ 	for _, metric := range m.Metrics {
+-		command := "GET " + metric + suffix
+ 		native := m.Mode == "timeseries" && len(m.GroupBy) == 0
++		if !native && !((m.Mode == "latest" || m.Mode == "table") && len(m.GroupBy) == 0) {
++			events, err := d.readEvents(ctx, metric, m.Filters, q.TimeRange.From, q.TimeRange.To)
++			if err != nil {
++				if unsupportedGrouping {
++					return nil, fmt.Errorf("%w; update the FlameDB server to use server-side grouping without the raw scan limit", err)
++				}
++				return nil, err
++			}
++			all[metric] = events
++			continue
++		}
++		command := "GET " + metric + suffix
+ 		if native {
+ 			command += " GROUP BY " + interval.String() + " " + m.Aggregation
+-		} else if m.Mode == "latest" && len(m.GroupBy) == 0 {
++		} else if (m.Mode == "latest" || m.Mode == "table") && len(m.GroupBy) == 0 {
+ 			command += " LIMIT 1 ORDER DESC"
+-		} else {
+-			command += " LIMIT " + strconv.Itoa(d.maxScan+1) + " ORDER ASC"
+ 		}
+ 		r, err := d.client.query(ctx, command)
+ 		if err != nil {
+diff --git a/grafana/pkg/plugin/frames.go b/grafana/pkg/plugin/frames.go
+index a12032c..44ae5ab 100644
+--- a/grafana/pkg/plugin/frames.go
++++ b/grafana/pkg/plugin/frames.go
+@@ -56,8 +56,8 @@ func groupedSeries(all map[string][]event, m queryModel, interval time.Duration)
+ 			times := []time.Time{}
+ 			values := []*float64{}
+ 			for i, ts := range stamps {
+-				// Explicit null in gaps prevents Grafana drawing a continuous measurement.
+-				if i > 0 && ts-stamps[i-1] > int64(interval) {
++				// Tolerate one empty bucket (sampling jitter); retain explicit nulls for longer gaps.
++				if i > 0 && (ts-stamps[i-1])/int64(interval) > 2 {
+ 					times = append(times, time.Unix(0, stamps[i-1]+int64(interval)).UTC())
+ 					values = append(values, nil)
+ 				}
+diff --git a/grafana/scripts/integration.mjs b/grafana/scripts/integration.mjs
+index b854bd8..22db7df 100644
+--- a/grafana/scripts/integration.mjs
++++ b/grafana/scripts/integration.mjs
+@@ -56,6 +56,17 @@ try {
+     commands.push('END');
+     const result = await writer.query(commands.join('\n')); assert.equal(result.failed, 0, JSON.stringify(result));
+   }
++  // More history than the plugin raw scan limit. Native grouped queries must
++  // still include every observation and return only compact aggregates.
++  for (let offset = 0; offset < 60000; offset += 1000) {
++    const commands = ['WRITE_BATCH'];
++    for (let i = offset; i < offset + 1000; i++) {
++      const ts = BigInt(now - 600000 + i * 9) * 1000000n;
++      commands.push(`WRITE grafana.large ${i} region="${i % 2 ? 'b' : 'a'}" ts=${ts}`);
++    }
++    commands.push('END');
++    const result = await writer.query(commands.join('\n')); assert.equal(result.failed, 0, JSON.stringify(result));
++  }
+   writer.close();
+   const reader = await connectDB('grafana-test-reader'); assert.ok((await reader.query('WRITE forbidden 1')).error, 'read-only key accepted writes'); reader.close();
+   const plugins = path.join(work, 'plugins'); mkdirSync(plugins, { recursive: true });
+@@ -67,7 +78,7 @@ try {
+   for (const name of ['dashboards', 'datasources', 'plugins', 'alerting']) { mkdirSync(path.join(work, 'provisioning', name), { recursive: true }); }
+   const grafana = launch(path.join(home, 'bin', process.platform === 'win32' ? 'grafana.exe' : 'grafana'), ['server', '--homepath', home, '--config', ini], home, 'grafana.log');
+   await until(async () => { const r = await api('/api/health'); assert.equal(r.database, 'ok'); }, 'Grafana startup');
+-  await api('/api/datasources', { name: 'FlameDB', uid: 'flamedb', type: 'flamedb-flamedb-datasource', access: 'proxy', isDefault: true, jsonData: { host: '127.0.0.1', port: dbPort, maxScanEvents: 50000 }, secureJsonData: { apiKey: 'grafana-test-reader' } });
++  await api('/api/datasources', { name: 'FlameDB', uid: 'flamedb', type: 'flamedb-flamedb-datasource', access: 'proxy', isDefault: true, jsonData: { host: '127.0.0.1', port: dbPort, maxScanEvents: 100 }, secureJsonData: { apiKey: 'grafana-test-reader' } });
+   assert.equal((await api('/api/datasources/uid/flamedb/health')).status, 'OK');
+   const metrics = await api('/api/datasources/uid/flamedb/resources/metrics'); assert.ok(metrics.includes('tps') && metrics.includes('players'));
+   const tags = await api('/api/datasources/uid/flamedb/resources/tags?metric=tps'); assert.deepEqual(tags.region, ['1', '2', '3']);
+@@ -77,6 +88,14 @@ try {
+   const filtered = await query({ filters: [{ key: 'region', value: '2' }], groupBy: ['region'] }); assert.equal(filtered.frames.length, 1); assert.equal(filtered.frames[0].schema.fields[1].labels.region, '2');
+   const table = await query({ mode: 'table', metrics: ['tps', 'players'], groupBy: ['region'] }); assert.equal(table.frames[0].data.values[0].length, 3); assert.deepEqual(table.frames[0].schema.fields.map(f => f.name), ['region', 'tps', 'tps time', 'players', 'players time']);
+   const latest = await query({ mode: 'latest', groupBy: ['region'] }); assert.equal(latest.frames.length, 3); assert.ok(latest.frames.every(f => f.data.values[0].length === 1));
++  const large = await query({ metrics: ['grafana.large'], aggregation: 'COUNT', groupBy: ['region'] });
++  assert.ok(!large.error, JSON.stringify(large)); assert.equal(large.frames.length, 2);
++  const count = large.frames.reduce((sum, f) => sum + f.data.values[1].reduce((n, v) => n + (v ?? 0), 0), 0);
++  assert.equal(count, 60000, 'Native grouping lost records beyond the raw scan limit');
++  const largeTable = await query({ metrics: ['grafana.large'], mode: 'table', groupBy: ['region'] });
++  assert.ok(!largeTable.error, JSON.stringify(largeTable));
++  assert.deepEqual(largeTable.frames[0].data.values[1], [59998, 59999]);
++  console.log('Native grouping beyond raw scan limit passed');
+   const dashboard = JSON.parse(readFileSync(path.join(root, 'dashboards', 'overview.json'), 'utf8'));
+   const saved = await api('/api/dashboards/db', { dashboard, overwrite: true });
+   const url = base + saved.url + `?from=${now - 600000}&to=${now + 1000}`;
+diff --git a/internal/analytics/read.go b/internal/analytics/read.go
+index a040870..bafb84f 100644
+--- a/internal/analytics/read.go
++++ b/internal/analytics/read.go
+@@ -129,6 +129,9 @@ func (e *Engine) events(ctx context.Context, q *query.Query, metric string, aggr
+ 	return out, rows.Err()
+ }
+ func (e *Engine) get(ctx context.Context, q *query.Query) (*query.Result, error) {
++	if len(q.GroupTags) > 0 {
++		return e.grouped(ctx, q)
++	}
+ 	metrics := q.Metrics
+ 	if len(metrics) == 0 {
+ 		metrics = []string{q.Metric}
+diff --git a/internal/query/executor.go b/internal/query/executor.go
+index fd1abd5..8dbdd16 100644
+--- a/internal/query/executor.go
++++ b/internal/query/executor.go
+@@ -1,6 +1,7 @@
+ package query
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"math"
+ 	"sort"
+@@ -392,6 +393,18 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
+ }
+ 
+ func (e *Executor) executeGet(q *Query) (*Result, error) {
++	if len(q.GroupTags) > 0 {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		return AggregateGrouped(q, DefaultGroupedLimits(), func(visit func(storage.Event) error) error {
++			to := q.To
++			if to == 0 {
++				to = math.MaxInt64
++			}
++			return e.store.WalkEvents(ctx, q.Metric, q.From, to, q.Where, visit)
++		})
++	}
++
+ 	to := q.To
+ 	if to == 0 {
+ 		to = math.MaxInt64
+diff --git a/internal/query/parser.go b/internal/query/parser.go
+index 3b4cb13..19fab68 100644
+--- a/internal/query/parser.go
++++ b/internal/query/parser.go
+@@ -458,6 +458,27 @@ func Parse(input string) (result *Query, err error) {
+ 			}
+ 			q.From = ts
+ 			i += 2
++		case "TAGS":
++			if q.Type != QueryTypeGet || len(q.GroupTags) > 0 || i+1 >= len(tokens) {
++				return nil, fmt.Errorf("GET TAGS requires one comma-separated tag list")
++			}
++			q.GroupTags = strings.Split(tokens[i+1], ",")
++			i += 2
++		case "LAST":
++			if q.Type != QueryTypeGet || q.LastPerGroup {
++				return nil, fmt.Errorf("LAST is only valid once for GET TAGS")
++			}
++			q.LastPerGroup = true
++			i++
++		case "POINTS":
++			if q.Type != QueryTypeGet || q.GroupPointLimit != 0 || i+1 >= len(tokens) {
++				return nil, fmt.Errorf("GET TAGS POINTS requires a positive limit")
++			}
++			q.GroupPointLimit, err = strconv.Atoi(tokens[i+1])
++			if err != nil || q.GroupPointLimit <= 0 {
++				return nil, fmt.Errorf("invalid POINTS")
++			}
++			i += 2
+ 		case "COUNT", "SUM", "AVG":
+ 			if q.Type != QueryTypeGet {
+ 				return nil, fmt.Errorf("%s is only valid for GET", strings.ToUpper(tokens[i]))
+@@ -668,6 +689,9 @@ func parseDurationSpec(spec string) (time.Duration, error) {
+ }
+ 
+ func validateQuery(q *Query) error {
++	if err := validateGrouped(q); err != nil {
++		return err
++	}
+ 	if q.DryRun && (q.IsReplica || q.Quorum) {
+ 		return fmt.Errorf("DRY_RUN cannot be combined with replication flags or QUORUM")
+ 	}
+diff --git a/internal/query/query.go b/internal/query/query.go
+index 0120de3..d7f6fc3 100644
+--- a/internal/query/query.go
++++ b/internal/query/query.go
+@@ -55,16 +55,19 @@ type Query struct {
+ 	UpdateLB   bool
+ 	LBEntityID string
+ 	// LBEntities updates named leaderboards in the same metric mutation.
+-	LBEntities  map[string]string
+-	Board       string
+-	TagKeys     []string
+-	Quorum      bool
+-	IsReplica   bool
+-	ForceLocal  bool
+-	Groups      []GroupDef
+-	Aggregate   AggType
+-	GroupBy     time.Duration
+-	GroupBySpec string
++	LBEntities      map[string]string
++	Board           string
++	TagKeys         []string
++	Quorum          bool
++	IsReplica       bool
++	ForceLocal      bool
++	Groups          []GroupDef
++	Aggregate       AggType
++	GroupBy         time.Duration
++	GroupBySpec     string
++	GroupTags       []string
++	LastPerGroup    bool
++	GroupPointLimit int
+ 
+ 	// EntityTag is the tag key identifying entities in windowed leaderboards.
+ 	// Required when FROM or TO is set.
+@@ -79,6 +82,7 @@ type DeleteResult struct {
+ }
+ 
+ type Result struct {
++	Grouped        *GroupedResult              `json:"grouped,omitempty"`
+ 	Ranking        *RankingResult              `json:"ranking,omitempty"`
+ 	Delete         *DeleteResult               `json:"delete,omitempty"`
+ 	MetricKeys     []string                    `json:"metric_keys,omitempty"`
+@@ -161,3 +165,19 @@ type StatsResult struct {
+ 	Metric   string             `json:"metric"`
+ 	TagStats []storage.TagStats `json:"tag_stats"`
+ }
++
++// Compact grouped results omit the duplicated legacy Event aliases.
++type TaggedSeries struct {
++	Tags   map[string]string `json:"tags"`
++	Points []SeriesPoint     `json:"points"`
++}
++type TaggedValue struct {
++	Tags  map[string]string `json:"tags"`
++	TS    int64             `json:"ts"`
++	Value float64           `json:"value"`
++}
++type GroupedResult struct {
++	IntervalNS int64          `json:"interval_ns"`
++	Series     []TaggedSeries `json:"series,omitempty"`
++	Latest     []TaggedValue  `json:"latest,omitempty"`
++}
+diff --git a/internal/query/grouped.go b/internal/query/grouped.go
+new file mode 100644
+--- /dev/null
++++ b/internal/query/grouped.go
+@@ -0,0 +1,234 @@
++package query
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math"
++	"sort"
++	"strconv"
++	"strings"
++
++	"github.com/byPixelTV/flamedb/internal/storage"
++)
++
++const MaxGroupedPoints = 20000
++
++type GroupedLimits struct{ Points, Series, Latest, Bytes int }
++
++func DefaultGroupedLimits() GroupedLimits {
++	return GroupedLimits{Points: MaxGroupedPoints, Series: 1000, Latest: 10000, Bytes: 3 << 20}
++}
++
++func validateGrouped(q *Query) error {
++	if len(q.GroupTags) == 0 {
++		if q.LastPerGroup || q.GroupPointLimit != 0 {
++			return errors.New("LAST/POINTS require GET TAGS")
++		}
++		return nil
++	}
++	if q.Type != QueryTypeGet || len(q.Metrics) > 1 {
++		return errors.New("TAGS requires a single-metric GET")
++	}
++	if len(q.GroupTags) > 8 {
++		return errors.New("TAGS supports at most 8 grouping keys")
++	}
++	seen := map[string]bool{}
++	for _, key := range q.GroupTags {
++		if key == "" || seen[key] || strings.ContainsAny(key, ",=\" \t\r\n\x00\x1f") {
++			return errors.New("invalid or duplicate grouping tag")
++		}
++		seen[key] = true
++	}
++	if q.GroupPointLimit < 0 || q.GroupPointLimit > MaxGroupedPoints {
++		return fmt.Errorf("POINTS must be between 1 and %d", MaxGroupedPoints)
++	}
++	if q.LastPerGroup {
++		if q.GroupBySpec != "" || q.Aggregate != "" || q.GroupPointLimit != 0 {
++			return errors.New("LAST cannot be combined with time aggregation or POINTS")
++		}
++		return nil
++	}
++	spec, err := parseCalendarSpec(q.GroupBySpec)
++	if err != nil || spec.years != 0 || spec.months != 0 || spec.dur <= 0 {
++		return errors.New("GET TAGS time series require GROUP BY with a fixed positive duration")
++	}
++	if q.Aggregate == "" {
++		q.Aggregate = AggAvg
++	}
++	if q.Aggregate != AggAvg && q.Aggregate != AggSum && q.Aggregate != AggCount {
++		return errors.New("invalid grouped aggregation")
++	}
++	return nil
++}
++
++type groupedCell struct {
++	sum   float64
++	count int
++}
++type groupedState struct {
++	labels    map[string]string
++	cells     map[int64]*groupedCell
++	latest    TaggedValue
++	hasLatest bool
++}
++
++// AggregateGrouped streams an arbitrary number of raw rows while retaining only
++// bounded output. If necessary, coarser aligned buckets merge sums AND counts,
++// so AVG remains weighted and COUNT/SUM include all observations.
++func AggregateGrouped(q *Query, limits GroupedLimits, scan func(func(storage.Event) error) error) (*Result, error) {
++	if err := validateGrouped(q); err != nil {
++		return nil, err
++	}
++	if len(q.GroupTags) == 0 {
++		return nil, errors.New("grouping tags required")
++	}
++	if limits.Points <= 0 || limits.Series <= 0 || limits.Latest <= 0 || limits.Bytes <= 0 {
++		return nil, errors.New("invalid grouped result limits")
++	}
++	budget := limits.Points
++	if q.GroupPointLimit > 0 && q.GroupPointLimit < budget {
++		budget = q.GroupPointLimit
++	}
++	interval := int64(q.GroupBy)
++	if !q.LastPerGroup {
++		spec, _ := parseCalendarSpec(q.GroupBySpec)
++		interval = int64(spec.dur)
++	}
++	groups := map[string]*groupedState{}
++	points := 0
++	labelBytes := 0
++	widen := func() error {
++		if interval > math.MaxInt64/2 {
++			return errors.New("grouped interval overflow")
++		}
++		interval *= 2
++		points = 0
++		for _, g := range groups {
++			stamps := make([]int64, 0, len(g.cells))
++			for ts := range g.cells {
++				stamps = append(stamps, ts)
++			}
++			sort.Slice(stamps, func(i, j int) bool { return stamps[i] < stamps[j] })
++			merged := map[int64]*groupedCell{}
++			for _, ts := range stamps {
++				bucket := ts / interval * interval
++				c := merged[bucket]
++				if c == nil {
++					c = &groupedCell{}
++					merged[bucket] = c
++				}
++				c.sum += g.cells[ts].sum
++				c.count += g.cells[ts].count
++			}
++			g.cells = merged
++			points += len(merged)
++		}
++		return nil
++	}
++	err := scan(func(e storage.Event) error {
++		var key strings.Builder
++		for _, tag := range q.GroupTags {
++			v := e.Tags[tag]
++			key.WriteString(strconv.Itoa(len(v)))
++			key.WriteByte(':')
++			key.WriteString(v)
++		}
++		id := key.String()
++		g := groups[id]
++		if g == nil {
++			limit := limits.Series
++			if q.LastPerGroup {
++				limit = limits.Latest
++			} else if budget < limit {
++				limit = budget
++			}
++			if len(groups) >= limit {
++				return fmt.Errorf("grouped result exceeds %d groups; add tag filters", limit)
++			}
++			labels := map[string]string{}
++			for _, tag := range q.GroupTags {
++				labels[tag] = e.Tags[tag]
++			}
++			encoded, _ := json.Marshal(labels)
++			labelBytes += len(encoded)
++			if labelBytes > limits.Bytes/2 {
++				return errors.New("grouped labels exceed result byte limit; add tag filters")
++			}
++			g = &groupedState{labels: labels, cells: map[int64]*groupedCell{}}
++			groups[id] = g
++		}
++		if q.LastPerGroup {
++			if !g.hasLatest || e.Timestamp > g.latest.TS {
++				g.latest = TaggedValue{Tags: g.labels, TS: e.Timestamp, Value: e.Value}
++				g.hasLatest = true
++			}
++			return nil
++		}
++		bucket := e.Timestamp / interval * interval
++		for g.cells[bucket] == nil && points >= budget {
++			if err := widen(); err != nil {
++				return err
++			}
++			bucket = e.Timestamp / interval * interval
++		}
++		c := g.cells[bucket]
++		if c == nil {
++			c = &groupedCell{}
++			g.cells[bucket] = c
++			points++
++		}
++		c.count++
++		if q.Aggregate != AggCount {
++			c.sum += e.Value
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	keys := make([]string, 0, len(groups))
++	for key := range groups {
++		keys = append(keys, key)
++	}
++	sort.Strings(keys)
++	for {
++		out := &GroupedResult{IntervalNS: interval}
++		for _, key := range keys {
++			g := groups[key]
++			if q.LastPerGroup {
++				out.Latest = append(out.Latest, g.latest)
++				continue
++			}
++			series := TaggedSeries{Tags: g.labels, Points: []SeriesPoint{}}
++			for ts, c := range g.cells {
++				value := c.sum
++				if q.Aggregate == AggAvg {
++					value /= float64(c.count)
++				} else if q.Aggregate == AggCount {
++					value = float64(c.count)
++				}
++				if math.IsNaN(value) || math.IsInf(value, 0) {
++					return nil, errors.New("response serialization failed")
++				}
++				series.Points = append(series.Points, SeriesPoint{TS: ts, Value: value, Count: c.count})
++			}
++			sort.Slice(series.Points, func(i, j int) bool { return series.Points[i].TS < series.Points[j].TS })
++			out.Series = append(out.Series, series)
++		}
++		result := &Result{Grouped: out}
++		raw, err := json.Marshal(result)
++		if err != nil {
++			return nil, err
++		}
++		if len(raw) <= limits.Bytes {
++			return result, nil
++		}
++		if q.LastPerGroup || points <= len(groups) {
++			return nil, errors.New("grouped result exceeds byte limit; add tag filters")
++		}
++		if err := widen(); err != nil {
++			return nil, err
++		}
++	}
++}
+diff --git a/internal/query/grouped_test.go b/internal/query/grouped_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/query/grouped_test.go
+@@ -0,0 +1,167 @@
++package query
++
++import (
++	"context"
++	"errors"
++	"math"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/byPixelTV/flamedb/internal/aggregates"
++	"github.com/byPixelTV/flamedb/internal/storage"
++)
++
++func TestGroupedParserValidation(t *testing.T) {
++	for _, line := range []string{
++		"GET x TAGS region LAST", "GET x GROUP BY 1m AVG TAGS server,world,region POINTS 1000",
++	} {
++		if _, err := Parse(line); err != nil {
++			t.Fatalf("%s: %v", line, err)
++		}
++	}
++	for _, line := range []string{
++		"GET x LAST", "GET x POINTS 10", "GET x TAGS region", "GET x GROUP BY 1mo AVG TAGS region", "GET x GROUP BY 1s AVG TAGS a,a", "GET x TAGS a, LAST", "GET x,y TAGS region LAST", "GET x GROUP BY 1s TAGS a POINTS 0", "GET x GROUP BY 1s TAGS a POINTS 20001", "GET x TAGS a LAST AVG", "GET x TAGS a LAST GROUP BY 1s", "LEADERBOARD x TAGS region LAST",
++	} {
++		if _, err := Parse(line); err == nil {
++			t.Fatalf("accepted %s", line)
++		}
++	}
++}
++
++func TestGroupedAggregationCoarsensAllHistoryWithoutLosingCounts(t *testing.T) {
++	const records = 60001
++	for _, agg := range []string{"AVG", "SUM", "COUNT"} {
++		t.Run(agg, func(t *testing.T) {
++			q, err := Parse("GET system:region:tps GROUP BY 1s " + agg + " TAGS region POINTS 12")
++			if err != nil {
++				t.Fatal(err)
++			}
++			result, err := AggregateGrouped(q, DefaultGroupedLimits(), func(visit func(storage.Event) error) error {
++				for i := 0; i < records; i++ {
++					if err := visit(storage.Event{Timestamp: int64(i) * int64(time.Second), Value: float64(i%7) + .25, Tags: map[string]string{"region": string(rune('a' + i%3))}}); err != nil {
++						return err
++					}
++				}
++				return nil
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if result.Grouped.IntervalNS <= int64(time.Second) {
++				t.Fatal("fixture did not coarsen buckets")
++			}
++			total, points := 0, 0
++			for _, series := range result.Grouped.Series {
++				for _, point := range series.Points {
++					count := 0
++					sum := 0.0
++					for i := 0; i < records; i++ {
++						if string(rune('a'+i%3)) == series.Tags["region"] && (int64(i)*int64(time.Second))/result.Grouped.IntervalNS*result.Grouped.IntervalNS == point.TS {
++							count++
++							sum += float64(i%7) + .25
++						}
++					}
++					want := sum
++					if agg == "AVG" {
++						want /= float64(count)
++					} else if agg == "COUNT" {
++						want = float64(count)
++					}
++					if point.Count != count || math.Abs(point.Value-want) > 1e-9 {
++						t.Fatalf("count=%d/%d value=%v/%v", point.Count, count, point.Value, want)
++					}
++					total += point.Count
++					points++
++				}
++			}
++			if total != records || points > 12 {
++				t.Fatalf("records=%d points=%d", total, points)
++			}
++		})
++	}
++}
++
++func TestGroupedLatestAndLimits(t *testing.T) {
++	q, _ := Parse("GET x TAGS region LAST")
++	scan := func(visit func(storage.Event) error) error {
++		for i := 0; i < 60001; i++ {
++			if err := visit(storage.Event{Timestamp: int64(i), Value: float64(i), Tags: map[string]string{"region": string(rune('a' + i%3)), "unused": "not returned"}}); err != nil {
++				return err
++			}
++		}
++		return nil
++	}
++	result, err := AggregateGrouped(q, DefaultGroupedLimits(), scan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(result.Grouped.Latest) != 3 {
++		t.Fatal(result)
++	}
++	for _, last := range result.Grouped.Latest {
++		if last.TS < 59998 || len(last.Tags) != 1 {
++			t.Fatal(last)
++		}
++	}
++	limits := DefaultGroupedLimits()
++	limits.Latest = 2
++	if result, err := AggregateGrouped(q, limits, scan); err == nil || result != nil {
++		t.Fatal("group limit returned partial data")
++	}
++	sentinel := errors.New("storage failed")
++	if _, err := AggregateGrouped(q, DefaultGroupedLimits(), func(func(storage.Event) error) error { return sentinel }); !errors.Is(err, sentinel) {
++		t.Fatal(err)
++	}
++}
++
++func TestPebbleGroupedReadFiltersAndSnapshotWalkCancellation(t *testing.T) {
++	store, err := storage.Open(t.TempDir(), "none")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	events := make([]storage.Event, 60001)
++	for i := range events {
++		events[i] = storage.Event{Metric: "system:region:tps", Timestamp: int64(i + 1), Value: float64(i), Tags: map[string]string{"server": "a", "region": string(rune('a' + i%3))}}
++	}
++	if err := store.WriteEvents(events, true); err != nil {
++		t.Fatal(err)
++	}
++	exec := NewExecutor(store, aggregates.New(store.DB()))
++	q, _ := Parse(`GET system:region:tps WHERE server="a" FROM 1970-01-01T00:00:00Z TO 1970-01-01T00:00:01Z GROUP BY 1s COUNT TAGS region`)
++	result, err := exec.Execute(q)
++	if err != nil {
++		t.Fatal(err)
++	}
++	count := 0
++	for _, s := range result.Grouped.Series {
++		for _, p := range s.Points {
++			count += p.Count
++		}
++	}
++	if count != len(events) {
++		t.Fatalf("count=%d", count)
++	}
++	q, _ = Parse(`GET system:region:tps WHERE server="missing" GROUP BY 1s COUNT TAGS region`)
++	result, err = exec.Execute(q)
++	if err != nil || len(result.Grouped.Series) != 0 {
++		t.Fatalf("filter: %v %v", result, err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	seen := 0
++	err = store.WalkEvents(ctx, "system:region:tps", 0, 1e9, nil, func(storage.Event) error {
++		seen++
++		if seen == 10 {
++			cancel()
++		}
++		return nil
++	})
++	if !errors.Is(err, context.Canceled) || seen != 10 {
++		t.Fatalf("cancel: %d %v", seen, err)
++	}
++	// The default and explicit limits remain bounded by compact output, not history.
++	if _, err := Parse(strings.Repeat(" ", 1) + "GET x GROUP BY 1s AVG TAGS server POINTS 20"); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/internal/storage/scan.go b/internal/storage/scan.go
+new file mode 100644
+--- /dev/null
++++ b/internal/storage/scan.go
+@@ -0,0 +1,62 @@
++package storage
++
++import (
++	"context"
++
++	"github.com/cockroachdb/pebble/v2"
++)
++
++// WalkEvents keeps one Pebble snapshot and does not retain the raw history.
++func (s *Storage) WalkEvents(ctx context.Context, metric string, from, to int64, tags map[string]string, visit func(Event) error) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	lower, upper := eventKey(metric, from), eventKey(metric, to)
++	indexed := len(tags) > 0
++	if indexed {
++		k, v := s.BestIndexTag(metric, tags)
++		lower, upper = indexKey(metric, k, v, from), indexKey(metric, k, v, to)
++	}
++	snapshot := s.db.NewSnapshot()
++	defer snapshot.Close()
++	iter, err := snapshot.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
++	if err != nil {
++		return err
++	}
++	defer iter.Close()
++	for valid := iter.First(); valid; valid = iter.Next() {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		var event Event
++		if indexed {
++			raw, closer, getErr := snapshot.Get(iter.Value())
++			if getErr == pebble.ErrNotFound {
++				continue
++			}
++			if getErr != nil {
++				return getErr
++			}
++			event, err = decodeEventValue(raw, metric)
++			closer.Close()
++		} else {
++			event, err = decodeEventValue(iter.Value(), metric)
++		}
++		if err != nil {
++			return err
++		}
++		matches := true
++		for key, value := range tags {
++			if actual, ok := event.Tags[key]; !ok || actual != value {
++				matches = false
++				break
++			}
++		}
++		if matches {
++			if err := visit(event); err != nil {
++				return err
++			}
++		}
++	}
++	return iter.Error()
++}
+diff --git a/internal/analytics/grouped.go b/internal/analytics/grouped.go
+new file mode 100644
+--- /dev/null
++++ b/internal/analytics/grouped.go
+@@ -0,0 +1,64 @@
++package analytics
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"math"
++
++	"github.com/byPixelTV/flamedb/internal/query"
++	"github.com/byPixelTV/flamedb/internal/storage"
++)
++
++func (e *Engine) grouped(ctx context.Context, q *query.Query) (*query.Result, error) {
++	limits := query.DefaultGroupedLimits()
++	if e.max < limits.Points {
++		limits.Points = e.max
++	}
++	if e.max < limits.Series {
++		limits.Series = e.max
++	}
++	if e.max < limits.Latest {
++		limits.Latest = e.max
++	}
++	if e.maxBytes < limits.Bytes {
++		limits.Bytes = e.maxBytes
++	}
++	return query.AggregateGrouped(q, limits, func(visit func(storage.Event) error) error {
++		to := q.To
++		if to == 0 {
++			to = math.MaxInt64
++		}
++		tags, _ := json.Marshal(EncodeTags(q.Where))
++		if q.Where == nil {
++			tags = []byte(`{}`)
++		}
++		rows, err := e.db.Query(ctx, `SELECT ts,value,tags FROM flame_events WHERE flame_identity_hash(metric)=flame_identity_hash($1) AND metric=$1 AND ts >= $2 AND ts < $3 AND tags @> $4::jsonb ORDER BY ts`, EncodeString(q.Metric), q.From, to, string(tags))
++		if err != nil {
++			return err
++		}
++		defer rows.Close()
++		for rows.Next() {
++			var event storage.Event
++			var raw []byte
++			if err := rows.Scan(&event.Timestamp, &event.Value, &raw); err != nil {
++				return err
++			}
++			if len(raw) > e.maxBytes {
++				return fmt.Errorf("one event exceeds configured byte limit")
++			}
++			if err := json.Unmarshal(raw, &event.Tags); err != nil {
++				return err
++			}
++			event.Tags, err = decodeTags(event.Tags)
++			if err != nil {
++				return err
++			}
++			event.Metric = q.Metric
++			if err := visit(event); err != nil {
++				return err
++			}
++		}
++		return rows.Err()
++	})
++}
+diff --git a/internal/server/grouped_test.go b/internal/server/grouped_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/server/grouped_test.go
+@@ -0,0 +1,65 @@
++package server
++
++import (
++	"bufio"
++	"fmt"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/byPixelTV/flamedb/internal/aggregates"
++	"github.com/byPixelTV/flamedb/internal/auth"
++	"github.com/byPixelTV/flamedb/internal/cluster"
++	"github.com/byPixelTV/flamedb/internal/config"
++	"github.com/byPixelTV/flamedb/internal/storage"
++)
++
++func TestGroupedWireReadsLargeHistoryWithReadonlyKey(t *testing.T) {
++	store, err := storage.Open(t.TempDir(), "none")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	events := make([]storage.Event, 60000)
++	for i := range events {
++		events[i] = storage.Event{Metric: "regions", Timestamp: int64(i + 1), Value: float64(i), Tags: map[string]string{"region": string(rune('a' + i%2))}}
++	}
++	if err := store.WriteEvents(events, true); err != nil {
++		t.Fatal(err)
++	}
++	srv := New(store, aggregates.New(store.DB()), auth.New(config.AuthConfig{Keys: []config.APIKey{{Name: "grafana", Key: "readonly", Permissions: []string{"read"}}}}), cluster.New(cluster.Node{ID: "self"}, 150, "internal", 1), "internal", nil, "")
++	client, peer := net.Pipe()
++	defer client.Close()
++	done := make(chan struct{})
++	go func() { srv.handleConn(peer); close(done) }()
++	defer func() { client.Close(); <-done }()
++	client.SetDeadline(time.Now().Add(10 * time.Second))
++	sc := bufio.NewScanner(client)
++	if !sc.Scan() {
++		t.Fatal("no challenge")
++	}
++	fmt.Fprintln(client, "AUTH readonly")
++	if !sc.Scan() {
++		t.Fatal("no auth")
++	}
++	result := frame(t, client, sc, "GET regions GROUP BY 1s COUNT TAGS region POINTS 8")
++	if result["error"] != nil {
++		t.Fatal(result)
++	}
++	total := 0.0
++	for _, s := range result["grouped"].(map[string]any)["series"].([]any) {
++		for _, p := range s.(map[string]any)["points"].([]any) {
++			total += p.(map[string]any)["value"].(float64)
++		}
++	}
++	if total != 60000 {
++		t.Fatalf("count=%v", total)
++	}
++	result = frame(t, client, sc, "GET regions TAGS region LAST")
++	if len(result["grouped"].(map[string]any)["latest"].([]any)) != 2 {
++		t.Fatal(result)
++	}
++	if frame(t, client, sc, "WRITE regions 1")["error"] == nil {
++		t.Fatal("read-only grouped session accepted a write")
++	}
++}
+diff --git a/grafana/pkg/plugin/grouped.go b/grafana/pkg/plugin/grouped.go
+new file mode 100644
+--- /dev/null
++++ b/grafana/pkg/plugin/grouped.go
+@@ -0,0 +1,122 @@
++package plugin
++
++import (
++	"context"
++	"errors"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/grafana/grafana-plugin-sdk-go/backend"
++	"github.com/grafana/grafana-plugin-sdk-go/data"
++)
++
++func (d *Datasource) groupedFrames(parent context.Context, q backend.DataQuery, m queryModel, interval time.Duration) (data.Frames, bool, error) {
++	ctx, cancel := context.WithCancel(parent)
++	defer cancel()
++	replies := make([]*groupedReply, len(m.Metrics))
++	errs := make([]error, len(m.Metrics))
++	var unsupported atomic.Bool
++	var wg sync.WaitGroup
++	for i, metric := range m.Metrics {
++		wg.Add(1)
++		go func(index int, metric string) {
++			defer wg.Done()
++			command := "GET " + metric + where(m.Filters) + " FROM " + q.TimeRange.From.UTC().Format(time.RFC3339Nano) + " TO " + q.TimeRange.To.UTC().Format(time.RFC3339Nano)
++			if m.Mode == "timeseries" {
++				command += " GROUP BY " + interval.String() + " " + m.Aggregation
++			}
++			command += " TAGS " + strings.Join(m.GroupBy, ",")
++			if m.Mode == "timeseries" {
++				command += " POINTS " + strconv.Itoa(20000/len(m.Metrics))
++			} else {
++				command += " LAST"
++			}
++			r, err := d.client.query(ctx, command)
++			if err != nil {
++				if strings.Contains(err.Error(), "unknown keyword: TAGS") {
++					unsupported.Store(true)
++				} else {
++					errs[index] = err
++				}
++				cancel()
++				return
++			}
++			if r.Grouped == nil {
++				unsupported.Store(true)
++				cancel()
++				return
++			}
++			replies[index] = r.Grouped
++		}(i, metric)
++	}
++	wg.Wait()
++	if unsupported.Load() {
++		return nil, false, nil
++	}
++	// Prefer the originating server error to cancellation of sibling metric reads.
++	for _, err := range errs {
++		if err != nil && !errors.Is(err, context.Canceled) {
++			return nil, true, err
++		}
++	}
++	for _, err := range errs {
++		if err != nil {
++			return nil, true, err
++		}
++	}
++	groups := map[string]bool{}
++	all := map[string][]event{}
++	var frames data.Frames
++	for i, g := range replies {
++		if g == nil {
++			return nil, true, errors.New("missing grouped metric response")
++		}
++		metric := m.Metrics[i]
++		if m.Mode != "timeseries" {
++			all[metric] = []event{}
++			for _, value := range g.Latest {
++				key, _ := groupKey(value.Tags, m.GroupBy)
++				groups[key] = true
++				all[metric] = append(all[metric], event{Metric: metric, Timestamp: value.TS, Value: value.Value, Tags: value.Tags})
++			}
++			continue
++		}
++		if len(g.Series) > 0 && g.IntervalNS <= 0 {
++			return nil, true, errors.New("invalid grouped response interval")
++		}
++		for _, series := range g.Series {
++			key, _ := groupKey(series.Tags, m.GroupBy)
++			groups[key] = true
++			sort.Slice(series.Points, func(i, j int) bool { return series.Points[i].TS < series.Points[j].TS })
++			times := []time.Time{}
++			values := []*float64{}
++			for j, p := range series.Points {
++				if j > 0 && (p.TS-series.Points[j-1].TS)/g.IntervalNS > 2 {
++					times = append(times, time.Unix(0, series.Points[j-1].TS+g.IntervalNS).UTC())
++					values = append(values, nil)
++				}
++				v := p.Value
++				times = append(times, time.Unix(0, p.TS).UTC())
++				values = append(values, &v)
++			}
++			frame := data.NewFrame(metric, data.NewField("Time", nil, times), data.NewField(seriesName(metric, series.Tags, m.Legend), data.Labels(series.Tags), values))
++			frame.Meta = &data.FrameMeta{Type: data.FrameTypeTimeSeriesMulti, Custom: map[string]any{"interval_ns": g.IntervalNS}}
++			frames = append(frames, frame)
++		}
++	}
++	limit := 1000
++	if m.Mode == "table" {
++		limit = 10000
++	}
++	if len(groups) > limit {
++		return nil, true, errors.New("too many grouped series; add server/world/region filters")
++	}
++	if m.Mode != "timeseries" {
++		frames = latestFrames(all, m)
++	}
++	return frames, true, nil
++}
+diff --git a/grafana/pkg/plugin/grouped_test.go b/grafana/pkg/plugin/grouped_test.go
+new file mode 100644
+--- /dev/null
++++ b/grafana/pkg/plugin/grouped_test.go
+@@ -0,0 +1,49 @@
++package plugin
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/grafana/grafana-plugin-sdk-go/backend"
++)
++
++func TestNativeGroupingBypassesRawScanLimit(t *testing.T) {
++	c := fakeDB(t, func(command string) string {
++		if !strings.Contains(command, "TAGS server POINTS 20000") {
++			return `{"error":"expected server grouping"}`
++		}
++		return `{"grouped":{"interval_ns":1000000000,"series":[{"tags":{"server":"a"},"points":[{"ts":1000000000,"value":30000,"count":30000},{"ts":2000000000,"value":30000,"count":30000}]}]}}`
++	})
++	d := &Datasource{client: c, maxScan: 1, serverGrouping: true}
++	q := backend.DataQuery{TimeRange: backend.TimeRange{From: time.Unix(0, 0), To: time.Unix(10, 0)}}
++	frames, err := d.execute(context.Background(), q, queryModel{Metrics: []string{"regions"}, Aggregation: "COUNT", GroupBy: []string{"server"}})
++	if err != nil || len(frames) != 1 || *frames[0].Fields[1].At(0).(*float64) != 30000 {
++		t.Fatalf("frames=%v err=%v", frames, err)
++	}
++}
++func TestNativeLatestTableAndUpgradeFallback(t *testing.T) {
++	c := fakeDB(t, func(command string) string {
++		if strings.Contains(command, "TAGS server LAST") {
++			return `{"grouped":{"latest":[{"tags":{"server":"a"},"ts":2000000000,"value":20}]}}`
++		}
++		return `{"error":"unexpected command"}`
++	})
++	d := &Datasource{client: c, maxScan: 1, serverGrouping: true}
++	q := backend.DataQuery{TimeRange: backend.TimeRange{From: time.Unix(0, 0), To: time.Unix(10, 0)}}
++	frames, err := d.execute(context.Background(), q, queryModel{Metrics: []string{"regions"}, Mode: "table", GroupBy: []string{"server"}})
++	if err != nil || frames[0].Rows() != 1 || *frames[0].Fields[1].At(0).(*float64) != 20 {
++		t.Fatalf("frames=%v err=%v", frames, err)
++	}
++	d.client = fakeDB(t, func(command string) string {
++		if strings.Contains(command, " TAGS ") {
++			return `{"error":"unknown keyword: TAGS"}`
++		}
++		return `{"events":[{"timestamp":1,"value":2,"tags":{"server":"a"}}]}`
++	})
++	frames, err = d.execute(context.Background(), q, queryModel{Metrics: []string{"regions"}, GroupBy: []string{"server"}})
++	if err != nil || len(frames) != 1 {
++		t.Fatalf("legacy fallback failed: %v", err)
++	}
++}
+diff --git a/grafana/pkg/plugin/read_events.go b/grafana/pkg/plugin/read_events.go
+new file mode 100644
+--- /dev/null
++++ b/grafana/pkg/plugin/read_events.go
+@@ -0,0 +1,67 @@
++package plugin
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strconv"
++	"time"
++)
++
++const rawWindowEvents = 1000
++
++type readWindow struct{ from, to time.Time }
++
++// Read disjoint half-open time windows rather than offset pages. This preserves
++// all equal-timestamp observations and avoids rescanning every previous page.
++// Each storage request has its own snapshot; this is not an atomic snapshot of
++// concurrent historical backfills across the complete dashboard range.
++func (d *Datasource) readEvents(ctx context.Context, metric string, filters []filter, from, to time.Time) ([]event, error) {
++	windows := []readWindow{{from, to}}
++	events := []event{}
++	for len(windows) > 0 {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		w := windows[len(windows)-1]
++		windows = windows[:len(windows)-1]
++		remaining := d.maxScan - len(events)
++		limit := rawWindowEvents + 1
++		if remaining < rawWindowEvents || w.to.Sub(w.from) <= time.Nanosecond {
++			limit = remaining + 1
++		}
++		command := "GET " + metric + where(filters) + " FROM " + w.from.UTC().Format(time.RFC3339Nano) + " TO " + w.to.UTC().Format(time.RFC3339Nano) + " LIMIT " + strconv.Itoa(limit) + " ORDER ASC"
++		r, err := d.client.query(ctx, command)
++		split := errors.Is(err, errResponseTooLarge)
++		if err != nil && !split {
++			return nil, err
++		}
++		if err == nil {
++			if len(r.Events) > limit {
++				return nil, errors.New("FlameDB returned more events than the requested page limit")
++			}
++			if len(r.Events) > remaining {
++				return nil, fmt.Errorf("%s exceeds the scan limit (%d events); add filters or increase Scan limit per metric in the datasource settings (maximum 200000)", metric, d.maxScan)
++			}
++			split = len(r.Events) == limit
++		}
++		if split {
++			mid := w.from.Add(w.to.Sub(w.from) / 2)
++			if !mid.After(w.from) || !mid.Before(w.to) {
++				if err != nil {
++					return nil, fmt.Errorf("%s has an oversized response at one timestamp; add tag filters: %w", metric, err)
++				}
++				return nil, fmt.Errorf("%s exceeds the scan limit (%d events)", metric, d.maxScan)
++			}
++			windows = append(windows, readWindow{mid, w.to}, readWindow{w.from, mid})
++			continue
++		}
++		for _, e := range r.Events {
++			if e.Timestamp < w.from.UnixNano() || e.Timestamp >= w.to.UnixNano() {
++				return nil, errors.New("FlameDB returned an event outside the requested time window")
++			}
++		}
++		events = append(events, r.Events...)
++	}
++	return events, nil
++}
+diff --git a/grafana/pkg/plugin/large_response_test.go b/grafana/pkg/plugin/large_response_test.go
+new file mode 100644
+--- /dev/null
++++ b/grafana/pkg/plugin/large_response_test.go
+@@ -0,0 +1,165 @@
++package plugin
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/grafana/grafana-plugin-sdk-go/backend"
++)
++
++func TestReplyFramingAndSize(t *testing.T) {
++	payload := `{"events":[{"timestamp":1,"tags":{"large":"` + strings.Repeat("x", 200000) + `"}}]}` + "\n"
++	r, err := readReply(bufio.NewReaderSize(strings.NewReader(payload), 32))
++	if err != nil || len(r.Events) != 1 || len(r.Events[0].Tags["large"]) != 200000 {
++		t.Fatalf("chunked response: %v", err)
++	}
++	_, err = readReply(bufio.NewReader(strings.NewReader(strings.Repeat(" ", maxResponseBytes) + "x\n")))
++	if !errors.Is(err, errResponseTooLarge) {
++		t.Fatalf("oversize frame: %v", err)
++	}
++	_, err = readReply(bufio.NewReader(strings.NewReader(`{"events":[]}`)))
++	if !errors.Is(err, io.ErrUnexpectedEOF) {
++		t.Fatalf("accepted unterminated frame: %v", err)
++	}
++	_, err = readReply(bufio.NewReader(strings.NewReader("{bad json}\n")))
++	if err == nil {
++		t.Fatal("accepted malformed JSON")
++	}
++	_, err = readReply(bufio.NewReader(strings.NewReader("{\"error\":\"bufio.Scanner: token too long\"}\n")))
++	if !errors.Is(err, errResponseTooLarge) {
++		t.Fatalf("upstream frame limit was not recognized: %v", err)
++	}
++}
++
++var windowCommand = regexp.MustCompile(` FROM (\S+) TO (\S+) LIMIT (\d+) ORDER ASC$`)
++
++func fixtureHandler(events []event, calls *atomic.Int32) func(string) string {
++	return func(command string) string {
++		calls.Add(1)
++		match := windowCommand.FindStringSubmatch(command)
++		if match == nil {
++			return `{"error":"test expected a bounded time-window read"}`
++		}
++		from, err := time.Parse(time.RFC3339Nano, match[1])
++		if err != nil {
++			return `{"error":"invalid FROM"}`
++		}
++		to, err := time.Parse(time.RFC3339Nano, match[2])
++		if err != nil {
++			return `{"error":"invalid TO"}`
++		}
++		limit, _ := strconv.Atoi(match[3])
++		page := []event{}
++		for _, e := range events {
++			if e.Timestamp >= from.UnixNano() && e.Timestamp < to.UnixNano() {
++				page = append(page, e)
++				if len(page) == limit {
++					break
++				}
++			}
++		}
++		raw, _ := json.Marshal(reply{Events: page})
++		return string(raw)
++	}
++}
++
++func TestWindowedReadKeepsEveryEventAndTimestampTie(t *testing.T) {
++	events := []event{}
++	for i := 0; i < 2505; i++ {
++		events = append(events, event{Timestamp: int64(i), Value: float64(i), Tags: map[string]string{"server": "a"}})
++	}
++	for i := 0; i < 3; i++ {
++		events = append(events, event{Timestamp: 1024, Value: float64(3000 + i), Tags: map[string]string{"server": "a"}})
++	}
++	sort.SliceStable(events, func(i, j int) bool { return events[i].Timestamp < events[j].Timestamp })
++	var calls atomic.Int32
++	handler := fixtureHandler(events, &calls)
++	c := fakeDB(t, func(command string) string {
++		if !strings.Contains(command, `WHERE server="a"`) {
++			return `{"error":"lost filters"}`
++		}
++		return handler(command)
++	})
++	c.timeout = 5 * time.Second
++	d := &Datasource{client: c, maxScan: 3000}
++	got, err := d.readEvents(context.Background(), "system:region:tps", []filter{{Key: "server", Value: "a"}}, time.Unix(0, 0), time.Unix(0, 4096))
++	if err != nil || len(got) != len(events) {
++		t.Fatalf("got %d, want %d; err=%v", len(got), len(events), err)
++	}
++	for i := range got {
++		if got[i].Timestamp != events[i].Timestamp || got[i].Value != events[i].Value {
++			t.Fatalf("lost or duplicated event at %d", i)
++		}
++	}
++	if calls.Load() < 3 {
++		t.Fatal("fixture did not exercise multiple time windows")
++	}
++	d.maxScan = 2000
++	got, err = d.readEvents(context.Background(), "system:region:tps", []filter{{Key: "server", Value: "a"}}, time.Unix(0, 0), time.Unix(0, 4096))
++	if err == nil || !strings.Contains(err.Error(), "scan limit") || got != nil {
++		t.Fatalf("expected limit error without partial results: %d, %v", len(got), err)
++	}
++}
++
++func TestWindowedReadRecoversFromFrameLargerThan16MiB(t *testing.T) {
++	padding := strings.Repeat("x", 22000)
++	events := make([]event, 800)
++	for i := range events {
++		events[i] = event{Timestamp: int64(i + 1), Value: float64(i + 1), Tags: map[string]string{"server": "a", "padding": padding}}
++	}
++	var calls atomic.Int32
++	c := fakeDB(t, fixtureHandler(events, &calls))
++	c.timeout = 10 * time.Second
++	d := &Datasource{client: c, maxScan: 1000}
++	q := backend.DataQuery{Interval: time.Second, TimeRange: backend.TimeRange{From: time.Unix(0, 0), To: time.Unix(0, 1000)}}
++	frames, err := d.execute(context.Background(), q, queryModel{Metrics: []string{"system:region:tps"}, Mode: "timeseries", Aggregation: "AVG", GroupBy: []string{"server"}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(frames) != 1 || *frames[0].Fields[1].At(0).(*float64) != 400.5 {
++		t.Fatal("lost values while splitting oversized response")
++	}
++	if calls.Load() < 3 {
++		t.Fatal("fixture did not exercise oversize recovery")
++	}
++}
++
++func TestWholeQueryTimeoutAppliesAcrossWindows(t *testing.T) {
++	events := make([]event, 1100)
++	for i := range events {
++		events[i] = event{Timestamp: int64(i), Value: 1}
++	}
++	var calls atomic.Int32
++	handler := fixtureHandler(events, &calls)
++	c := fakeDB(t, func(command string) string { time.Sleep(40 * time.Millisecond); return handler(command) })
++	c.timeout = 65 * time.Millisecond
++	d := &Datasource{client: c, maxScan: 2000}
++	q := backend.DataQuery{TimeRange: backend.TimeRange{From: time.Unix(0, 0), To: time.Unix(0, 2048)}}
++	start := time.Now()
++	frames, err := d.execute(context.Background(), q, queryModel{Metrics: []string{"tps"}, GroupBy: []string{"server"}})
++	if err == nil || frames != nil {
++		t.Fatal("query was allowed to reset its timeout for every window")
++	}
++	if time.Since(start) > 500*time.Millisecond {
++		t.Fatal("total query timeout was not enforced")
++	}
++}
++
++func TestSamplingJitterDoesNotCreateOneBucketHole(t *testing.T) {
++	m := queryModel{Metrics: []string{"system:regions"}, Aggregation: "AVG", GroupBy: []string{"server"}}
++	events := []event{{Timestamp: 1e9, Value: 89, Tags: map[string]string{"server": "a"}}, {Timestamp: 3e9, Value: 90, Tags: map[string]string{"server": "a"}}, {Timestamp: 7e9, Value: 88, Tags: map[string]string{"server": "a"}}}
++	frame := groupedSeries(map[string][]event{"system:regions": events}, m, time.Second)[0]
++	if frame.Rows() != 4 || *frame.Fields[1].At(1).(*float64) != 90 || frame.Fields[1].At(2).(*float64) != nil {
++		t.Fatal("one missing bucket should connect, a longer gap should remain null")
++	}
++}
+diff --git a/scripts/check-grouped-query.cjs b/scripts/check-grouped-query.cjs
+new file mode 100644
+--- /dev/null
++++ b/scripts/check-grouped-query.cjs
+@@ -0,0 +1,4 @@
++const {spawnSync} = require('node:child_process');
++const r = spawnSync('go', ['test', './internal/query', './internal/storage', './internal/server', './internal/analytics', '-count=1'], {stdio:'inherit', windowsHide:true});
++if(r.status!==0) process.exit(r.status ?? 1);
++console.log('Server grouped-query tests passed');

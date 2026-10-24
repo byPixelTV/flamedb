@@ -129,6 +129,9 @@ func (e *Engine) events(ctx context.Context, q *query.Query, metric string, aggr
 	return out, rows.Err()
 }
 func (e *Engine) get(ctx context.Context, q *query.Query) (*query.Result, error) {
+	if len(q.GroupTags) > 0 {
+		return e.grouped(ctx, q)
+	}
 	metrics := q.Metrics
 	if len(metrics) == 0 {
 		metrics = []string{q.Metric}

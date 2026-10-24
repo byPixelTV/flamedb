@@ -1,6 +1,7 @@
 package query
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -392,6 +393,18 @@ func (e *Executor) executeLeaderboard(q *Query) (*Result, error) {
 }
 
 func (e *Executor) executeGet(q *Query) (*Result, error) {
+	if len(q.GroupTags) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return AggregateGrouped(q, DefaultGroupedLimits(), func(visit func(storage.Event) error) error {
+			to := q.To
+			if to == 0 {
+				to = math.MaxInt64
+			}
+			return e.store.WalkEvents(ctx, q.Metric, q.From, to, q.Where, visit)
+		})
+	}
+
 	to := q.To
 	if to == 0 {
 		to = math.MaxInt64

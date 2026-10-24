@@ -56,6 +56,17 @@ try {
     commands.push('END');
     const result = await writer.query(commands.join('\n')); assert.equal(result.failed, 0, JSON.stringify(result));
   }
+  // More history than the plugin raw scan limit. Native grouped queries must
+  // still include every observation and return only compact aggregates.
+  for (let offset = 0; offset < 60000; offset += 1000) {
+    const commands = ['WRITE_BATCH'];
+    for (let i = offset; i < offset + 1000; i++) {
+      const ts = BigInt(now - 600000 + i * 9) * 1000000n;
+      commands.push(`WRITE grafana.large ${i} region="${i % 2 ? 'b' : 'a'}" ts=${ts}`);
+    }
+    commands.push('END');
+    const result = await writer.query(commands.join('\n')); assert.equal(result.failed, 0, JSON.stringify(result));
+  }
   writer.close();
   const reader = await connectDB('grafana-test-reader'); assert.ok((await reader.query('WRITE forbidden 1')).error, 'read-only key accepted writes'); reader.close();
   const plugins = path.join(work, 'plugins'); mkdirSync(plugins, { recursive: true });
@@ -67,7 +78,7 @@ try {
   for (const name of ['dashboards', 'datasources', 'plugins', 'alerting']) { mkdirSync(path.join(work, 'provisioning', name), { recursive: true }); }
   const grafana = launch(path.join(home, 'bin', process.platform === 'win32' ? 'grafana.exe' : 'grafana'), ['server', '--homepath', home, '--config', ini], home, 'grafana.log');
   await until(async () => { const r = await api('/api/health'); assert.equal(r.database, 'ok'); }, 'Grafana startup');
-  await api('/api/datasources', { name: 'FlameDB', uid: 'flamedb', type: 'flamedb-flamedb-datasource', access: 'proxy', isDefault: true, jsonData: { host: '127.0.0.1', port: dbPort, maxScanEvents: 50000 }, secureJsonData: { apiKey: 'grafana-test-reader' } });
+  await api('/api/datasources', { name: 'FlameDB', uid: 'flamedb', type: 'flamedb-flamedb-datasource', access: 'proxy', isDefault: true, jsonData: { host: '127.0.0.1', port: dbPort, maxScanEvents: 100 }, secureJsonData: { apiKey: 'grafana-test-reader' } });
   assert.equal((await api('/api/datasources/uid/flamedb/health')).status, 'OK');
   const metrics = await api('/api/datasources/uid/flamedb/resources/metrics'); assert.ok(metrics.includes('tps') && metrics.includes('players'));
   const tags = await api('/api/datasources/uid/flamedb/resources/tags?metric=tps'); assert.deepEqual(tags.region, ['1', '2', '3']);
@@ -77,6 +88,14 @@ try {
   const filtered = await query({ filters: [{ key: 'region', value: '2' }], groupBy: ['region'] }); assert.equal(filtered.frames.length, 1); assert.equal(filtered.frames[0].schema.fields[1].labels.region, '2');
   const table = await query({ mode: 'table', metrics: ['tps', 'players'], groupBy: ['region'] }); assert.equal(table.frames[0].data.values[0].length, 3); assert.deepEqual(table.frames[0].schema.fields.map(f => f.name), ['region', 'tps', 'tps time', 'players', 'players time']);
   const latest = await query({ mode: 'latest', groupBy: ['region'] }); assert.equal(latest.frames.length, 3); assert.ok(latest.frames.every(f => f.data.values[0].length === 1));
+  const large = await query({ metrics: ['grafana.large'], aggregation: 'COUNT', groupBy: ['region'] });
+  assert.ok(!large.error, JSON.stringify(large)); assert.equal(large.frames.length, 2);
+  const count = large.frames.reduce((sum, f) => sum + f.data.values[1].reduce((n, v) => n + (v ?? 0), 0), 0);
+  assert.equal(count, 60000, 'Native grouping lost records beyond the raw scan limit');
+  const largeTable = await query({ metrics: ['grafana.large'], mode: 'table', groupBy: ['region'] });
+  assert.ok(!largeTable.error, JSON.stringify(largeTable));
+  assert.deepEqual(largeTable.frames[0].data.values[1], [59998, 59999]);
+  console.log('Native grouping beyond raw scan limit passed');
   const dashboard = JSON.parse(readFileSync(path.join(root, 'dashboards', 'overview.json'), 'utf8'));
   const saved = await api('/api/dashboards/db', { dashboard, overwrite: true });
   const url = base + saved.url + `?from=${now - 600000}&to=${now + 1000}`;
