@@ -60,8 +60,7 @@ batches, one write connection, two statistics readers, unchanged 5000 ms command
 deadline, Zstd, replication factor one, fresh Linux Docker volumes, and a server
 limit of four CPUs/four GiB. Source metric names, UUIDs, values, tags, timestamps
 and batch boundaries were preserved. The candidate image was built from the
-committed dev.47 source plus only the Pebble batch-lookup change, excluding the
-uncommitted NextGen work.
+committed dev.47 source plus only the Pebble batch-lookup change.
 
 | Measurement | Published dev.47 | Optimized local candidate |
 | --- | ---: | ---: |

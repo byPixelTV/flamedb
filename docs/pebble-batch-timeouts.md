@@ -63,8 +63,7 @@ comparison JSON, negative-control output, Docker TCP results and server WAL
 recovery logs. `deploy/check-pebble-batch.cjs measurements` validates the measured
 inputs/results. Its `tcp` action creates and removes its own labeled test container;
 the test database files remain under that artifact directory. Local Go regressions,
-race detection and vet for affected packages passed. External PostgreSQL/HA
-integration suites are separate from this Pebble fix.
+race detection and vet for affected packages passed.
 
 ## Using the fix
 
@@ -76,8 +75,8 @@ the existing Compose project and volume; starting it under a different project
 name can create a different `flamedb-data` volume. The mounted configuration must
 keep `server.data_path: /root/data-node1` (or `./data-node1`, relative to the image's
 `/root` working directory). An absent `storage.engine`, or `storage.engine: pebble`,
-uses Pebble unless PostgreSQL is explicitly configured. No PostgreSQL/Redis
-services or data migration are needed for this fix.
+uses the existing Pebble data directory. No additional services or data migration
+are needed for this fix.
 
 The repository's Build & Release workflow publishes `ghcr.io/bypixeltv/flamedb:dev`
 after a push to `master`, following successful binary and SDK build/publish jobs.

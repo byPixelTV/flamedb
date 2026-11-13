@@ -8,15 +8,12 @@ const env = {
   ...process.env,
   FLAMEDB_INTEGRATION:'1',
   FLAMEDB_REFERENCE_BINARY:process.env.FLAMEDB_REFERENCE_BINARY || path.join(root,'.compat','flamedb-reference'+(process.platform==='win32'?'.exe':'')),
-  FLAMEDB_NEXTGEN_BINARY:process.env.FLAMEDB_NEXTGEN_BINARY || path.join(root,'.compat','flamedb-nextgen-sdk'+(process.platform==='win32'?'.exe':'')),
-  FLAMEDB_TEST_POSTGRES:process.env.FLAMEDB_TEST_POSTGRES || 'postgres://flamedb:flamedb@127.0.0.1:55432/flamedb?sslmode=disable',
-  FLAMEDB_TEST_REDIS:process.env.FLAMEDB_TEST_REDIS || '127.0.0.1:56379',
+  FLAMEDB_PEBBLE_BINARY:process.env.FLAMEDB_PEBBLE_BINARY || path.join(root,'.compat','flamedb-pebble'+(process.platform==='win32'?'.exe':'')),
 };
-delete env.FLAMEDB_TEST_LEGACY_SKIP_RAW;
-for (const key of ['FLAMEDB_REFERENCE_BINARY','FLAMEDB_NEXTGEN_BINARY']) {
+for (const key of ['FLAMEDB_REFERENCE_BINARY','FLAMEDB_PEBBLE_BINARY']) {
   if (!fs.existsSync(env[key])) throw new Error(`Missing ${key}: ${env[key]}`);
 }
-const requiredTests = ['TestFrozenLegacySDKsAgainstNextgen','TestFrozenRawEventSDKBaselineLimitation','TestFrozenMissingMetricResultShapesAgainstNextgen','TestAdditiveRankingSDKsAgainstNextgen'];
+const requiredTests = ['TestFrozenLegacySDKsAgainstPebble','TestFrozenRawEventSDKBaselineLimitation','TestFrozenMissingMetricResultShapesAgainstPebble','TestAdditiveRankingSDKsAgainstPebble'];
 const result = spawnSync('go',['test','./internal/compat','-run',`(${requiredTests.join('|')})`,'-count=1','-v','-timeout=8m'],{cwd:root,env,encoding:'utf8',maxBuffer:8*1024*1024,timeout:540000});
 const output = (result.stdout || '')+(result.stderr || '');
 if (Buffer.byteLength(output)>8*1024*1024) throw new Error('SDK integration output exceeds 8 MiB');

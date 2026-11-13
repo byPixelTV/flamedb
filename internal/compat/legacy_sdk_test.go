@@ -14,25 +14,21 @@ import (
 	"time"
 )
 
-// TestFrozenLegacySDKsAgainstNextgen compiles unchanged SDK source from the
-// frozen reference and executes real consumers against PostgreSQL/Redis-backed
+// TestFrozenLegacySDKsAgainstPebble compiles unchanged SDK source from the
+// frozen reference and executes real consumers against
 // FlameDB TCP. It is deliberately separate from local fake-server SDK unit tests.
-func TestFrozenLegacySDKsAgainstNextgen(t *testing.T) {
-	nextgen := prerequisite(t, "FLAMEDB_NEXTGEN_BINARY")
+func TestFrozenLegacySDKsAgainstPebble(t *testing.T) {
+	candidate := prerequisite(t, "FLAMEDB_PEBBLE_BINARY")
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
 	}
 	frozen := filepath.Join(root, ".compat", "reference")
 	verifyFrozenSDKSource(t, root, frozen)
-	addr := startServer(t, nextgen, true)
+	addr := startServer(t, candidate)
 	prefix := fmt.Sprintf("frozensdk%d", time.Now().UnixNano())
 	sdk := filepath.Join(root, "internal", "compat", "sdk")
 	mode := "all"
-	if os.Getenv("FLAMEDB_TEST_LEGACY_SKIP_RAW") == "1" {
-		mode = "skip-raw"
-		t.Log("LIMITATION: raw-event Kotlin/TypeScript decoding excluded explicitly; frozen server emits uppercase event keys rejected by those frozen SDKs")
-	}
 	t.Run("Go", func(t *testing.T) {
 		runConsumer(t, filepath.Join(sdk, "go"), "FROZEN_GO_SDK_OK", "go", "run", ".", addr, prefix+"go")
 	})
@@ -64,7 +60,7 @@ func TestFrozenRawEventSDKBaselineLimitation(t *testing.T) {
 	}
 	frozen := filepath.Join(root, ".compat", "reference")
 	verifyFrozenSDKSource(t, root, frozen)
-	addr := startServer(t, reference, false)
+	addr := startServer(t, reference)
 	sdk := filepath.Join(root, "internal", "compat", "sdk")
 	prefix := fmt.Sprintf("rawbaseline%d", time.Now().UnixNano())
 	w := connect(t, addr, "compat-key")
@@ -118,13 +114,13 @@ func runConsumer(t *testing.T, dir, success, executable string, args ...string) 
 	t.Logf("%s\n%s", executable, output)
 }
 
-func TestAdditiveRankingSDKsAgainstNextgen(t *testing.T) {
-	nextgen := prerequisite(t, "FLAMEDB_NEXTGEN_BINARY")
+func TestAdditiveRankingSDKsAgainstPebble(t *testing.T) {
+	candidate := prerequisite(t, "FLAMEDB_PEBBLE_BINARY")
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := startServer(t, nextgen, true)
+	addr := startServer(t, candidate)
 	prefix := fmt.Sprintf("rankingsdk%d", time.Now().UnixNano())
 	sdk := filepath.Join(root, "internal", "compat", "sdk")
 	t.Run("Go", func(t *testing.T) {
@@ -148,11 +144,11 @@ func TestAdditiveRankingSDKsAgainstNextgen(t *testing.T) {
 	})
 }
 
-func TestFrozenMissingMetricResultShapesAgainstNextgen(t *testing.T) {
+func TestFrozenMissingMetricResultShapesAgainstPebble(t *testing.T) {
 	reference := prerequisite(t, "FLAMEDB_REFERENCE_BINARY")
-	nextgen := prerequisite(t, "FLAMEDB_NEXTGEN_BINARY")
-	old := connect(t, startServer(t, reference, false), "compat-key")
-	current := connect(t, startServer(t, nextgen, true), "compat-key")
+	candidate := prerequisite(t, "FLAMEDB_PEBBLE_BINARY")
+	old := connect(t, startServer(t, reference), "compat-key")
+	current := connect(t, startServer(t, candidate), "compat-key")
 	metric := fmt.Sprintf("missingmetric%d", time.Now().UnixNano())
 	for _, w := range []*wire{old, current} {
 		w.send(t, "WRITE "+metric+" 1 ts=1704067200000000001")
@@ -166,10 +162,10 @@ func TestFrozenMissingMetricResultShapesAgainstNextgen(t *testing.T) {
 		}
 		newMap, ok := b[q.field].(map[string]any)
 		if !ok {
-			t.Fatalf("missing nextgen map %s: %v", q.field, b)
+			t.Fatalf("missing candidate map %s: %v", q.field, b)
 		}
 		if !reflect.DeepEqual(oldMap[metric+".absent"], newMap[metric+".absent"]) {
-			t.Fatalf("%s absent shape mismatch frozen=%v nextgen=%v", q.field, oldMap[metric+".absent"], newMap[metric+".absent"])
+			t.Fatalf("%s absent shape mismatch frozen=%v candidate=%v", q.field, oldMap[metric+".absent"], newMap[metric+".absent"])
 		}
 		if q.field == "aggregates" {
 			if !reflect.DeepEqual(oldMap, newMap) {

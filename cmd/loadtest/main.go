@@ -414,8 +414,8 @@ func run(o options) error {
 	default:
 		return fmt.Errorf("unsupported mode")
 	}
-	if o.durability != "unspecified" && o.durability != "postgres-sync" {
-		return fmt.Errorf("durability-contract must be unspecified or postgres-sync")
+	if o.durability != "unspecified" && o.durability != "pebble-sync" {
+		return fmt.Errorf("durability-contract must be unspecified or pebble-sync")
 	}
 	if strings.ContainsAny(o.prefix, " \r\n\"=,") || o.prefix == "" {
 		return fmt.Errorf("invalid metric prefix")
@@ -478,7 +478,7 @@ func run(o options) error {
 	}
 	sort.Strings(mismatches)
 	durable := int64(0)
-	if o.durability == "postgres-sync" {
+	if o.durability == "pebble-sync" {
 		durable = s.confirmed.Load()
 	}
 	report := map[string]any{"metric_prefix": o.prefix, "elapsed_seconds_including_drain": elapsed, "workers": o.workers, "batch_size": o.batch, "pipeline": o.pipeline, "metrics": o.metrics, "entities": o.entities, "mode": o.mode, "requests_submitted": s.requests.Load(), "events_submitted": s.submitted.Load(), "events_confirmed": s.confirmed.Load(), "reads_confirmed": s.reads.Load(), "errors": s.errors.Load(), "events_ambiguous": s.ambiguous.Load(), "confirmed_events_per_second": float64(s.confirmed.Load()) / elapsed, "confirmed_reads_per_second": float64(s.reads.Load()) / elapsed, "latency_ms_bucket_upper_bound": map[string]float64{"p50": s.latency.quantile(.5), "p95": s.latency.quantile(.95), "p99": s.latency.quantile(.99)}, "events_durable_by_configured_contract": durable, "durability_contract": o.durability, "readback_events": observed, "readback_mismatches": mismatches, "correctness_pass": len(mismatches) == 0 && s.errors.Load() == 0 && s.ambiguous.Load() == 0, "readback_proves_restart_survival": false}
@@ -529,7 +529,7 @@ func main() {
 	flag.IntVar(&o.fixtureEvents, "fixture-events", 1000, "events per metric seeded outside timed read-only runs")
 	flag.Int64Var(&o.timestampStart, "start-timestamp", 0, "initial explicit timestamp sequence; zero uses current time")
 	flag.StringVar(&o.prefix, "prefix", fmt.Sprintf("load%d", time.Now().UnixNano()), "unique metric prefix; reuse causes readback failure")
-	flag.StringVar(&o.durability, "durability-contract", "unspecified", "unspecified or postgres-sync; the latter requires synchronous PostgreSQL commits")
+	flag.StringVar(&o.durability, "durability-contract", "unspecified", "unspecified or pebble-sync; the latter requires synchronous Pebble commits")
 	flag.IntVar(&o.workers, "workers", 32, "concurrent connections")
 	flag.IntVar(&o.batch, "batch-size", 1, "events in one WRITE_BATCH response")
 	flag.IntVar(&o.pipeline, "pipeline", 1, "requests sent before reading responses")

@@ -3,25 +3,24 @@ const {spawnSync}=require('node:child_process');
 const path=require('node:path');
 const fs=require('node:fs');
 const {randomUUID}=require('node:crypto');
-for(const key of ['FLAMEDB_TEST_POSTGRES','FLAMEDB_TEST_REDIS','FLAMEDB_REFERENCE_BINARY','FLAMEDB_NEXTGEN_BINARY']) {
+for(const key of ['FLAMEDB_REFERENCE_BINARY','FLAMEDB_PEBBLE_BINARY']) {
   if(!process.env[key]) throw new Error(`${key} is required`);
 }
 const required=[
-  'TestFrozenReferenceDifferentialTCP','TestSharedNodesConcurrentDurabilityAndRecovery',
-  'TestFrozenLegacySDKsAgainstNextgen','TestFrozenRawEventSDKBaselineLimitation',
-  'TestFrozenMissingMetricResultShapesAgainstNextgen','TestAdditiveRankingSDKsAgainstNextgen',
-  'TestImportPreservesEventsAbsoluteScoresAndSource','TestCorruptSnapshotRowsReject',
-  'TestPostgresSemantics','TestPostgresConcurrentAndCacheRecovery','TestPostgresNativeBoardBatch',
-  'TestPostgresSharedAutomaticTimestampAllocator','TestPostgresRawHistoryLeavesScoreProjectionValid',
-  'TestRedisAttemptBudgetPreservesPostgresFallback','TestListenerReadinessLifecycle','TestPostgresParallelRawBatches',
-  'TestRedisRankingAtomicVersionAndRoundTrips','TestRecoveryVerificationRejectsWrongScores','TestFrameSelectsTimestampModeWithoutChangingEvents',
-  'TestPostgresLargeProtocolIdentities','TestPostgresSchemaUpgradeAndBoundedRebuild','TestPostgresIdentityIndexBoundary','TestPostgresIndependentMetricBatches','TestPostgresCoalescedSmallBatches','TestRedisProjectionBoardCommandCost','TestPostgresBatchedAutomaticTimestamps','TestPostgresAutomaticBatchIndependentMetrics','TestPostgresAutomaticDirectCopy','TestRedisBatchedProjectionRoundTrips','TestPostgresIngestSnapshotAfterLock'
+  'TestFrozenReferenceDifferentialTCP','TestFrozenLegacySDKsAgainstPebble',
+  'TestFrozenRawEventSDKBaselineLimitation','TestFrozenMissingMetricResultShapesAgainstPebble',
+  'TestAdditiveRankingSDKsAgainstPebble','TestPebbleTCPLeaderboardBatch128',
+  'TestPebbleBatchScoresHistoryAndReopen','TestGroupedWireReadsLargeHistoryWithReadonlyKey',
+  'TestTwoNodeQuorumAndForwardedBatch','TestPebbleOnlyConfiguration',
+  'TestPebbleTLSWithUnchangedAuthAndCommands',
+  'TestPebbleRankingSignedTiesAndBoundedNeighbors',
+  'TestLegacyLookupFilterPreservesDecodedIdentity',
 ];
 // All packages share local Docker and finite CPU/I/O. Serialize packages so
 // unrelated SDK compilers cannot consume a deadline-bound backend fixture's
 // budget. Assertions, race detection and production timing limits stay intact.
 const result=spawnSync('go',['test','-race','-p','1','./...','-count=1','-json','-timeout=12m'],{
-  cwd:path.resolve(__dirname,'../..'),env:{...process.env,FLAMEDB_INTEGRATION:'1',FLAMEDB_TEST_TIMESCALE:'1'},
+  cwd:path.resolve(__dirname,'../..'),env:{...process.env,FLAMEDB_INTEGRATION:'1'},
   encoding:'utf8',maxBuffer:32*1024*1024,timeout:780000
 });
 if(result.error) throw result.error;

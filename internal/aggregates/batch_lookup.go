@@ -55,8 +55,14 @@ func (lookup *LockedBatchLookup) Get(metric, entity string) (float64, error) {
 		if lookup.stats != nil {
 			lookup.stats.LegacyEntries++
 		}
+		data := iter.Value()
+		if entity, ok := plainLegacyEntity(data); ok {
+			if _, wanted := lookup.targets[metric][string(entity)]; !wanted {
+				continue
+			}
+		}
 		var entry LeaderboardEntry
-		if json.Unmarshal(iter.Value(), &entry) != nil {
+		if json.Unmarshal(data, &entry) != nil {
 			continue
 		}
 		if _, wanted := lookup.targets[metric][entry.EntityID]; !wanted {

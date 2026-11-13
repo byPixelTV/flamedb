@@ -156,8 +156,12 @@ func (l *Leaderboard) GetWithLookupStats(metric, entityID string, stats *LookupS
 		if stats != nil {
 			stats.LegacyEntries++
 		}
+		data := iter.Value()
+		if id, ok := plainLegacyEntity(data); ok && string(id) != entityID {
+			continue
+		}
 		var entry LeaderboardEntry
-		if err := json.Unmarshal(iter.Value(), &entry); err != nil {
+		if err := json.Unmarshal(data, &entry); err != nil {
 			continue
 		}
 		if entry.EntityID == entityID {
@@ -186,54 +190,52 @@ func (l *Leaderboard) TopN(metric string, limit, offset int) ([]LeaderboardEntry
 	if limit < 0 || offset < 0 {
 		return nil, fmt.Errorf("invalid pagination")
 	}
-	prefix := []byte("lb:" + keyspace.Component(metric) + ":")
-	split := append(append([]byte(nil), prefix...), 0x80)
 	results := []LeaderboardEntry{}
-	// Preserve the on-disk format: nonnegative scores scan forward, negative
-	// scores backward. This fixes signed ordering without a data migration.
-	for pass := 0; pass < 2; pass++ {
-		lower, upper := split, []byte("lb:"+keyspace.Component(metric)+";")
-		if pass == 1 {
-			lower, upper = prefix, split
+	err := l.VisitRanked(metric, func(entry LeaderboardEntry) bool {
+		if offset > 0 {
+			offset--
+		} else {
+			results = append(results, entry)
 		}
-		iter, err := l.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
-		if err != nil {
-			return nil, err
-		}
-		valid := iter.First()
-		if pass == 1 {
-			valid = iter.Last()
-		}
-		for valid {
-			var entry LeaderboardEntry
-			if err := json.Unmarshal(iter.Value(), &entry); err != nil {
-				iter.Close()
-				return nil, err
-			}
-			if offset > 0 {
-				offset--
-			} else {
-				results = append(results, entry)
-			}
-			if limit > 0 && len(results) >= limit {
-				break
-			}
-			if pass == 0 {
-				valid = iter.Next()
-			} else {
-				valid = iter.Prev()
-			}
-		}
-		err = iter.Error()
-		iter.Close()
-		if err != nil {
-			return nil, err
-		}
-		if limit > 0 && len(results) >= limit {
-			break
-		}
+		return limit == 0 || len(results) < limit
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
+}
+
+// VisitRanked scans both signed score ranges on one consistent iterator. The
+// visitor may stop early without building an in-memory copy of the board.
+func (l *Leaderboard) VisitRanked(metric string, visit func(LeaderboardEntry) bool) error {
+	prefix := []byte("lb:" + keyspace.Component(metric) + ":")
+	split := append(append([]byte(nil), prefix...), 0x80)
+	iter, err := l.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: []byte("lb:" + keyspace.Component(metric) + ";")})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	// Preserve the on-disk format: nonnegative scores scan forward, negative
+	// scores backward. This fixes signed ordering without a data migration.
+	for _, negative := range []bool{false, true} {
+		position, advance := iter.SeekGE, iter.Next
+		if negative {
+			position, advance = iter.SeekLT, iter.Prev
+		}
+		for valid := position(split); valid; valid = advance() {
+			var entry LeaderboardEntry
+			if err := json.Unmarshal(iter.Value(), &entry); err != nil {
+				return err
+			}
+			if !visit(entry) {
+				return nil
+			}
+		}
+		if err := iter.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AtomicMutation holds the entity lock until events, scores and receipts commit.

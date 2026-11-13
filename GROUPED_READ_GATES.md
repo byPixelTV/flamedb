@@ -1,10 +1,10 @@
 # Gates: Server-side grouped reads for Grafana
 
-OWNS: internal/query/**, internal/storage/scan.go, internal/analytics/grouped.go, internal/analytics/read.go, internal/server/grouped_test.go, grafana/pkg/plugin/**, grafana/scripts/**, grafana/README.md, grafana/patches/grouped-history.patch, GROUPED_READ_GATES.md, scripts/check-grouped-query.cjs
+OWNS: internal/query/**, internal/storage/scan.go, internal/server/grouped_test.go, grafana/pkg/plugin/**, grafana/scripts/**, grafana/README.md, grafana/patches/grouped-history.patch, GROUPED_READ_GATES.md, scripts/check-grouped-query.cjs
 
 Scope: Stream grouped histories and latest-per-group snapshots on FlameDB, bound output rather than scanned raw events, use compact results in Grafana, preserve global time ranges, and verify histories beyond the old scan limit.
 
-- [x] G1: Query, storage, server and analytics tests pass, including large streaming aggregation and compact protocol checks
+- [x] G1: Query, storage and server tests pass, including large streaming aggregation and compact protocol checks
   CHECK: node scripts/check-grouped-query.cjs
   EXPECT: Server grouped-query tests passed
   EVIDENCE: automatic-evidence=v1; definition-sha256=89707b1ebbdc00f73ec8d296cf5f9293e5876ed13f63ea2de8dab9cfbe6909f0; exit=0; EXPECT=matched; output-sha256=74656a8b499acf0199e476faaab75a5fd347241a86718b8968192dab766324f3; output-bytes=265; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Dev\Go\flamedb; path=e76b00ac42dd/62 entries

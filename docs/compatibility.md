@@ -17,7 +17,7 @@ authentication messages, command framing and result keys remain the baseline.
 | Errors and empty results | An error is `{"error":"message"}`. WRITE/SET success is `{}`. Result fields use `omitempty`: empty single-metric events, leaderboards and series may be omitted. Public multi-metric merging normalizes empty event/series lists to []; public METRICS emits metric_keys:[]. DELETE has a `delete` object; batches have counters. | Preserve field names and old SDK empty-result interpretation. No extra wrapping of old commands. |
 | Raw event JSON casing | Frozen server serializes storage.Event as uppercase `Timestamp/Metric/Value/Tags`; the frozen Go SDK decodes those case-insensitively. Frozen Kotlin/TypeScript raw-event models require lowercase keys, a pre-existing server/SDK discrepancy hidden by fixture-only tests. | User-approved additive correction emits lowercase timestamp/metric/value/tags aliases together with all unchanged uppercase fields. Exact integer timestamp digits are shared. Untagged lowercase tags is {}, while uppercase Tags retains null. |
 | WRITE | `WRITE metric value [lb="entity"] [lb.board="entity"] [tag="value"] [ts=nanoseconds] [QUORUM]`. Finite signed float64; nonnegative timestamp; zero means assign a strictly increasing per-executor current timestamp. One raw event plus increments on each requested default/named board; leaderboard IDs are separate from raw event tags. | Persist event and board mutations together before successful acknowledgement. Preserve signed and zero values. |
-| Duplicate timestamp | Raw event identity is `(metric,timestamp)`. A later write replaces that event and its old tag index entries, even with different tags. Each accepted WRITE still increments its requested absolute boards; replacing an event does not reverse earlier board increments. | PostgreSQL UPSERT must preserve this separation between event history and absolute boards. Timestamp generation across nodes is operationally distinct from explicit overwrite semantics. |
+| Duplicate timestamp | Raw event identity is `(metric,timestamp)`. A later write replaces that event and its old tag index entries, even with different tags. Each accepted WRITE still increments its requested absolute boards; replacing an event does not reverse earlier board increments. | Preserve this separation between event history and absolute boards. Timestamp generation across nodes is operationally distinct from explicit overwrite semantics. |
 | SET | `SET metric value lb="entity"` or named `lb.board`. Replaces absolute board score, including zero or a negative value; emits no raw event. Missing target board/entity is invalid. | Preserve absolute mutation and empty `{}` acknowledgement. |
 | GET | Single metric returns `events`; comma-separated metrics return `metrics`. WHERE combines exact tag equalities with AND; missing tags do not equal empty values. Time interval is `[FROM,TO)`, default FROM=0 and omitted TO unbounded. Parser defaults LIMIT=10/OFFSET=0/ORDER=DESC. Explicit LIMIT 0 means unlimited. Sorting/pagination apply per metric. | Preserve order, exact nanoseconds, half-open boundaries and independent per-metric pagination. |
 | Query dates | RFC3339Nano, UTC `YYYY-MM-DD`, `now`, and signed relative times. Calendar `y`/`mo` differ from fixed durations; `m` means minute unless the duration contains a calendar unit. Negative timestamps, reversed ranges and invalid durations fail. Equal endpoints select nothing. | Use the unchanged parser; resolve relative dates per request. |
@@ -31,8 +31,8 @@ authentication messages, command framing and result keys remain the baseline.
 | METRICS | Unfiltered list includes event metrics and metrics with only board entries; sorts and deduplicates cluster-wide keys as `metric_keys`. WHERE selects metrics with at least one matching raw event. Empty public lists return metric_keys:[]. Reserved storage/replication key prefixes do not become metrics. | Preserve filtered event semantics and default/named board discovery. |
 | STATS | `stats:{metric,tag_stats:[{tag_key,cardinality}]}` for requested tag keys in request order. Cardinality tracks distinct historically observed tag values, asynchronously; deletion does not decrement that history. Zero is valid before async flush. Index choice prefers higher distinct count, tie-breaking by tag key. | Preserve the envelope and historical counting; immediate post-write counts must not be treated as a synchronously fresh guarantee. |
 | WRITE_BATCH | Newline `WRITE_BATCH [QUORUM]`, WRITE lines, `END`; one response `{ok,accepted,failed,errors?}`. Original zero-based indexes retained; failures may coexist with applied writes. Only WRITE items. Local plain writes grouped; board writes preserve their original deltas and events. Header/per-item quorum supported. Limits: 10,000 items / 8 MiB total / 30-second frame deadline. | Keep partial-success semantics; no all-or-nothing claim, dropped items, per-event response lines or silent retries. |
-| Internal replication | Durable Pebble outbox plus internal `__op` receipts prevents replayed internal increments; REPL_BATCH can carry WRITE/SET/DELETE and returns exactly once. User writes do not carry an idempotency key. Baseline clustered acknowledgement can fail after a local mutation if replica delivery/quorum fails. | Old mutation errors can have an unknown outcome. PostgreSQL becomes authority in external mode; existing peer replication is not an external durability substitute. |
-| QUORUM | Frozen cluster quorum uses configured majority and rejects application-level replica failure; RF does not shrink to healthy-node count. External storage mode must reject QUORUM before mutation when it cannot prove the requested synchronous topology guarantee. | This explicit rejection is an intentional external-mode difference, not a claim that quorum succeeded. Consumers that request quorum must handle it. |
+| Internal replication | Durable Pebble outbox plus internal `__op` receipts prevents replayed internal increments; REPL_BATCH can carry WRITE/SET/DELETE and returns one response. User writes do not carry an idempotency key. Clustered acknowledgement can fail after a local mutation if replica delivery/quorum fails. | Preserve unknown outcomes and internal replay protection. |
+| QUORUM | Cluster quorum uses configured majority and rejects application-level replica failure; RF does not shrink to healthy-node count. | Single-node quorum is satisfied by the durable local write. Preserve the configured majority in clustered mode. |
 | Identifiers | Metric/tag identifiers support colon namespaces and UTF-8. Metrics reject comma/quote/equality/space conflicts and reserved storage prefixes. Parser tag/entity-tag names reject quote/equality/space conflicts but can contain comma; SDK shared validators also reject comma. Boards reject colon, quote, equality, space and unit separator; SDK board validation is stricter about comma. Entity/tag values are quoted and may contain escaped control characters. | Preserve valid namespaces and quoted values. New ranking methods quote entities rather than treating them as identifiers. |
 
 ## SDK public contract inventory
@@ -40,7 +40,7 @@ authentication messages, command framing and result keys remain the baseline.
 No existing option type, constructor, method parameter, return type or exception
 constructor was removed or changed. Old call sites compile against the updated
 SDKs. Old SDK source is also compiled independently against the frozen checkout
-and used as a TCP client of the new backend by `TestFrozenLegacySDKsAgainstNextgen`.
+and used as a TCP client of the current Pebble server by `TestFrozenLegacySDKsAgainstPebble`.
 `TestFrozenRawEventSDKBaselineLimitation` separately reproduces the original
 raw-event defect against the real frozen server: TypeScript lacks timestampNs;
 Kotlin rejects missing timestamp/metric/value. Its successful negative-control
@@ -80,18 +80,15 @@ read_policy, replication_queue_size, fanout_queue_size), and `storage.compressio
 (none/snappy/zstd). `FLAMEDB_INTERNAL_KEY` overrides the configured internal key
 and is deliberately omitted from saved YAML. Keys must be nonempty, unique,
 nonconflicting and free of literal newlines; clustered mode requires the shared
-internal key. Config Save uses a 0600 temporary file and rename. New storage,
-TLS, HTTP and limit fields are opt-in additions; the old Pebble path remains
-available. PostgreSQL is authoritative in external mode and Redis is rebuildable.
+internal key. Config Save uses a 0600 temporary file and rename. TLS and request
+limits are opt-in additions. `storage.engine` may be omitted or set to `pebble`;
+an explicit unsupported engine is rejected before storage opens.
 
 Legacy on-disk state includes raw event and tag indexes, absolute/named boards,
 historical cardinality, durable replication outbox and receipt keys. Existing
 Pebble automatic-migration tests require a preserved backup before format upgrade,
-including locked/corrupt/incomplete-checkpoint failure behavior. Switching storage
-engines does not automatically import an existing Pebble data directory. The
-compatibility contract preserves public data behavior; it does not imply binary
-compatibility between PostgreSQL schema and Pebble SSTs or reuse peer rebalance
-KV payloads across storage engines.
+including locked/corrupt/incomplete-checkpoint failure behavior. This contract
+preserves public data behavior and the existing Pebble key layout.
 
 | Existing evidence source | What it actually establishes |
 | --- | --- |
@@ -103,7 +100,7 @@ KV payloads across storage engines.
 | SDK_GATES.md and SDK test suites | TCP-fixture transport concurrency, reserved reads, total deadlines/cancellation, recovery and no ambiguous-mutation replay. These are SDK tests, not a live storage throughput benchmark. |
 | pkg/kotlin BUFFERED/HARDENING results | Bounded journal/recovery/unknown outcomes/callbacks/overload and TCP fixture stress. Their recorded throughput is not evidence of database/server ingestion rate, durability, HA or production heap use. |
 | internal/compat differential harness | Selected same-command real TCP responses versus the frozen server. Exact timestamps allow direct response comparison. Uncovered valid inputs remain outside its measured corpus. |
-| internal/compat legacy SDK harness | Unchanged source compiled as independent Go/TypeScript/Kotlin consumers and exercised against the real PostgreSQL/Redis server, including Kotlin event windows/aggregates and buffered confirmation/shutdown. It does not exhaust every argument combination or outage. |
+| internal/compat legacy SDK harness | Unchanged source compiled as independent Go/TypeScript/Kotlin consumers and exercised against the Pebble server, including Kotlin event windows/aggregates and buffered confirmation/shutdown. It does not exhaust every argument combination or outage. |
 
 ## Additive ranking API
 

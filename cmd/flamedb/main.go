@@ -68,12 +68,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if cfg.Storage.Engine != "" && cfg.Storage.Engine != "pebble" {
-		if err := runShared(cfg); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
 	printBanner(util.CurrentVersion())
 
 	store, err := storage.Open(cfg.Server.DataPath, cfg.Storage.Compression)

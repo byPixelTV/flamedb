@@ -3,8 +3,8 @@ param(
   [string]$LoadtestBinary = '.compat/loadtest.exe',
   [string]$Addresses = '127.0.0.1:7777',
   [string]$OutputDirectory = '.compat/benchmarks',
-  [string[]]$DatabaseContainers = @('flamedb-nextgen-postgres-1', 'flamedb-nextgen-redis-1', 'flamedb-nextgen-api-1'),
-  [string[]]$MetricsUrls = @('http://127.0.0.1:9090/metrics'),
+  [string[]]$DatabaseContainers = @(),
+  [string[]]$MetricsUrls = @(),
   [int[]]$ApiProcessIds = @(),
   [int]$Workers = 32,
   [string]$Duration = '15s',
@@ -27,7 +27,7 @@ $matrix = @(
 foreach ($mode in @('top','rank','window','sum','avg','count','history','tags')) {
   $matrix += @{name=$mode;mode=$mode;batch=1;pipeline=1;board='true'}
 }
-$sourceFiles = @(Get-ChildItem -LiteralPath 'internal/analytics','internal/server','cmd/loadtest' -File -Recurse | Sort-Object FullName | ForEach-Object {
+$sourceFiles = @(Get-ChildItem -LiteralPath 'internal/aggregates','internal/storage','internal/server','cmd/loadtest' -File -Recurse | Sort-Object FullName | ForEach-Object {
   @{path=[IO.Path]::GetRelativePath((Get-Location).Path,$_.FullName);sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
 })
 $dockerEnvironment = if ($DatabaseContainers.Count -gt 0) { & docker info --format 'cpus={{.NCPU}} memory_bytes={{.MemTotal}} server={{.ServerVersion}}' } else { 'not sampled' }
@@ -43,7 +43,7 @@ foreach ($item in $matrix) {
   $arguments = @('--addrs', $Addresses, '--workers', $Workers, '--duration', $Duration,
     '--metrics', $Metrics, '--fixture-events', $FixtureEvents, '--prefix', $prefix,
     '--mode', $item.mode, '--batch-size', $item.batch, '--pipeline', $item.pipeline,
-    ('--leaderboard=' + $item.board), '--durability-contract', 'postgres-sync')
+    ('--leaderboard=' + $item.board), '--durability-contract', 'pebble-sync')
   $process = Start-Process -FilePath $binaryPath -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
   do {
     $sample = @{utc=[DateTime]::UtcNow.ToString('o');loadtest_pid=$process.Id;api=@();docker=@();metrics=@()}
@@ -54,9 +54,6 @@ foreach ($item in $matrix) {
     if ($DatabaseContainers.Count -gt 0) {
       $rows = & docker stats --no-stream --format '{{json .}}' @DatabaseContainers
       $sample.docker = @($rows | ForEach-Object { $_ | ConvertFrom-Json })
-      $pg = $DatabaseContainers[0]
-      $sample.postgres_activity = & docker exec $pg psql -U flamedb -d flamedb -Atc "SELECT json_build_object('state',state,'wait_event_type',wait_event_type,'sessions',count(*)) FROM pg_stat_activity WHERE datname='flamedb' GROUP BY state,wait_event_type;"
-      $sample.postgres_database = & docker exec $pg psql -U flamedb -d flamedb -Atc "SELECT row_to_json(s) FROM (SELECT xact_commit,xact_rollback,blks_read,blks_hit,tup_inserted,tup_updated,tup_deleted,deadlocks,temp_bytes FROM pg_stat_database WHERE datname='flamedb') s;"
     }
     foreach ($url in $MetricsUrls) {
       try { $sample.metrics += @{url=$url;text=(Invoke-WebRequest -Uri $url -TimeoutSec 2).Content} }

@@ -1,5 +1,5 @@
 // Package compat verifies the public TCP protocol against the frozen reference.
-// Run with FLAMEDB_INTEGRATION=1 to require real binaries and databases.
+// Run with FLAMEDB_INTEGRATION=1 to require real server binaries.
 package compat
 
 import (
@@ -81,11 +81,11 @@ func prerequisite(t *testing.T, key string) string {
 	}
 	return value
 }
-func startServer(t *testing.T, binary string, external bool) string {
-	addr, _ := startServerControlled(t, binary, external)
+func startServer(t *testing.T, binary string) string {
+	addr, _ := startServerControlled(t, binary)
 	return addr
 }
-func startServerControlled(t *testing.T, binary string, external bool) (string, func()) {
+func startServerControlled(t *testing.T, binary string) (string, func()) {
 	t.Helper()
 	absolute, err := filepath.Abs(binary)
 	if err != nil {
@@ -100,9 +100,6 @@ func startServerControlled(t *testing.T, binary string, external bool) (string, 
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	dir := t.TempDir()
 	cfg := fmt.Sprintf("auth:\n  keys:\n    - name: compat\n      key: compat-key\n      permissions: [read, write]\n    - name: reader\n      key: read-key\n      permissions: [read]\n    - name: writer\n      key: write-key\n      permissions: [write]\nserver:\n  host: 127.0.0.1\n  port: %d\n  node_id: compat\n  advertise_addr: %s\n  data_path: %q\ncluster:\n  seeds: []\n  replication_factor: 1\n", port, addr, filepath.ToSlash(filepath.Join(dir, "data")))
-	if external {
-		cfg += externalConfig(t)
-	}
 	path := filepath.Join(dir, "config.yml")
 	if err := os.WriteFile(path, []byte(cfg), 0600); err != nil {
 		t.Fatal(err)
@@ -151,15 +148,11 @@ func startServerControlled(t *testing.T, binary string, external bool) (string, 
 	return "", kill
 }
 
-func externalConfig(t *testing.T) string {
-	return fmt.Sprintf("storage:\n  engine: postgres\n  postgres:\n    dsn: %q\n  redis:\n    mode: standalone\n    address: %q\n", prerequisite(t, "FLAMEDB_TEST_POSTGRES"), prerequisite(t, "FLAMEDB_TEST_REDIS"))
-}
-
 func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 	reference := prerequisite(t, "FLAMEDB_REFERENCE_BINARY")
-	nextgen := prerequisite(t, "FLAMEDB_NEXTGEN_BINARY")
-	oldAddr := startServer(t, reference, false)
-	newAddr := startServer(t, nextgen, true)
+	candidate := prerequisite(t, "FLAMEDB_PEBBLE_BINARY")
+	oldAddr := startServer(t, reference)
+	newAddr := startServer(t, candidate)
 	old := connect(t, oldAddr, "compat-key")
 	next := connect(t, newAddr, "compat-key")
 	prefix := fmt.Sprintf("compat%d", time.Now().UnixNano())
@@ -171,7 +164,7 @@ func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 		b := next.send(t, command)
 		validateApprovedAliases(t, b)
 		if !reflect.DeepEqual(a, b) {
-			t.Errorf("%s\nreference: %v\nnextgen:   %v", command, a, b)
+			t.Errorf("%s\nreference: %v\ncandidate:   %v", command, a, b)
 		}
 	}
 	// Explicit nanosecond timestamps make responses comparable without rounding or field removal.
@@ -250,8 +243,7 @@ func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 	} {
 		compare(t, command)
 	}
-	// Valid protocol text can exceed PostgreSQL's text-index tuple size. Use
-	// incompressible strings so TOAST/compression cannot hide a truncated model.
+	// Exercise wide identifiers and incompressible tag values on the wire.
 	randomText := func(bytes int) string {
 		data := make([]byte, bytes/2)
 		if _, err := rand.Read(data); err != nil {
@@ -292,7 +284,7 @@ func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 	filter(a)
 	filter(b)
 	if !reflect.DeepEqual(a, b) {
-		t.Errorf("scoped unfiltered METRICS reference=%v nextgen=%v", a, b)
+		t.Errorf("scoped unfiltered METRICS reference=%v candidate=%v", a, b)
 	}
 	// Reference cardinality is asynchronous: wait until its index settles, then compare exactly.
 	statsCmd := "STATS " + metric + " TAGS player region missing"
@@ -304,7 +296,7 @@ func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Errorf("%s reference=%v nextgen=%v", statsCmd, a, b)
+			t.Errorf("%s reference=%v candidate=%v", statsCmd, a, b)
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -321,15 +313,9 @@ func TestFrozenReferenceDifferentialTCP(t *testing.T) {
 			}
 		}
 	}
-	// QUORUM must fail before the database mutation in a topology without a proven synchronous majority.
-	rejected := next.send(t, "WRITE "+prefix+".quorum 1 QUORUM")
-	if m, ok := rejected.(map[string]any); !ok || m["error"] == nil {
-		t.Errorf("unsupported QUORUM acknowledged: %v", rejected)
-	}
-	got := next.send(t, "GET "+prefix+".quorum COUNT").(map[string]any)
-	if a, ok := got["aggregate"].(map[string]any); !ok || a["count"] != json.Number("0") {
-		t.Errorf("rejected QUORUM mutated: %v", got)
-	}
+	// On an isolated Pebble node, a quorum of one is a durable local write.
+	compare(t, "WRITE "+prefix+".quorum 1 QUORUM ts=1704067200000000100")
+	compare(t, "GET "+prefix+".quorum COUNT")
 }
 
 // The user explicitly approved additive lowercase aliases for legacy SDKs that

@@ -43,6 +43,8 @@ func (e *Executor) Execute(q *Query) (*Result, error) {
 		return e.executeDelete(q)
 	case QueryTypeLeaderboard:
 		return e.executeLeaderboard(q)
+	case QueryTypeRank, QueryTypeScore, QueryTypeAround, QueryTypeLeaderboardCount:
+		return e.executeRanking(q)
 	case QueryTypeGet:
 		return e.executeGet(q)
 	case QueryTypeStats:

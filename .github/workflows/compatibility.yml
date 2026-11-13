@@ -1,4 +1,4 @@
-name: Next Generation compatibility
+name: Pebble compatibility
 
 on:
   pull_request:
@@ -13,26 +13,10 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    services:
-      postgres:
-        image: timescale/timescaledb:latest-pg17@sha256:b346edcdb51a1fd6020e3965e0bd1c9f3406fa6d5fbce1e28f4852587ef934e2
-        env:
-          POSTGRES_USER: flamedb
-          POSTGRES_PASSWORD: flamedb
-          POSTGRES_DB: flamedb
-        ports: [5432:5432]
-        options: --health-cmd "pg_isready -U flamedb" --health-interval 5s --health-timeout 3s --health-retries 20
-      redis:
-        image: redis:8-alpine@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0
-        ports: [6379:6379]
-        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
     env:
       FLAMEDB_INTEGRATION: '1'
-      FLAMEDB_TEST_TIMESCALE: '1'
-      FLAMEDB_TEST_POSTGRES: postgres://flamedb:flamedb@127.0.0.1:5432/flamedb?sslmode=disable
-      FLAMEDB_TEST_REDIS: 127.0.0.1:6379
       FLAMEDB_REFERENCE_BINARY: ${{ github.workspace }}/.compat/flamedb-reference
-      FLAMEDB_NEXTGEN_BINARY: ${{ github.workspace }}/.compat/flamedb-nextgen
+      FLAMEDB_PEBBLE_BINARY: ${{ github.workspace }}/.compat/flamedb-pebble
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -51,14 +35,14 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: '1.4.1'
-      - name: Build the frozen reference and successor
+      - name: Build the frozen reference and current Pebble server
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .compat/reference
           git archive a7bb892b881e59d207f79ae7258ceecdd4c63ac7 | tar -x -C .compat/reference
           (cd .compat/reference && go build -o ../flamedb-reference ./cmd/flamedb)
-          go build -o .compat/flamedb-nextgen ./cmd/flamedb
+          go build -o .compat/flamedb-pebble ./cmd/flamedb
           chmod +x pkg/kotlin/gradlew
       - name: Install the locked TypeScript toolchain
         working-directory: pkg/typescript
@@ -72,3 +56,4 @@ jobs:
           (cd pkg/go && go test -race ./... && go vet ./...)
           (cd pkg/typescript && npm test && bun test && node ../../internal/compat/sdk/bun-wire.cjs)
           (cd pkg/kotlin && ./gradlew test --no-daemon --console=plain)
+          (cd grafana && go test ./...)

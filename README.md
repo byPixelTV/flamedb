@@ -1,12 +1,10 @@
-> **Next Generation:** A PostgreSQL/TimescaleDB backend with rebuildable Redis rankings is implemented alongside the legacy deployment. Start it with `docker compose -f compose.nextgen.yml up -d --build`. Read the [deployment, migration and measured performance guide](docs/nextgen.md) and [frozen SDK compatibility contract](docs/compatibility.md). Existing SDK calls remain supported; lowercase raw-event aliases repair the frozen Kotlin/TypeScript casing defect. The 200,000 requests/s engineering target has not been demonstrated by local measurements.
+FlameDB uses embedded Pebble. Existing Pebble deployments can keep their data directory and configuration. See the [TCP and SDK compatibility contract](docs/compatibility.md).
 
 For `REQUEST_TIMEOUT` on leaderboard batches in the existing Pebble deployment,
 see the [server batch fix, measurements and rollout notes](docs/pebble-batch-timeouts.md).
+See also the [Pebble lookup and journal measurements](docs/pebble-performance.md).
 
-The [current Pebble versus Next Gen comparison](docs/backend-comparison.md)
-measures both backends with equal local workload and resource limits.
-
-> **Legacy upgrade notice:** Pebble mode automatically migrates old databases after creating a checkpoint under `<data_path>.pre-v2-*/db`. Switching to PostgreSQL uses the separate read-only `cmd/import-postgres` tool; existing data directories are not automatically imported. See the [legacy audit](AUDIT_2026-09-18.md).
+> **Legacy upgrade notice:** FlameDB automatically migrates older Pebble formats after creating a checkpoint under `<data_path>.pre-v2-*/db`. Configurations selecting a removed backend are rejected; the server does not import or overwrite that data. See the [legacy audit](AUDIT_2026-09-18.md).
 
 <div align="center">
   <h1>FlameDB</h1>
@@ -43,7 +41,7 @@ measures both backends with equal local workload and resource limits.
 
 <br />
 
-FlameDB serves universal stats, events, analytics and exact leaderboards through its existing TCP protocol. The shared-storage backend keeps raw events and absolute scores in PostgreSQL/TimescaleDB, projects exact rankings into Redis, and permits multiple API nodes over the same durable data. Namespaced metrics and arbitrary entities remain application-neutral.
+FlameDB serves stats, events and exact leaderboards through its TCP protocol. Pebble stores raw events and absolute scores on each node. FlameDB replicates between nodes using its durable outbox and replica receipts.
 
 ## Why FlameDB
 
@@ -81,7 +79,7 @@ server:
 
 cluster:
   seeds: []
-  replication_factor: 2
+  replication_factor: 1
   replication_queue_size: 262144
   fanout_queue_size: 262144
 ```

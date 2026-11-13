@@ -16,11 +16,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/byPixelTV/flamedb/internal/aggregates"
 	"github.com/byPixelTV/flamedb/internal/auth"
+	"github.com/byPixelTV/flamedb/internal/cluster"
 	"github.com/byPixelTV/flamedb/internal/config"
+	"github.com/byPixelTV/flamedb/internal/storage"
 )
 
-func TestSharedTLSWithUnchangedAuthAndCommands(t *testing.T) {
+func TestPebbleTLSWithUnchangedAuthAndCommands(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -56,9 +59,14 @@ func TestSharedTLSWithUnchangedAuthAndCommands(t *testing.T) {
 	addr := probe.Addr().String()
 	probe.Close()
 	cfg := &config.Config{Server: config.ServerConfig{TLSCert: certPath, TLSKey: keyPath}, Auth: config.AuthConfig{Keys: []config.APIKey{{Name: "legacy", Key: "legacy", Permissions: []string{"read", "write"}}}}}
-	e := &blockingEngine{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	close(e.release)
-	srv := NewShared(e, auth.New(cfg.Auth), cfg)
+	store, err := storage.Open(filepath.Join(dir, "data"), "snappy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	c := cluster.New(cluster.Node{ID: "tls-node", Addr: addr}, 150, "", 1)
+	defer c.Close()
+	srv := New(store, aggregates.New(store.DB()), auth.New(cfg.Auth), c, "", cfg, "")
 	defer srv.Close()
 	serve := make(chan error, 1)
 	go func() { serve <- srv.Listen(addr) }()
@@ -83,6 +91,9 @@ func TestSharedTLSWithUnchangedAuthAndCommands(t *testing.T) {
 		t.Fatal(result)
 	}
 	if result := frame(t, client, scanner, "WRITE app:visits 1"); result["error"] != nil {
+		t.Fatal(result)
+	}
+	if result := frame(t, client, scanner, "GET app:visits COUNT"); result["aggregate"].(map[string]any)["count"] != float64(1) {
 		t.Fatal(result)
 	}
 	if state := client.ConnectionState(); !state.HandshakeComplete || len(state.VerifiedChains) == 0 {
